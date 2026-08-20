@@ -13,6 +13,9 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
     RegisterPostBackwardFunction,
 )
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+)
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
     check_sharded_parity,
@@ -23,13 +26,31 @@ from torch.testing._internal.common_fsdp import (
     patch_register_post_backward_hook_backward,
     reduce_scatter_with_assert,
 )
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 device_type = torch.device(get_devtype())
 
 
 class TestFullyShardFrozen(FSDPTest):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    # `instantiate_device_type_tests` injects `DeviceTypeTestBase`, whose
+    # `precision`/`rel_tol` are thread-local properties populated only on the
+    # thread that imports the module. The reduce-scatter numel check below
+    # (`assert_fn` in `_test_train_mixed_requires_grad_per_group`) runs
+    # `assertEqual` from an autograd worker thread during backward; since
+    # `assertEqual` always reads `self.rel_tol`, that worker thread's empty
+    # thread-local raises `AttributeError`. Override with the plain `TestCase`
+    # defaults (0 = no tolerance override) to shadow the thread-local
+    # properties; this is safe because this test sets no custom tolerance.
+    precision = TestCase._precision
+    rel_tol = TestCase._rel_tol
+
     @property
     def world_size(self) -> int:
         return min(4, torch.get_device_module(device_type).device_count())
@@ -265,6 +286,14 @@ class TestFullyShardFrozen(FSDPTest):
                 losses[-1].backward()
                 _optim.step()
             self.assertEqual(losses[0], losses[1])
+
+
+instantiate_device_type_tests(
+    TestFullyShardFrozen,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
 
 
 if __name__ == "__main__":
