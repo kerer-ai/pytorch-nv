@@ -5600,6 +5600,86 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
 
         torch._dynamo.testing.standard_test(self, fn=fn1, nargs=3)
 
+    def test_dunder_class_across_vt_types(self):
+        # obj.__class__ under compile must return the type for VTs across
+        # families (list/dict/set subclasses, tensor, exception).
+        class MyList(list):
+            pass
+
+        class MyExc(ValueError):
+            pass
+
+        def fn(x):
+            return (
+                x + 1,
+                MyList([1, 2]).__class__,
+                {1: 2}.__class__,
+                {1, 2}.__class__,
+                x.__class__,
+                MyExc("boom").__class__,
+            )
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_instance_dunder_dict(self):
+        # An instance's writable __dict__ under compile.
+        class Foo:
+            def __init__(self):
+                self.a = 1
+                self.b = 2
+
+        def fn(x):
+            obj = Foo()
+            return x + 1, dict(obj.__dict__)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_class_object_dunder_dict(self):
+        # A class object's __dict__ is a read-only mappingproxy, not an instance
+        # dict; both membership (which installs a dict guard) and item read must
+        # not route through the instance-dict machinery.
+        class Foo:
+            x = 5
+
+        def fn(t):
+            has_x = "x" in Foo.__dict__
+            return t + 1, has_x, Foo.__dict__["x"]
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        t = torch.randn(4)
+        self.assertEqual(fn(t), opt_fn(t))
+
+    def test_hasattr_dunder_dict_no_dict_type(self):
+        # Types without an instance __dict__ (builtins, __slots__-only classes)
+        # must report hasattr(obj, "__dict__") == False under compile, while
+        # types that do have one report True.
+        class Slots:
+            __slots__ = ("a",)
+
+            def __init__(self):
+                self.a = 1
+
+        class Plain:
+            def __init__(self):
+                self.a = 1
+
+        def fn(x):
+            return (
+                x + 1,
+                hasattr(Slots(), "__dict__"),
+                hasattr([1, 2], "__dict__"),
+                hasattr(5, "__dict__"),
+                hasattr(Plain(), "__dict__"),
+            )
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
     def test_class_reassignment_graph_break(self):
         class BaseClass:
             def __init__(self, x):
@@ -5926,6 +6006,84 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
             self.assertEqual(cnts.frame_count, 1)
             self.assertEqual(cnts.op_count, 3)
             cnts.clear()
+
+    def test_delete_deref(self):
+        # `del y` on a cell variable (captured by nested `g`) -> DELETE_DEREF
+        def fn(x):
+            y = x + 1
+
+            def g():
+                return y
+
+            z = y * 3
+            del y
+            return z
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_delete_deref_then_reassign(self):
+        def fn(x):
+            y = x + 1
+
+            def g():
+                return y
+
+            del y
+            y = x + 100
+            return g()
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_delete_deref_read_after_delete(self):
+        # Reading a cell after `del` raises NameError in eager; Dynamo must match
+        # (reads of a deleted cell graph break and fall back to eager).
+        def fn(x):
+            y = x + 1
+
+            def g():
+                return y
+
+            del y
+            return g()
+
+        opt_fn = torch.compile(fn, backend="eager")
+        x = torch.randn(4)
+        with self.assertRaises(NameError):
+            fn(x)
+        with self.assertRaises(NameError):
+            opt_fn(x)
+
+    def test_delete_deref_symint(self):
+        def fn(x):
+            s = x.shape[0] + 1
+
+            def g():
+                return s
+
+            del s
+            return x + 1
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True, dynamic=True)
+        x = torch.randn(4)
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_delete_deref_name_collision(self):
+        # An inlined comprehension's iteration variable shadows the `nonlocal`
+        # cell, so `x` occupies both a fast-local and a freevar slot. The
+        # DELETE_DEREF target is the cell, which lives in symbolic_cellvars.
+        x = 0
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def f():
+            nonlocal x
+            x = [x for x in range(3)]
+            del x
+
+        f()
 
     def test_closure_with_mutation_and_graph_break(self):
         def fn():
