@@ -204,7 +204,6 @@ class DeviceInterface:
                 "This device is not capable of supporting Triton"
             )
 
-<<<<<<< ours
     @classmethod
     def is_graph_capture_supported(cls, device: torch.types.Device = None) -> bool:
         """
@@ -219,7 +218,7 @@ class DeviceInterface:
         graph capture are safely skipped.
         """
         return False
-=======
+
     class GraphOps:
         """
         Runtime extension point for CUDA-graph-style capture: memory-pool
@@ -305,7 +304,6 @@ class DeviceInterface:
             # change behavior.
             with stream, graph:
                 yield
->>>>>>> theirs
 
 
 class DeviceGuard:
@@ -438,13 +436,12 @@ class CudaInterface(DeviceInterface):
         elif "nvidia" not in triton.backends.backends:
             raise TritonUnavailableError("triton not built with the 'nvidia' backend")
 
-<<<<<<< ours
     @classmethod
     def is_graph_capture_supported(cls, device: torch.types.Device = None) -> bool:
         # CUDA implements graph capture through its own torch.cuda.CUDAGraph
         # path, so the capability is declared unconditionally here.
         return True
-=======
+
     class GraphOps(DeviceInterface.GraphOps):
         graph_pool_handle = staticmethod(torch.cuda.graph_pool_handle)
         memory_snapshot = staticmethod(torch.cuda.memory_snapshot)
@@ -516,7 +513,6 @@ class CudaInterface(DeviceInterface):
         @staticmethod
         def caching_allocator_enabled() -> bool:
             return torch._C._cuda_cudaCachingAllocator_is_enabled()
->>>>>>> theirs
 
 
 get_mtia_stream: Callable[[int], int] | None
