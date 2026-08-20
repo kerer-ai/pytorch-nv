@@ -25,7 +25,7 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
-from torch.testing._internal.inductor_utils import GPU_TYPE
+from torch.testing._internal.inductor_utils import GPU_TYPE, requires_gpu
 
 
 def _prepend_product_of_values(inputs, possible_values, num_to_prepend=1, device=None):

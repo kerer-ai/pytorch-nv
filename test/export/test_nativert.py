@@ -35,7 +35,6 @@ except ImportError:
     import testing
 
 from torch.export import export
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
 
 
 test_classes = {}

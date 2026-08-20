@@ -14,6 +14,7 @@ from unittest import mock
 from sympy import I, Max, Min, Symbol, sympify
 
 import torch
+from torch._dynamo import device_interface
 from torch._dynamo import device_interface as di
 from torch._dynamo.device_interface import (
     CudaInterface,
