@@ -13,11 +13,15 @@ from unittest import mock
 from sympy import I, Max, Min, Symbol, sympify
 
 import torch
+<<<<<<< ours
 from torch._dynamo import device_interface
 from torch._dynamo.device_interface import (
     DeviceInterface,
     register_interface_for_device,
 )
+=======
+from torch._dynamo.device_interface import CudaInterface, DeviceInterface
+>>>>>>> theirs
 from torch._dynamo.exc import TritonUnavailableError
 from torch._dynamo.testing import AotEagerAndRecordGraphs
 from torch._dynamo.utils import detect_fake_mode
@@ -47,8 +51,11 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+<<<<<<< ours
     instantiate_parametrized_tests,
     parametrize,
+=======
+>>>>>>> theirs
     run_tests,
     TestCase,
     xfailIfNoAcceleratorTriton,
@@ -1254,6 +1261,7 @@ class TestHasTriton(TestCase):
         self.assertFalse(self._run([("fake", iface)]))
 
 
+<<<<<<< ours
 class _CapturableInterface(DeviceInterface):
     """Fake out-of-tree accelerator interface that opts into graph capture."""
 
@@ -1332,6 +1340,68 @@ class TestCheckMultipleDevicesOrAnyCpuNodes(TestCase):
             skip = cudagraphs_backend.check_for_skip(mock.Mock(), 0)
             self.assertIsNotNone(skip)
             self.assertIn("not supported by the cudagraphs backend", skip)
+=======
+class TestGraphOpsContract(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_base_graph_ops_defaults(self):
+        ops = DeviceInterface.GraphOps
+        # Safe defaults for backends that have not been adapted.
+        self.assertTrue(ops.caching_allocator_enabled())
+        self.assertIsNone(ops.memory_snapshot())
+        with self.assertRaises(NotImplementedError):
+            ops.graph_pool_handle()
+
+    def test_base_make_graph_uses_accelerator_graph(self):
+        # Backends without an override construct the registry-backed
+        # accelerator graph, carrying the pool at construction time.
+        with mock.patch(
+            "torch.accelerator.Graph", return_value=mock.sentinel.graph
+        ) as graph_cls:
+            result = DeviceInterface.GraphOps.make_graph((1, 2))
+        self.assertIs(result, mock.sentinel.graph)
+        graph_cls.assert_called_once_with(
+            pool=(1, 2), capture_error_mode="thread_local"
+        )
+
+    def test_base_capture_context_enters_stream_then_graph(self):
+        # The base capture context switches to the capture stream first, then
+        # enters the graph object (which is itself the capture context).
+        order = []
+        stream = mock.MagicMock()
+        stream.__enter__.side_effect = lambda *a: order.append("stream")
+        graph = mock.MagicMock()
+        graph.__enter__.side_effect = lambda *a: order.append("graph")
+        with DeviceInterface.GraphOps.capture_context(graph, stream, None):
+            self.assertEqual(order, ["stream", "graph"])
+        self.assertTrue(stream.__exit__.called)
+        self.assertTrue(graph.__exit__.called)
+
+    def test_cuda_graph_ops_forward_to_legacy_capture(self):
+        # CUDA must keep its legacy CUDAGraph object and torch.cuda.graph
+        # capture context, with pool/capture_error_mode passed at capture time.
+        with mock.patch(
+            "torch.cuda.CUDAGraph", return_value=mock.sentinel.cuda_graph
+        ) as graph_cls:
+            self.assertIs(
+                CudaInterface.GraphOps.make_graph((1, 2)), mock.sentinel.cuda_graph
+            )
+        graph_cls.assert_called_once_with()
+
+        with mock.patch(
+            "torch.cuda.graph", return_value=mock.sentinel.capture_cm
+        ) as capture:
+            result = CudaInterface.GraphOps.capture_context(
+                mock.sentinel.cuda_graph, mock.sentinel.stream, (1, 2)
+            )
+        self.assertIs(result, mock.sentinel.capture_cm)
+        capture.assert_called_once_with(
+            mock.sentinel.cuda_graph,
+            stream=mock.sentinel.stream,
+            pool=(1, 2),
+            capture_error_mode="thread_local",
+        )
+>>>>>>> theirs
 
 
 if __name__ == "__main__":
