@@ -46,7 +46,8 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
-from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA, TEST_MULTIGPU
+from torch.testing._internal.common_cuda import SM90OrLater, TEST_MULTIGPU
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     PLATFORM_SUPPORTS_SYMM_MEM,
@@ -63,6 +64,7 @@ from torch.testing._internal.common_fsdp import (
     patch_unshard,
 )
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     parametrize,
     requires_cuda_p2p_access,
@@ -95,6 +97,8 @@ device_module = torch.get_device_module(device_type)
 
 
 class TestFullyShardCollectiveOps(FSDPTestMultiThread):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @property
     def world_size(self) -> int:
         return 128
@@ -339,6 +343,8 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
 
 class TestFullyShardCommunication(FSDPTest):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @property
     def world_size(self) -> int:
         return min(4, torch.get_device_module(device_type).device_count())
@@ -744,6 +750,8 @@ class TestFullyShardCommunication(FSDPTest):
 
 
 class TestFullyShardPrefetch(FSDPTest):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @property
     def world_size(self) -> int:
         return min(4, torch.get_device_module(device_type).device_count())
@@ -1647,6 +1655,8 @@ class TestFullyShardPrefetch(FSDPTest):
 
 
 class TestFullyShardUnshardMultiProcess(FSDPTest):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @property
     def world_size(self) -> int:
         return min(torch.get_device_module(device_type).device_count(), 2)
@@ -1731,6 +1741,8 @@ class TestFullyShardUnshardMultiProcess(FSDPTest):
 
 
 class TestFullyShardUnshardMultiThread(FSDPTestMultiThread):
+    hw_classification = HardwareClassification.GENERIC
+
     @property
     def world_size(self) -> int:
         return 2
@@ -1758,6 +1770,8 @@ class TestFullyShardUnshardMultiThread(FSDPTestMultiThread):
 
 
 class TestFullyShardAllocFromPG(FSDPTest):
+    hw_classification = HardwareClassification.CUDA
+
     # The messages might change when we move to a different NCCL version.
     # Please update this test if it starts failing.
     MEMORY_REGISTER_RE = (
@@ -1843,6 +1857,8 @@ class TestFullyShardAllocFromPG(FSDPTest):
 @skipCUDAIf(TEST_WITH_ROCM, "requires NVIDIA GPUs")
 @skipCUDAIf(not SM90OrLater, "requires sm90+")
 class TestFullyShardSymmMem(MultiProcContinuousTest):
+    hw_classification = HardwareClassification.CUDA
+
     @classmethod
     def backend_str(cls) -> str | None:
         return "nccl"
@@ -1894,6 +1910,8 @@ instantiate_parametrized_tests(TestFullyShardSymmMem)
 
 
 class TestFullyShardForceSumReduction(FSDPTest):
+    hw_classification = HardwareClassification.CUDA
+
     # The messages might change when we move to a different NCCL version.
     # Please update this test if it starts failing.
 
@@ -1923,9 +1941,6 @@ class TestFullyShardForceSumReduction(FSDPTest):
     # Test reduce-scatter only on plain FSDP on 2 GPUs
     # This test verifies NCCL debug logs and is CUDA-specific.
     @skip_if_lt_x_gpu(2)
-    @unittest.skipIf(
-        not TEST_CUDA, "This test verifies NCCL debug logs and is CUDA-specific"
-    )
     def test_fully_shard_force_sum_reduce_scatter(self):
         torch.manual_seed(42)
         model_args = ModelArgs()
@@ -1979,9 +1994,6 @@ class TestFullyShardForceSumReduction(FSDPTest):
     # Test both reduce-scatter and all-reduce on HSDP (DDP+FSDP) on 4 GPUs
     # This test verifies NCCL debug logs and is CUDA-specific.
     @skip_if_lt_x_gpu(4)
-    @unittest.skipIf(
-        not TEST_CUDA, "This test verifies NCCL debug logs and is CUDA-specific"
-    )
     def test_fully_shard_force_sum_both_reductions(self):
         mesh = init_device_mesh(
             device_type.type, (2, self.world_size // 2), mesh_dim_names=("ddp", "fsdp")
@@ -2047,6 +2059,8 @@ class TestFullyShardForceSumReduction(FSDPTest):
 
 
 class TestFullyShardReduceOpWorldSize1(FSDPTest):
+    hw_classification = HardwareClassification.GENERIC
+
     @property
     def world_size(self) -> int:
         return 1
@@ -2094,6 +2108,52 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
         ) = _get_gradient_divide_factors(group, None, torch.float32)
         self.assertEqual(all_reduce_op, ReduceOp.SUM)
 
+
+instantiate_device_type_tests(
+    TestFullyShardCollectiveOps,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+instantiate_device_type_tests(
+    TestFullyShardCommunication,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+instantiate_device_type_tests(
+    TestFullyShardPrefetch,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+instantiate_device_type_tests(
+    TestFullyShardUnshardMultiProcess,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+instantiate_device_type_tests(
+    TestFullyShardAllocFromPG,
+    globals(),
+    only_for=["cuda"],
+)
+
+instantiate_device_type_tests(
+    TestFullyShardSymmMem,
+    globals(),
+    only_for=["cuda"],
+)
+
+instantiate_device_type_tests(
+    TestFullyShardForceSumReduction,
+    globals(),
+    only_for=["cuda"],
+)
 
 if __name__ == "__main__":
     run_tests()

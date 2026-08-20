@@ -355,6 +355,7 @@ class Capability:
         flash_attention = "attention.flash_attention"
         mem_efficient_attention = "attention.mem_efficient_attention"
 
+<<<<<<< ours
     class distributed:
         """Distributed runtime capabilities."""
 
@@ -412,6 +413,13 @@ def _device_module_available(device_type: str) -> bool:
         return torch.get_device_module(device_type).is_available()
     except (AttributeError, RuntimeError):
         return False
+=======
+    class collective:
+        """Collective communication capabilities (reconfigure, etc.)."""
+
+        reconfigure = "collective.reconfigure"
+        work_result = "collective.work_result"
+>>>>>>> theirs
 
 
 class DeviceTypeTestBase(TestCase):
@@ -874,6 +882,7 @@ class CPUTestBase(DeviceTypeTestBase):
 
     @classmethod
     def _capabilities(cls):
+<<<<<<< ours
         from torch.utils._triton import has_triton
 
         capabilities = super()._capabilities()
@@ -909,6 +918,20 @@ class CPUTestBase(DeviceTypeTestBase):
             {Capability.lib.triton: lambda: has_triton()}
         )
         return capabilities
+=======
+        import torch.distributed as dist
+
+        return {
+            Capability.dtype.fp8: lambda: True,
+            Capability.dtype.bf16: lambda: True,
+            Capability.attention.flash_attention: lambda: True,
+            Capability.attention.mem_efficient_attention: lambda: False,
+            # gloo (the default CPU backend) supports reconfigure; it is built
+            # whenever distributed is built. gloo does not report WorkResult.
+            Capability.collective.reconfigure: lambda: dist.is_available(),
+            Capability.collective.work_result: lambda: False,
+        }
+>>>>>>> theirs
 
 
 class CUDATestBase(DeviceTypeTestBase):
@@ -925,12 +948,14 @@ class CUDATestBase(DeviceTypeTestBase):
 
     @classmethod
     def _capabilities(cls):
+        import torch.distributed as dist
         from torch.testing._internal.common_cuda import (
             PLATFORM_SUPPORTS_FLASH_ATTENTION,
             PLATFORM_SUPPORTS_FP8,
             PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
             SM80OrLater,
         )
+<<<<<<< ours
         from torch.utils._triton import has_triton
 
         capabilities = super()._capabilities()
@@ -972,6 +997,22 @@ class CUDATestBase(DeviceTypeTestBase):
             {Capability.lib.triton: lambda: has_triton()}
         )
         return capabilities
+=======
+
+        def nccl2_available():
+            return dist.is_available() and dist.is_backend_available("nccl2")
+
+        return {
+            Capability.dtype.fp8: lambda: PLATFORM_SUPPORTS_FP8,
+            Capability.dtype.bf16: lambda: SM80OrLater,
+            Capability.attention.flash_attention: lambda: PLATFORM_SUPPORTS_FLASH_ATTENTION,
+            Capability.attention.mem_efficient_attention: lambda: PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
+            # nccl2 is the reconfigure-capable CUDA backend (default "nccl" is
+            # not) and is the only backend that reports WorkResult.
+            Capability.collective.reconfigure: nccl2_available,
+            Capability.collective.work_result: nccl2_available,
+        }
+>>>>>>> theirs
 
     @classmethod
     def get_primary_device(cls):
