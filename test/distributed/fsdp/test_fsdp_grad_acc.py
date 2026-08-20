@@ -13,6 +13,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     BackwardPrefetch,
     ShardingStrategy,
 )
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
     DEVICEInitMode,
@@ -21,7 +22,6 @@ from torch.testing._internal.common_fsdp import (
     TransformerWithSharedParams,
 )
 from torch.testing._internal.common_utils import (
-    instantiate_parametrized_tests,
     parametrize,
     run_tests,
     TEST_WITH_DEV_DBG_ASAN,
@@ -88,6 +88,7 @@ class TestGradAcc(FSDPTestContinuous):
 
     def _test_grad_acc(
         self,
+        device,
         batch_dim: int,
         configs: list[_GradAccConfig],
         cpu_offload: CPUOffload,
@@ -104,6 +105,7 @@ class TestGradAcc(FSDPTestContinuous):
         specified by the last element of ``configs``.
 
         Arguments:
+            device (str): Device type supplied by ``instantiate_device_type_tests``.
             batch_dim (int): Batch dimension in the input tensor to be passed
                 into the model for the forward pass.
             configs (List[_GradAccConfig]): :class:`list` of configurations
@@ -133,7 +135,7 @@ class TestGradAcc(FSDPTestContinuous):
             deterministic=True,
             add_bn=False,  # disable BN since the test uses varying batch sizes
         )
-        device = torch.device("cuda")
+        device_type = torch.device(device).type
         optim = torch.optim.SGD(
             fsdp_model.parameters(),
             lr=0.01,
@@ -145,7 +147,7 @@ class TestGradAcc(FSDPTestContinuous):
         def permute_tensor(x: torch.Tensor):
             return x.view(-1)[torch.randperm(x.numel())].view_as(x)
 
-        batch: tuple[torch.Tensor, ...] = fsdp_model.module.get_input(device)
+        batch: tuple[torch.Tensor, ...] = fsdp_model.module.get_input(device_type)
         batches: list[tuple[torch.Tensor, ...]] = [batch]
         num_iters_to_acc = sum(config.num_iters for config in configs)
         for _ in range(num_iters_to_acc - 1):
@@ -252,6 +254,7 @@ class TestGradAcc(FSDPTestContinuous):
     @parametrize("use_orig_params", [False, True])
     def test_grad_acc(
         self,
+        device,
         configs: _GradAccConfigs,
         use_orig_params: bool,
     ):
@@ -269,6 +272,7 @@ class TestGradAcc(FSDPTestContinuous):
         self.run_subtests(
             subtest_config,
             self._test_grad_acc,
+            device=device,
             batch_dim=1,
             configs=configs.configs,
             use_orig_params=use_orig_params,
@@ -278,6 +282,7 @@ class TestGradAcc(FSDPTestContinuous):
     @parametrize("use_orig_params", [False, True])
     def test_grad_acc_cpu_offload(
         self,
+        device,
         use_orig_params: bool,
     ):
         """
@@ -294,13 +299,15 @@ class TestGradAcc(FSDPTestContinuous):
         self.run_subtests(
             subtest_config,
             self._test_grad_acc,
+            device=device,
             batch_dim=1,
             configs=configs.configs,
             use_orig_params=use_orig_params,
         )
 
 
-instantiate_parametrized_tests(TestGradAcc)
+devices = ("cuda", "hpu", "xpu")
+instantiate_device_type_tests(TestGradAcc, globals(), only_for=devices, allow_xpu=True)
 
 if __name__ == "__main__":
     run_tests()
