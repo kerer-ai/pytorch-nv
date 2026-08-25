@@ -332,6 +332,12 @@ class TestCapabilityGating(TestCase):
             )
         super().tearDownClass()
 
+    def test_compile_capability_defaults_to_unsupported(self, device):
+        capabilities = type(self).get_capabilities()
+        self.assertIn(Capability.compile.inductor, capabilities)
+        self.assertFalse(capabilities[Capability.compile.inductor])
+        type(self).executed_count += 1
+
     @requires_capabilities(Capability.lib.triton)
     def test_capability_supported(self, device):
         type(self).executed_count += 1
