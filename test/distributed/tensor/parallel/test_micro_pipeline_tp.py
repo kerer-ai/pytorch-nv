@@ -75,6 +75,9 @@ class MicroPipelineTPTest(TestCase):
 
         self.rank = 0
         self.world_size = 2
+        torch.get_device_module(type(self).device_type).set_device(
+            type(self).get_primary_device()
+        )
 
         store = FakeStore()
         dist.init_process_group(
@@ -730,6 +733,9 @@ class MicroPipelineTP4GPUTest(TestCase):
 
         self.rank = 0
         self.world_size = 4
+        torch.get_device_module(type(self).device_type).set_device(
+            type(self).get_primary_device()
+        )
 
         store = FakeStore()
         dist.init_process_group(
@@ -781,7 +787,7 @@ class MicroPipelineTP4GPUTest(TestCase):
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
-    def test_fusion_without_deprecated_enable(self):
+    def test_fusion_without_deprecated_enable(self, device):
         # Fusion must not require the deprecated enable_symm_mem_for_group
         # (https://github.com/pytorch/pytorch/issues/193027), so no _test_mode here.
         group = dist.group.WORLD
@@ -795,9 +801,9 @@ class MicroPipelineTP4GPUTest(TestCase):
                 A @ B, "avg", scatter_dim=0, group=group.group_name
             )
 
-        A_shard = torch.rand(32, 32, device="cuda")
-        A = torch.rand(64, 32, device="cuda")
-        B = torch.rand(32, 16, device="cuda")
+        A_shard = torch.rand(32, 32, device=device)
+        A = torch.rand(64, 32, device=device)
+        B = torch.rand(32, 16, device=device)
 
         gm = _make_post_grad_fx(ag_mm, A_shard, B)
         micro_pipeline_tp_pass(gm.graph)

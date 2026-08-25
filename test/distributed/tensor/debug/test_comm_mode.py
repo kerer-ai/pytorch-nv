@@ -139,7 +139,7 @@ class TestCommMode(DeviceTypeTestBase):
         return
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
-    def test_comm_mode_with_c10d(self):
+    def test_comm_mode_with_c10d(self, device):
         if not torch.accelerator.is_available():
             return
 

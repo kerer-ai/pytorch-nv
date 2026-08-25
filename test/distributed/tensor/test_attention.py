@@ -56,6 +56,7 @@ from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_ATTENTION,
     PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
 )
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_device_type import (
     Capability,
@@ -426,6 +427,40 @@ class RingAttentionTestDevice(DTensorTestBase):
             _cp_options.enable_load_balance = old_load_balance
 
 
+class TestRingAttentionUtils(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_is_causal_behavior(self) -> None:
+        _cp_options.enable_load_balance = False
+        self.assertEqual(
+            _is_causal_behavior(rank=0, world_size=4, i=0, is_causal=False),
+            _CausalBehavior.NOT_IS_CAUSAL,
+        )
+
+        ranks = [
+            [_CausalBehavior.IS_CAUSAL, _CausalBehavior.SKIP],
+            [_CausalBehavior.IS_CAUSAL, _CausalBehavior.NOT_IS_CAUSAL],
+        ]
+        for rank, iters in enumerate(ranks):
+            for i, behavior in enumerate(iters):
+                self.assertEqual(
+                    _is_causal_behavior(rank=rank, world_size=2, i=i, is_causal=True),
+                    behavior,
+                )
+
+        _cp_options.enable_load_balance = True
+        ranks = [
+            [_CausalBehavior.IS_CAUSAL, _CausalBehavior.NOT_IS_CAUSAL],
+            [_CausalBehavior.IS_CAUSAL, _CausalBehavior.NOT_IS_CAUSAL],
+        ]
+        for rank, iters in enumerate(ranks):
+            for i, behavior in enumerate(iters):
+                self.assertEqual(
+                    _is_causal_behavior(rank=rank, world_size=2, i=i, is_causal=True),
+                    behavior,
+                )
+
+
 # Compile the flex_attention function
 compiled_flex_attention = torch.compile(flex_attention, dynamic=False, fullgraph=True)
 compiled_create_block_mask = torch.compile(
@@ -547,6 +582,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         return FlexAttentionWrapper._flex_attn(*args, **kwargs)
 
 
+@requires_cuda
 class CPFlexAttentionTest(DTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
@@ -1050,14 +1086,14 @@ class TestContextParallelStyle(DTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    def _create_test_tensors(self):
+    def _create_test_tensors(self, device_type):
         """Helper to create test query, key, value tensors"""
-        query = torch.randn(2, 4, 128, 64, device=self.device_type)
-        key = torch.randn(2, 4, 128, 64, device=self.device_type)
-        value = torch.randn(2, 4, 128, 64, device=self.device_type)
+        query = torch.randn(2, 4, 128, 64, device=device_type)
+        key = torch.randn(2, 4, 128, 64, device=device_type)
+        value = torch.randn(2, 4, 128, 64, device=device_type)
         return query, key, value
 
-    def _setup_mock_and_context(self, mock_allgather, key, value):
+    def _setup_mock_and_context(self, mock_allgather, key, value, device_type):
         """Helper to setup mock and create CP instance + device mesh"""
         # Setup mock with transformed tensors
         mock_key = key * 2
@@ -1068,7 +1104,7 @@ class TestContextParallelStyle(DTensorTestBase):
         cp_style = _ContextParallel(
             seq_dim=2, attention_type=_ContextParallel.AttentionType.FLEX
         )
-        device_mesh = DeviceMesh(self.device_type, torch.arange(0, self.world_size))
+        device_mesh = DeviceMesh(device_type, torch.arange(0, self.world_size))
 
         return cp_style, device_mesh, mock_key, mock_value
 
@@ -1078,9 +1114,10 @@ class TestContextParallelStyle(DTensorTestBase):
     )
     def test_flex_input_fn_all_positional(self, mock_allgather, device):
         """Test flex_input_fn with all positional arguments"""
-        query, key, value = self._create_test_tensors()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
         cp_style, device_mesh, mock_key, mock_value = self._setup_mock_and_context(
-            mock_allgather, key, value
+            mock_allgather, key, value, device_type
         )
 
         # Call with all positional args
@@ -1104,9 +1141,10 @@ class TestContextParallelStyle(DTensorTestBase):
     )
     def test_flex_input_fn_all_keyword(self, mock_allgather, device):
         """Test flex_input_fn with all keyword arguments"""
-        query, key, value = self._create_test_tensors()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
         cp_style, device_mesh, mock_key, mock_value = self._setup_mock_and_context(
-            mock_allgather, key, value
+            mock_allgather, key, value, device_type
         )
 
         # Call with all keyword args
@@ -1132,9 +1170,10 @@ class TestContextParallelStyle(DTensorTestBase):
     )
     def test_flex_input_fn_query_positional_kv_keyword(self, mock_allgather, device):
         """Test with query positional, key/value keyword"""
-        query, key, value = self._create_test_tensors()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
         cp_style, device_mesh, mock_key, mock_value = self._setup_mock_and_context(
-            mock_allgather, key, value
+            mock_allgather, key, value, device_type
         )
 
         # Query positional, key/value keyword
@@ -1159,9 +1198,10 @@ class TestContextParallelStyle(DTensorTestBase):
     )
     def test_flex_input_fn_qk_positional_v_keyword(self, mock_allgather, device):
         """Test with query/key positional, value keyword"""
-        query, key, value = self._create_test_tensors()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
         cp_style, device_mesh, mock_key, mock_value = self._setup_mock_and_context(
-            mock_allgather, key, value
+            mock_allgather, key, value, device_type
         )
 
         # Query/key positional, value keyword
@@ -1185,9 +1225,10 @@ class TestContextParallelStyle(DTensorTestBase):
     )
     def test_flex_input_fn_with_extra_args(self, mock_allgather, device):
         """Test with mixed positional/keyword and extra arguments"""
-        query, key, value = self._create_test_tensors()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
         cp_style, device_mesh, mock_key, mock_value = self._setup_mock_and_context(
-            mock_allgather, key, value
+            mock_allgather, key, value, device_type
         )
 
         # Mix of positional and keyword with extra args
@@ -1221,26 +1262,27 @@ class TestContextParallelStyleSDPA(DTensorTestBase):
     def world_size(self) -> int:
         return 2
 
-    def _create_test_tensors(self):
+    def _create_test_tensors(self, device_type):
         """Helper to create test query, key, value tensors"""
-        query = torch.randn(2, 4, 128, 64, device=self.device_type)
-        key = torch.randn(2, 4, 128, 64, device=self.device_type)
-        value = torch.randn(2, 4, 128, 64, device=self.device_type)
+        query = torch.randn(2, 4, 128, 64, device=device_type)
+        key = torch.randn(2, 4, 128, 64, device=device_type)
+        value = torch.randn(2, 4, 128, 64, device=device_type)
         return query, key, value
 
-    def _setup_context(self):
+    def _setup_context(self, device_type):
         """Helper to create CP instance and device mesh"""
         cp_style = _ContextParallel(
             seq_dim=2, attention_type=_ContextParallel.AttentionType.SDPA
         )
-        device_mesh = DeviceMesh(self.device_type, torch.arange(0, self.world_size))
+        device_mesh = DeviceMesh(device_type, torch.arange(0, self.world_size))
         return cp_style, device_mesh
 
     @with_comms
     def test_sdpa_input_fn_all_positional(self, device):
         """Test sdpa_input_fn with all positional arguments"""
-        query, key, value = self._create_test_tensors()
-        cp_style, device_mesh = self._setup_context()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
+        cp_style, device_mesh = self._setup_context(device_type)
 
         # Call with all positional args
         args = (query, key, value)
@@ -1266,8 +1308,9 @@ class TestContextParallelStyleSDPA(DTensorTestBase):
     @with_comms
     def test_sdpa_input_fn_all_keyword(self, device):
         """Test sdpa_input_fn with all keyword arguments"""
-        query, key, value = self._create_test_tensors()
-        cp_style, device_mesh = self._setup_context()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
+        cp_style, device_mesh = self._setup_context(device_type)
 
         # Call with all keyword args
         args = ()
@@ -1295,8 +1338,9 @@ class TestContextParallelStyleSDPA(DTensorTestBase):
     @with_comms
     def test_sdpa_input_fn_query_positional_kv_keyword(self, device):
         """Test sdpa_input_fn with query positional, key/value keyword"""
-        query, key, value = self._create_test_tensors()
-        cp_style, device_mesh = self._setup_context()
+        device_type = torch.device(device).type
+        query, key, value = self._create_test_tensors(device_type)
+        cp_style, device_mesh = self._setup_context(device_type)
 
         # Query positional, key/value keyword
         args = (query,)

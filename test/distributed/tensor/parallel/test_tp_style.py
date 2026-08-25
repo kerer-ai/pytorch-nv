@@ -467,5 +467,6 @@ TensorParallelStyleTestWithLocalTensor = create_local_tensor_test_class(
     TensorParallelStyleTest,
 )
 
+
 if __name__ == "__main__":
     run_tests()

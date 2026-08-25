@@ -34,7 +34,8 @@ class TestRegisterSharding(DTensorTestBase):
             delattr(torch.ops, "test_dtensor")
 
     @with_comms
-    def test_softmax_fwd(self):
+    def test_softmax_fwd(self, device):
+        device_type = torch.device(device).type
         # After registering the custom softmax sharding strategy,
         # the original entry would have been replaced.
         # The following line is for showcasing purpose only.
@@ -73,7 +74,7 @@ class TestRegisterSharding(DTensorTestBase):
 
         device_mesh = self.build_device_mesh()
 
-        x = torch.rand(8, 12, 16, device=self.device_type)
+        x = torch.rand(8, 12, 16, device=device_type)
         dims = range(3)  # used to convert -1 to the actual dim
         softmax_dims = [-1, 0, 1]
         shard_dims = [0, 1, 2]
@@ -95,7 +96,9 @@ class TestRegisterSharding(DTensorTestBase):
                 self.assertEqual(dist_y.full_tensor(), local_y)
 
     @with_comms
-    def test_argmax(self):
+    def test_argmax(self, device):
+        device_type = torch.device(device).type
+
         @register_sharding(aten.argmax.default)
         def custom_argmax_sharding(x, dim, keepdim):
             acceptable_shardings = []
@@ -123,7 +126,7 @@ class TestRegisterSharding(DTensorTestBase):
 
         device_mesh = self.build_device_mesh()
 
-        x = torch.rand(8, 12, device=self.device_type)
+        x = torch.rand(8, 12, device=device_type)
         dist_x = distribute_tensor(x, device_mesh, [Shard(0)])
 
         local_y = torch.argmax(x, dim=1, keepdim=True)
@@ -133,9 +136,10 @@ class TestRegisterSharding(DTensorTestBase):
         self.assertEqual(dist_y.full_tensor(), local_y)
 
     @with_comms
-    def test_register_sharding_for_tensor_kwargs(self):
+    def test_register_sharding_for_tensor_kwargs(self, device):
+        device_type = torch.device(device).type
         mesh = self.build_device_mesh()
-        x = torch.randn(4, 4, device=self.device_type)
+        x = torch.randn(4, 4, device=device_type)
         x_dt = distribute_tensor(x, mesh, [Replicate()])
 
         @register_sharding(aten.min.dim_min)
@@ -146,8 +150,8 @@ class TestRegisterSharding(DTensorTestBase):
             )
             return [all_replicate]
 
-        value = torch.randn(4, 1, device=self.device_type)
-        indices = torch.randn(4, 1, device=self.device_type).long()
+        value = torch.randn(4, 1, device=device_type)
+        indices = torch.randn(4, 1, device=device_type).long()
         value_dt = distribute_tensor(value, mesh, [Replicate()])
         indices_dt = distribute_tensor(indices, mesh, [Replicate()])
 
@@ -161,9 +165,12 @@ class TestRegisterSharding(DTensorTestBase):
         self.assertEqual(result[1].full_tensor(), expected_indices)
 
     @with_comms
-    def test_register_sharding_non_tensor_first_arg(self):
+    def test_register_sharding_non_tensor_first_arg(self, device):
+        device_type = torch.device(device).type
+
         # Test that get_mesh_from_args works when the first arg is not a DTensor
         # Regression test for https://github.com/pytorch/pytorch/issues/167915
+
         @torch.library.custom_op("test_dtensor::scalar_first_arg", mutates_args=())
         def scalar_first_arg(name: str, x: torch.Tensor) -> torch.Tensor:
             return x.clone()
@@ -177,7 +184,7 @@ class TestRegisterSharding(DTensorTestBase):
             return [([Replicate()], [None, Replicate()])]
 
         mesh = self.build_device_mesh()
-        x = torch.randn(4, 4, device=self.device_type)
+        x = torch.randn(4, 4, device=device_type)
         x_dt = distribute_tensor(x, mesh, [Replicate()])
 
         # This should not raise "Cannot find device mesh from args"
