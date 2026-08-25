@@ -300,6 +300,10 @@ def _maybe_handle_skip_if_lt_x_gpu(args, msg) -> bool:
 def skip_if_lt_x_gpu(x, *, allow_cpu=False):
     """Skip if fewer than x accelerators available.
 
+    NOTE: The naming retains "gpu" for backward compatibility, but the logic
+    is hardware-agnostic and works for any accelerator supported by
+    torch.accelerator (e.g., CUDA, XPU, HPU, and PrivateUse1-based backends).
+
     Args:
         x: Minimum number of accelerators required.
         allow_cpu: If True, run the test on CPU-only machines (no accelerators).
