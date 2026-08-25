@@ -1204,6 +1204,12 @@ class PrivateUse1TestBase(DeviceTypeTestBase):
         device_type = torch._C._get_privateuse1_backend_name()
         capabilities.update(
             {
+                Capability.attention: {
+                    Capability.attention.flash_attention: lambda: True,
+                    Capability.attention.mem_efficient_attention: lambda: True,
+                    Capability.attention.cuda_attention: lambda: False,
+                    Capability.attention.fused_attention: lambda: False,
+                },
                 Capability.distributed: {
                     Capability.distributed.backend: lambda: _distributed_backend_available(
                         device_type
