@@ -1179,9 +1179,6 @@ class RedistributeTest(DTensorContinuousTestBase):
             self.assertEqual(weight_ref.grad, weight.grad.full_tensor())
 
 
-instantiate_parametrized_tests(RedistributeTest)
-
-
 class MultiDimRedistributeTest(DTensorContinuousTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
     world_size = 8
@@ -1846,11 +1843,12 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         else:
             return ""
 
-    def test_strided_shard_redistribution(self):
+    def test_strided_shard_redistribution(self, device):
+        device_type = torch.device(device).type
         torch.manual_seed(21)
         # 1D mesh: _StridedShard -> Replicate uses the greedy path's 1D shortcut
-        mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
-        input_1d = torch.randn((16, 13), device=self.device_type)
+        mesh_1d = init_device_mesh(device_type, (self.world_size,))
+        input_1d = torch.randn((16, 13), device=device_type)
         src_dt = distribute_tensor(
             input_1d, mesh_1d, [_StridedShard(0, split_factor=2)]
         )
@@ -1861,8 +1859,8 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(src_dt.full_tensor(), input_1d)
 
         # 2D mesh: _StridedShard with undecodable split_factor falls back to greedy
-        mesh_2d = init_device_mesh(self.device_type, (4, 2))
-        input_2d = torch.randn((24, 8), device=self.device_type)
+        mesh_2d = init_device_mesh(device_type, (4, 2))
+        input_2d = torch.randn((24, 8), device=device_type)
         src_dt = distribute_tensor(
             input_2d, mesh_2d, [_StridedShard(0, split_factor=3), Replicate()]
         )
@@ -1870,8 +1868,8 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(result_dt.to_local(), input_2d)
 
         # 3D mesh cases
-        mesh = init_device_mesh(self.device_type, (2, 2, 2))
-        input_data = torch.randn((31, 13, 11), device=self.device_type)
+        mesh = init_device_mesh(device_type, (2, 2, 2))
+        input_data = torch.randn((31, 13, 11), device=device_type)
         sharding_src_dst_pairs_with_expected_trace = [
             (
                 (
@@ -1961,14 +1959,15 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
             )
             self.assertEqual(sharded_dt.to_local(), expected_dt.to_local())
 
-    def test_strided_shard_to_shard_redistribution(self):
+    def test_strided_shard_to_shard_redistribution(self, device):
+        device_type = torch.device(device).type
         torch.manual_seed(42)
-        mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
-        mesh_2d = init_device_mesh(self.device_type, (4, 2))
-        mesh_3d = init_device_mesh(self.device_type, (2, 2, 2))
-        input_1d = torch.randn((16, 13), device=self.device_type)
-        input_2d = torch.randn((24, 8), device=self.device_type)
-        input_3d = torch.randn((31, 13, 11), device=self.device_type)
+        mesh_1d = init_device_mesh(device_type, (self.world_size,))
+        mesh_2d = init_device_mesh(device_type, (4, 2))
+        mesh_3d = init_device_mesh(device_type, (2, 2, 2))
+        input_1d = torch.randn((16, 13), device=device_type)
+        input_2d = torch.randn((24, 8), device=device_type)
+        input_3d = torch.randn((31, 13, 11), device=device_type)
 
         # _StridedShard <-> Shard on 1D, 2D, and 3D meshes
         redistribute_pairs = [
@@ -2038,12 +2037,13 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         )
         self.assertEqual(result_dt.to_local(), expected_dt.to_local())
 
-    def test_partial_to_strided_shard_redistribution(self):
+    def test_partial_to_strided_shard_redistribution(self, device):
+        device_type = torch.device(device).type
         torch.manual_seed(42)
 
         # 1D mesh, Partial -> _StridedShard(0)
-        mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
-        input_1d = torch.randn((16, 13), device=self.device_type)
+        mesh_1d = init_device_mesh(device_type, (self.world_size,))
+        input_1d = torch.randn((16, 13), device=device_type)
         src_dt = DTensor.from_local(
             input_1d.clone(), mesh_1d, [Partial("sum")], run_check=False
         )
@@ -2056,8 +2056,8 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(result_dt.full_tensor(), reduced)
 
         # 2D mesh (4x2), [Partial, Replicate()] -> [_StridedShard(0), Replicate()]
-        mesh_2d = init_device_mesh(self.device_type, (4, 2))
-        input_2d = torch.randn((24, 8), device=self.device_type)
+        mesh_2d = init_device_mesh(device_type, (4, 2))
+        input_2d = torch.randn((24, 8), device=device_type)
         src_dt = DTensor.from_local(
             input_2d.clone(), mesh_2d, [Partial("sum"), Replicate()], run_check=False
         )
@@ -2071,12 +2071,13 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(result_dt.to_local(), expected_dt.to_local())
         self.assertEqual(result_dt.full_tensor(), reduced_2d)
 
-    def test_strided_shard_to_partial_raises(self):
+    def test_strided_shard_to_partial_raises(self, device):
+        device_type = torch.device(device).type
         torch.manual_seed(42)
 
         # 1D mesh
-        mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
-        input_1d = torch.randn((16, 13), device=self.device_type)
+        mesh_1d = init_device_mesh(device_type, (self.world_size,))
+        input_1d = torch.randn((16, 13), device=device_type)
         src_dt = distribute_tensor(
             input_1d, mesh_1d, [_StridedShard(0, split_factor=2)]
         )
@@ -2084,8 +2085,8 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
             src_dt.redistribute(mesh_1d, [Partial("sum")])
 
         # 2D mesh
-        mesh_2d = init_device_mesh(self.device_type, (4, 2))
-        input_2d = torch.randn((24, 8), device=self.device_type)
+        mesh_2d = init_device_mesh(device_type, (4, 2))
+        input_2d = torch.randn((24, 8), device=device_type)
         src_dt = distribute_tensor(
             input_2d, mesh_2d, [_StridedShard(0, split_factor=3), Replicate()]
         )
@@ -3032,16 +3033,15 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
     world_size = 8
 
-    def test_merging_reductions(self):
+    def test_merging_reductions(self, device):
         """Tests various combinations in the same test function to avoid setup time"""
-        mesh = init_device_mesh(
-            self.device_type, (2, 2, 2), mesh_dim_names=("A", "B", "C")
-        )
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (2, 2, 2), mesh_dim_names=("A", "B", "C"))
 
         # Test: All three consecutive dims with same reduce op CAN be merged
         mesh["A", "B", "C"]._flatten("A_B_C")
 
-        local_tensor = torch.ones(8, 8, device=self.device_type)
+        local_tensor = torch.ones(8, 8, device=device_type)
         dt = DTensor.from_local(
             local_tensor,
             mesh,
@@ -3063,7 +3063,7 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
         # Test: Two consecutive dims (A,B) with same reduce op CAN be merged
         mesh["A", "B"]._flatten("A_B")
 
-        local_tensor = torch.ones(8, 8, device=self.device_type)
+        local_tensor = torch.ones(8, 8, device=device_type)
         dt = DTensor.from_local(
             local_tensor,
             mesh,
@@ -3085,7 +3085,7 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
         # Test: Non-consecutive dims (A,C) with Replicate on B - CAN merge now
         mesh["A", "C"]._flatten("A_C")
 
-        local_tensor = torch.ones(8, 8, device=self.device_type)
+        local_tensor = torch.ones(8, 8, device=device_type)
         dt = DTensor.from_local(
             local_tensor,
             mesh,
@@ -3105,7 +3105,7 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
         self.assertEqual(result.to_local(), expected)
 
         # Test: Non-consecutive dims (A,C) with Shard on B - CAN merge
-        local_tensor = torch.ones(8, 8, device=self.device_type)
+        local_tensor = torch.ones(8, 8, device=device_type)
         dt = DTensor.from_local(
             local_tensor,
             mesh,
@@ -3123,7 +3123,7 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_total_counts(), 3)
 
         # Verify correctness: sum across A (2) and C (2) = 4x, gather on B
-        expected = torch.ones(8 * 2, 8, device=self.device_type) * 4
+        expected = torch.ones(8 * 2, 8, device=device_type) * 4
         self.assertEqual(result.to_local(), expected)
 
 
@@ -3138,7 +3138,7 @@ class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
     world_size = 6  # 2 x 3 mesh
 
-    def test_partial_partial_to_shard_shard_uneven(self):
+    def test_partial_partial_to_shard_shard_uneven(self, device):
         """Test that Partial,Partial -> Shard(0),Shard(0) produces correct results with uneven dims.
 
         With mesh [2, 3] and tensor dim 0 size = 4:
@@ -3148,7 +3148,8 @@ class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
         The flattened optimization should NOT be applied when it would change
         which elements go to which ranks.
         """
-        mesh = init_device_mesh(self.device_type, (2, 3), mesh_dim_names=("A", "B"))
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (2, 3), mesh_dim_names=("A", "B"))
         # Create flattened mesh for the optimization
         mesh["A", "B"]._flatten("A_B")
 
@@ -3156,7 +3157,7 @@ class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
         # This creates an uneven sharding scenario
         tensor_size = 4
         local_tensor = torch.arange(
-            tensor_size, dtype=torch.float32, device=self.device_type
+            tensor_size, dtype=torch.float32, device=device_type
         ).unsqueeze(1)  # Shape: [4, 1]
 
         # Create a Partial,Partial DTensor (each rank has the same values)
@@ -3211,6 +3212,27 @@ class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
             )
 
 
+instantiate_device_type_tests(
+    DistributeWithStridedShardTest,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+instantiate_device_type_tests(
+    FlattenedReductionIntegrationTest,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+instantiate_device_type_tests(
+    UnevenFlattenedReduceScatterTest,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+
+instantiate_parametrized_tests(RedistributeTest)
 RedistributeTestWithLocalTensor = create_local_tensor_test_class(
     RedistributeTest,
     base_class=LocalDTensorContinuousTestBase,

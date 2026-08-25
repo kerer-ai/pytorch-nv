@@ -2041,5 +2041,6 @@ DistMathOpsTestWithLocalTensor = create_local_tensor_test_class(
     DistMathOpsTest,
 )
 
+
 if __name__ == "__main__":
     run_tests()

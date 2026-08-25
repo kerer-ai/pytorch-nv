@@ -1340,9 +1340,6 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
             self.assertEqual(op(dx, dn).to_local(), op(x, n))
 
 
-instantiate_parametrized_tests(DistElementwiseOpsTest)
-
-
 class TestPointwiseRuleValidation(TestCase):
     """Validate registered partial-placement rules via OpInfo samples."""
 
@@ -1436,6 +1433,7 @@ class TestPointwiseRuleValidation(TestCase):
                 self._with_even_sizes(run)
 
 
+instantiate_parametrized_tests(DistElementwiseOpsTest)
 DistElementwiseOpsTestWithLocalTensor = create_local_tensor_test_class(
     DistElementwiseOpsTest, base_class=LocalDTensorOpTestBase
 )

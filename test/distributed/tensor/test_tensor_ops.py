@@ -1556,16 +1556,17 @@ class DistBucketizeTest(LocalDTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @with_comms
-    def test_bucketize_partial_input(self):
+    def test_bucketize_partial_input(self, device):
+        device_type = torch.device(device).type
         # Bucketize is non-linear, so Partial("sum")/Partial("avg") inputs
         # must be converted to Replicate. But bucketize is monotone, so
         # Partial("max") and Partial("min") can propagate directly.
         with LocalTensorMode(ranks=self.world_size):
-            mesh = self.build_device_mesh()
-            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=self.device_type)
+            mesh = init_device_mesh(device_type, (self.world_size,))
+            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=device_type)
             input_tensor = torch.tensor(
                 [[2.0, 4.0, 6.0, 8.0], [0.0, 1.0, 5.0, 9.0]],
-                device=self.device_type,
+                device=device_type,
             )
 
             # Non-linear reductions: must redistribute to Replicate
@@ -1607,12 +1608,13 @@ class DistBucketizeTest(LocalDTensorTestBase):
                 self.assertEqual(result.full_tensor(), expected)
 
     @with_comms
-    def test_bucketize_sharded_input(self):
+    def test_bucketize_sharded_input(self, device):
+        device_type = torch.device(device).type
         # Sharded inputs should propagate sharding to output normally.
         with LocalTensorMode(ranks=self.world_size):
-            mesh = self.build_device_mesh()
-            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=self.device_type)
-            input_tensor = torch.randn(8, 4, device=self.device_type)
+            mesh = init_device_mesh(device_type, (self.world_size,))
+            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=device_type)
+            input_tensor = torch.randn(8, 4, device=device_type)
             expected = torch.bucketize(input_tensor, boundaries)
 
             for shard_dim in range(2):
@@ -1624,16 +1626,17 @@ class DistBucketizeTest(LocalDTensorTestBase):
                 self.assertEqual(result.full_tensor(), expected)
 
     @with_comms
-    def test_bucketize_sharded_boundaries(self):
+    def test_bucketize_sharded_boundaries(self, device):
+        device_type = torch.device(device).type
         # When boundaries are sharded on dim 0, each rank counts how many of
         # its local boundary values each input exceeds. The sum across ranks
         # (Partial("sum")) gives the correct global bucket index.
         with LocalTensorMode(ranks=self.world_size):
-            mesh = self.build_device_mesh()
-            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=self.device_type)
+            mesh = init_device_mesh(device_type, (self.world_size,))
+            boundaries = torch.tensor([1.0, 3.0, 5.0, 7.0], device=device_type)
             input_tensor = torch.tensor(
                 [[2.0, 4.0, 6.0, 8.0], [0.0, 1.0, 5.0, 9.0]],
-                device=self.device_type,
+                device=device_type,
             )
             expected = torch.bucketize(input_tensor, boundaries)
 
@@ -1647,7 +1650,8 @@ class DistToCopyTest(LocalDTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @with_comms
-    def test_to_copy_partial_reduces_for_nonlinear_cast(self):
+    def test_to_copy_partial_reduces_for_nonlinear_cast(self, device):
+        device_type = torch.device(device).type
         # (reduce_op, target_dtype, expect_partial)
         cases = [
             ("sum", torch.int32, False),  # truncation breaks additivity
@@ -1657,8 +1661,8 @@ class DistToCopyTest(LocalDTensorTestBase):
             ("max", torch.bool, False),  # thresholding
         ]
         with LocalTensorMode(ranks=self.world_size):
-            mesh = self.build_device_mesh()
-            input_tensor = torch.randn(4, 4, device=self.device_type)
+            mesh = init_device_mesh(device_type, (self.world_size,))
+            input_tensor = torch.randn(4, 4, device=device_type)
             for reduce_op, target_dtype, expect_partial in cases:
                 dt = DTensor.from_local(input_tensor, mesh, [Partial(reduce_op)])
                 result = dt.to(target_dtype)
@@ -1775,7 +1779,8 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             _get_fast_path_sharding_prop_cache_stats,
         )
 
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         cases = [
             ((8, 8), (8, 8), 0, [Shard(1)], (Shard(1),)),
             ((4, 8), (6, 8), 0, [Replicate()], (Replicate(),)),
@@ -1783,8 +1788,8 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
         ]
         for shape_a, shape_b, cat_dim, placements, expected_placements in cases:
             _clear_fast_path_sharding_prop_cache()
-            global_a = torch.randn(shape_a)
-            global_b = torch.randn(shape_b)
+            global_a = torch.randn(shape_a, device=device_type)
+            global_b = torch.randn(shape_b, device=device_type)
             dt_a = distribute_tensor(global_a, mesh, placements)
             dt_b = distribute_tensor(global_b, mesh, placements)
             # first call: cache miss
@@ -1802,34 +1807,33 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
                 result.full_tensor(), torch.cat([global_a, global_b], dim=cat_dim)
             )
 
-    def test_foreach_mixed_dtensor_and_tensor(self):
+    def test_foreach_mixed_dtensor_and_tensor(self, device):
         from torch.distributed.tensor.debug import (
             _clear_fast_path_sharding_prop_cache,
             _get_fast_path_sharding_prop_cache_stats,
         )
         from torch.distributed.tensor.experimental import implicit_replication
 
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         with implicit_replication():
             _clear_fast_path_sharding_prop_cache()
             dt = distribute_tensor(
-                torch.zeros(4, 4, device=self.device_type), mesh, [Shard(0)]
+                torch.zeros(4, 4, device=device_type), mesh, [Shard(0)]
             )
-            regular = torch.zeros(4, 4, device=self.device_type)
+            regular = torch.zeros(4, 4, device=device_type)
 
             torch._foreach_add_([dt, regular], 1)
             hits, misses = _get_fast_path_sharding_prop_cache_stats()
             self.assertEqual(misses, 1)
-            self.assertEqual(
-                dt.full_tensor(), torch.ones(4, 4, device=self.device_type)
-            )
-            self.assertEqual(regular, torch.ones(4, 4, device=self.device_type))
+            self.assertEqual(dt.full_tensor(), torch.ones(4, 4, device=device_type))
+            self.assertEqual(regular, torch.ones(4, 4, device=device_type))
 
             torch._foreach_add_([dt, regular], 1)
             hits, misses = _get_fast_path_sharding_prop_cache_stats()
             self.assertEqual(hits, 1)
 
-    def test_two_list_op_cache_collision(self):
+    def test_two_list_op_cache_collision(self, device):
         from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
         from torch.distributed.tensor._ops.utils import replicate_op_strategy
         from torch.distributed.tensor.debug import (
@@ -1837,7 +1841,8 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             _get_fast_path_sharding_prop_cache_stats,
         )
 
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         op = torch.ops.testlib.modified_cat_op
 
         with op_strategy_context(
@@ -1846,8 +1851,12 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             schema_info=RuntimeSchemaInfo(needs_pytree=True),
         ):
             _clear_fast_path_sharding_prop_cache()
-            a = distribute_tensor(torch.randn(4, 8), mesh, [Replicate()])
-            b = distribute_tensor(torch.randn(4, 8), mesh, [Replicate()])
+            a = distribute_tensor(
+                torch.randn(4, 8, device=device_type), mesh, [Replicate()]
+            )
+            b = distribute_tensor(
+                torch.randn(4, 8, device=device_type), mesh, [Replicate()]
+            )
 
             op([a], [b])  # cache miss, populates cache
             result = op([a, b], [])  # different list sizes, should also miss
@@ -1856,7 +1865,7 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             self.assertEqual(misses, 2)
             self.assertEqual(result.shape, torch.Size([8, 8]))
 
-    def test_optional_tensor_cache_key(self):
+    def test_optional_tensor_cache_key(self, device):
         """Cache must distinguish op(t1, None, t2) from op(t1, t2, None).
 
         Uses a custom op with high static_argnum so that None args for
@@ -1871,7 +1880,8 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             _get_fast_path_sharding_prop_cache_stats,
         )
 
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         op = torch.ops.testlib.optional_clamp_op
 
         with op_strategy_context(
@@ -1880,7 +1890,9 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             schema_info=RuntimeSchemaInfo(static_argnum=3),
         ):
             _clear_fast_path_sharding_prop_cache()
-            a = distribute_tensor(torch.randn(4, 8), mesh, [Shard(0)])
+            a = distribute_tensor(
+                torch.randn(4, 8, device=device_type), mesh, [Shard(0)]
+            )
 
             op(a, a, None)  # miss 1: key should include None at position 2
             op(a, None, a)  # miss 2: key should include None at position 1
@@ -1889,7 +1901,7 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             self.assertEqual(hits, 0)
             self.assertEqual(misses, 2)
 
-    def test_optional_tensor_cache_key_python_slow_path(self):
+    def test_optional_tensor_cache_key_python_slow_path(self, device):
         """Same as above but exercises the Python slow path via OpSchema directly.
 
         DTensor_OpSchema_recompute_comparison_key_impl must include None
@@ -1898,7 +1910,8 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
         from torch.distributed.tensor._dtensor_spec import DTensorSpec
         from torch.distributed.tensor._op_schema import OpSchema, RuntimeSchemaInfo
 
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         spec = DTensorSpec(mesh, (Shard(0),))
         op = torch.ops.testlib.optional_clamp_op.default
 
@@ -1918,11 +1931,17 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @with_comms
-    def test_backward_no_allgather(self):
+    def test_backward_no_allgather(self, device):
         """Backward on unevenly-sharded DTensor should not allgather (issue #107661)."""
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         placement = (Shard(1),)
-        x = torch.randn(12, self.world_size * 2 + 1, requires_grad=True)
+        x = torch.randn(
+            12,
+            self.world_size * 2 + 1,
+            device=device_type,
+            requires_grad=True,
+        )
         dt = distribute_tensor(x, mesh, placement)
         comm_mode = CommDebugMode()
         with comm_mode:
@@ -1936,7 +1955,7 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         )
 
     @with_comms
-    def test_new_empty_propagates_partial(self):
+    def test_new_empty_propagates_partial(self, device):
         """new_empty/new_empty_strided on a Partial DTensor should inherit Partial.
 
         Uninitialized memory will be overwritten immediately, so the placement
@@ -1944,9 +1963,10 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         copy_ from a Partial source to a Replicate destination triggers an
         unwanted all-reduce (issue #180486).
         """
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         partial_dt = DTensor.from_local(
-            torch.randn(4, 8, device=self.device_type),
+            torch.randn(4, 8, device=device_type),
             device_mesh=mesh,
             placements=[Partial()],
         )
@@ -1965,7 +1985,7 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         self.assertEqual(ones_dt.placements, (Replicate(),))
 
     @with_comms
-    def test_backward_partial_grad_with_transpose(self):
+    def test_backward_partial_grad_with_transpose(self, device):
         """Backward preserves Partial placement when grad is non-contiguous (issue #180486).
 
         When a Replicate DTensor parameter is used with to_local(grad_placements=[Partial()]),
@@ -1973,7 +1993,8 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         layout invariant calls new_empty_strided + copy_ to fix strides. This must preserve
         the Partial placement rather than defaulting to Replicate.
         """
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
 
         class _Model(torch.nn.Module):
             def __init__(self):
@@ -1996,7 +2017,7 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
                 w = w.transpose(1, 2).contiguous()
                 return torch.mm(x, w[0])
 
-        model = _Model().to(self.device_type)
+        model = _Model().to(device_type)
         with torch.no_grad():
             model.weight = torch.nn.Parameter(
                 DTensor.from_local(
@@ -2006,7 +2027,7 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
                 )
             )
 
-        x = torch.randn(2, 8, device=self.device_type, requires_grad=True)
+        x = torch.randn(2, 8, device=device_type, requires_grad=True)
         out = model(x)
         out.sum().backward()
 
@@ -2017,12 +2038,13 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         )
 
     @with_comms
-    def test_backward_channels_last(self):
+    def test_backward_channels_last(self, device):
         """Backward preserves channels-last stride order for unevenly-sharded DTensor."""
-        mesh = self.build_device_mesh()
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         placement = (Shard(2),)
         # H=2*world_size+1 ensures uneven sharding on dim 2
-        x = torch.randn(2, 3, self.world_size * 2 + 1, 4).to(
+        x = torch.randn(2, 3, self.world_size * 2 + 1, 4, device=device_type).to(
             memory_format=torch.channels_last
         )
         x.requires_grad_(True)
