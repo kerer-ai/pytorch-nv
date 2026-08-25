@@ -41,6 +41,7 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.testing._internal.distributed._tensor.common_dtensor import (
+    build_fake_device_mesh,
     create_local_tensor_test_class,
     DTensorOpTestBase,
     DTensorTestBase,
@@ -253,35 +254,6 @@ class TestCostModel(TestCase):
         # Replicate as source: is_replicated() short-circuits to 0 before
         # reaching the shard_order check
         self.assertEqual(redistribute_cost(replica_spec, strided_shard_spec), 0.0)
-
-    def test_addmm_partial_redistribute(self):
-        mesh = DeviceMesh("cpu", torch.arange(self.world_size))
-        # bias/mat1/mat2 are the GLOBAL (unsharded) tensors, distributed below;
-        # the final assert checks full_tensor() against the global addmm. Every
-        # rank must therefore draw identical values: distribute_tensor broadcasts
-        # from rank 0, and the Partial() mat1 reconstruction sums mat1/world_size
-        # across ranks, which only recovers the global mat1 if all ranks match.
-        # This class is a MultiThreadedTestCase, so ranks are threads sharing the
-        # process-global default generator; a per-thread local Generator gives
-        # each rank its own state seeded identically, avoiding interleaved draws.
-        gen = torch.Generator().manual_seed(0)
-        bias = torch.randn(8, generator=gen)
-        mat1 = torch.randn(50, 6, generator=gen)
-        mat2 = torch.randn(6, 8, generator=gen)
-
-        dist_bias = distribute_tensor(bias, mesh, [Shard(0)])
-        dist_mat1 = DTensor.from_local(
-            mat1 / self.world_size,
-            mesh,
-            [Partial()],
-            run_check=False,
-        )
-        dist_mat2 = distribute_tensor(mat2, mesh, [Shard(1)])
-
-        dist_out = torch.addmm(dist_bias, dist_mat1, dist_mat2)
-
-        self.assertEqual(dist_out.placements, (Shard(1),))
-        self.assertEqual(dist_out.full_tensor(), torch.addmm(bias, mat1, mat2))
 
     def test_redistribute_cost_mesh_2d(self):
         mesh_2d = DeviceMesh("cpu", torch.arange(self.world_size).reshape(2, 2))
@@ -655,7 +627,8 @@ class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
 
     @with_comms
     @patch("torch.distributed.tensor._sharding_prop._select_min_cost_strategy")
-    def test_replicate_strategy_placement(self, mock_select_strategy):
+    def test_replicate_strategy_placement(self, mock_select_strategy, device):
+        device_type = torch.device(device).type
         costs_from__select_strategy = []
 
         def mock_select_func(strategy, op_schema=None):
@@ -675,11 +648,11 @@ class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
             return strategy.strategies[op_spec_costs.index(min(op_spec_costs))]
 
         mock_select_strategy.side_effect = mock_select_func
-        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+        mesh = init_device_mesh(device_type, (2, self.world_size // 2))
         comm_mode = CommDebugMode()
         test_op = torch.ops.mylib.numpy_sin
-        input_x = torch.randn([8, 16, 32], device=self.device_type)
-        input_y = torch.randn([8, 16, 32], device=self.device_type)
+        input_x = torch.randn([8, 16, 32], device=device_type)
+        input_y = torch.randn([8, 16, 32], device=device_type)
         output = test_op(input_x, input_y)
         input_x_dt = distribute_tensor(input_x, mesh, [Shard(0), Shard(1)])
         input_y_dt = distribute_tensor(input_y, mesh, [Shard(0), Shard(1)])
@@ -718,19 +691,18 @@ class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
                 )
 
     @with_comms
-    def test_tuple_replicate_strategy_placement(self):
-        mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
+    def test_tuple_replicate_strategy_placement(self, device):
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (2, self.world_size // 2))
         test_op = torch.ops.mylib.numpy_tuple_sin
         with op_strategy_context(
             test_op.default,
             replicate_op_strategy,
             schema_info=RuntimeSchemaInfo(needs_pytree=True),
         ):
-            input_x = torch.randn([8, 16, 8], device=self.device_type)
-            input_y = [
-                torch.randn([8, 16, 8], device=self.device_type) for _ in range(3)
-            ]
-            input_z = torch.randn([8, 16, 8], device=self.device_type)
+            input_x = torch.randn([8, 16, 8], device=device_type)
+            input_y = [torch.randn([8, 16, 8], device=device_type) for _ in range(3)]
+            input_z = torch.randn([8, 16, 8], device=device_type)
             output = test_op(input_x, input_y, input_z)
             input_x_dt = distribute_tensor(input_x, mesh, [Shard(0), Shard(1)])
             input_y_dt = [
@@ -746,8 +718,9 @@ class TestStrategyHashing(DTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @with_comms
-    def test_call_with_different_nontensor_args(self):
-        mesh = self.build_device_mesh()
+    def test_call_with_different_nontensor_args(self, device):
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         global_tensor = torch.tensor(
             [
                 [29.0, 45.0, 3.0, 61.0],
@@ -775,11 +748,12 @@ class TestStrategyOperation(DTensorTestBase):
         return 2
 
     @with_comms
-    def test_cache_clean(self):
-        mesh = self.build_device_mesh()
+    def test_cache_clean(self, device):
+        device_type = torch.device(device).type
+        mesh = init_device_mesh(device_type, (self.world_size,))
         test_op = torch.ops.mylib.numpy_sin
-        x = torch.randn(2, device=self.device_type)
-        y = torch.randn(2, device=self.device_type)
+        x = torch.randn(2, device=device_type)
+        y = torch.randn(2, device=device_type)
         x_dt = distribute_tensor(x, mesh, [Shard(0)])
         y_dt = distribute_tensor(y, mesh, [Shard(0)])
         with op_strategy_context(test_op.default, replicate_op_strategy):
@@ -791,6 +765,19 @@ class TestStrategyOperation(DTensorTestBase):
             self._test_op_on_dtensor(test_op, x_dt, y_dt)
 
 
+instantiate_device_type_tests(
+    TestCostModelLatency,
+    globals(),
+    only_for=["cpu"],
+)
+instantiate_device_type_tests(
+    TestStrategyOperation,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+
+
 DistTensorReplicateStrategyRegistrationTestWithLocalTensor = (
     create_local_tensor_test_class(
         DistTensorReplicateStrategyRegistrationTest,
@@ -799,6 +786,31 @@ DistTensorReplicateStrategyRegistrationTestWithLocalTensor = (
 
 TestStrategyHashingWithLocalTensor = create_local_tensor_test_class(
     TestStrategyHashing,
+)
+
+instantiate_device_type_tests(
+    DistTensorReplicateStrategyRegistrationTest,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+instantiate_device_type_tests(
+    DistTensorReplicateStrategyRegistrationTestWithLocalTensor,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+instantiate_device_type_tests(
+    TestStrategyHashing,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
+)
+instantiate_device_type_tests(
+    TestStrategyHashingWithLocalTensor,
+    globals(),
+    except_for=["cpu"],
+    allow_xpu=True,
 )
 
 

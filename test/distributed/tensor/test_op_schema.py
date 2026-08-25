@@ -6,6 +6,11 @@ import random
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._op_schema import OpSchema, RuntimeSchemaInfo
 from torch.testing._internal.common_utils import HardwareClassification, run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 class TestOpSchema(TestCase):

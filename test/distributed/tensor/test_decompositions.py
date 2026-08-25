@@ -4,7 +4,7 @@
 import torch
 import torch.distributed as dist
 from torch._decomp import register_decomposition
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.distributed.tensor.placement_types import (
     _StridedShard,
@@ -14,6 +14,11 @@ from torch.distributed.tensor.placement_types import (
 )
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import HardwareClassification, run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -253,7 +258,7 @@ class TestDecompShardingWithComms(DTensorTestBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     @with_comms
-    def test_decomp_schema_caches_static_args(self):
+    def test_decomp_schema_caches_static_args(self, device):
         """
         Test that decomposition ops use the correct cache key with static args.
         unsafe_chunk decomposes through split, and two unsafe_chunk calls with different dims
@@ -261,8 +266,9 @@ class TestDecompShardingWithComms(DTensorTestBase):
 
         This checks the first call allows Shard(2) through, while the 2nd call forces Replicate.
         """
-        device_mesh = self.build_device_mesh()
-        t = torch.randn(8, 8, 8, requires_grad=False, device=self.device_type)
+        device_type = torch.device(device).type
+        device_mesh = init_device_mesh(device_type, (self.world_size,))
+        t = torch.randn(8, 8, 8, requires_grad=False, device=device_type)
         dt = distribute_tensor(t, device_mesh, [Shard(2)])
 
         # chunk on non-sharding dim propagates through
@@ -280,12 +286,11 @@ class TestDecompShardingWithComms(DTensorTestBase):
             self.assertEqual(r.full_tensor(), e)
 
     @with_comms
-    def test_decomp_schema_for_cache_aminmax(self):
+    def test_decomp_schema_for_cache_aminmax(self, device):
         """Test that aminmax with different dim kwargs doesn't hit stale cache."""
-        device_mesh = self.build_device_mesh()
-        t = torch.randn(
-            self.world_size, 4, 4, requires_grad=False, device=self.device_type
-        )
+        device_type = torch.device(device).type
+        device_mesh = init_device_mesh(device_type, (self.world_size,))
+        t = torch.randn(self.world_size, 4, 4, requires_grad=False, device=device_type)
         dt = distribute_tensor(t, device_mesh, [Shard(0)])
 
         # First call: full reduction (no dim kwarg)

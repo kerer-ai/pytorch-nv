@@ -790,5 +790,6 @@ TestDTensorOptimizerWithLocalTensor = create_local_tensor_test_class(
     TestDTensorOptimizerAccelerator,
 )
 
+
 if __name__ == "__main__":
     run_tests()
