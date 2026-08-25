@@ -6839,5 +6839,5 @@ if __name__ == "__main__":
             sys.exit(0)
         raise unittest.SkipTest("cuda graph test is skipped")
 
-    @requires_capabilities(Capability.lib.triton)
-    run_tests(needs="filelock")
+    if HAS_CUDA_AND_TRITON:
+        run_tests(needs="filelock")
