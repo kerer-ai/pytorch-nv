@@ -1,6 +1,5 @@
 # Owner(s): ["module: inductor"]
 import copy
-import functools
 import gc
 import io
 import os
@@ -10,10 +9,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from collections.abc import Callable
 from pathlib import Path
-
-from parameterized import parameterized_class
 
 import torch
 import torch._inductor.config
@@ -124,7 +120,9 @@ class TestAOTInductorPackage(TestCase):
     def check_model(
         self: TestCase,
         model,
+        device,
         example_inputs,
+        package_cpp_only,
         inductor_configs=None,
         dynamic_shapes=None,
         atol=None,
@@ -132,13 +130,13 @@ class TestAOTInductorPackage(TestCase):
     ) -> AOTICompiledModel:
         with torch.no_grad():
             torch.manual_seed(0)
-            model = model.to(self.device)
+            model = model.to(device)
             ref_model = copy.deepcopy(model)
             ref_inputs = copy.deepcopy(example_inputs)
             expected = ref_model(*ref_inputs)
 
             inductor_configs = inductor_configs or {}
-            inductor_configs["aot_inductor.package_cpp_only"] = self.package_cpp_only
+            inductor_configs["aot_inductor.package_cpp_only"] = package_cpp_only
 
             torch.manual_seed(0)
             with WritableTempFile(suffix=".pt2") as f:
@@ -155,12 +153,12 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(actual, expected, atol=atol, rtol=rtol)
         return compiled_model
 
-    def check_package_cpp_only(self: TestCase) -> None:
+    def check_package_cpp_only(self: TestCase, package_cpp_only) -> None:
         """
         Check if cmake and make are available.
-        Skip self.package_cpp_only=False tests
+        Skip package_cpp_only=False tests
         """
-        if not self.package_cpp_only:
+        if not package_cpp_only:
             raise unittest.SkipTest("Only meant to test cpp package")
         if shutil.which("cmake") is None:
             raise unittest.SkipTest("cmake is not available")
@@ -232,16 +230,25 @@ class TestAOTInductorPackage(TestCase):
             subprocess.run(["make"], cwd=build_path, check=True)
         return build_path, tmp_path
 
-    def test_add(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_add(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         class Model(torch.nn.Module):
             def forward(self, x, y):
                 return x + y
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
-        self.check_model(Model(), example_inputs)
+        self.check_model(Model(), example_inputs, device, package_cpp_only)
+
+    @parametrize("package_cpp_only", [True, False])
+    def test_int64_floor_divide_tensor_constant_divisor(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
 
     def test_int64_floor_divide_tensor_constant_divisor(self):
         if self.device != GPU_TYPE:
@@ -256,11 +263,11 @@ class TestAOTInductorPackage(TestCase):
                 return torch.floor_divide(x, self.divisor)
 
         example_inputs = (
-            torch.tensor([-5, -1, 0, 7, 8], dtype=torch.int64, device=self.device),
+            torch.tensor([-5, -1, 0, 7, 8], dtype=torch.int64, device=device),
         )
-        self.check_model(Model(), example_inputs)
+        self.check_model(Model(), example_inputs, device, package_cpp_only)
 
-    def test_remove_intermediate_files(self):
+    def test_remove_intermediate_files(self, device):
         # For CUDA, generated cpp files contain absolute path to the generated cubin files.
         # With the package artifact, that cubin path should be overridden at the run time,
         # so removing those intermediate files in this test to verify that.
@@ -269,13 +276,13 @@ class TestAOTInductorPackage(TestCase):
                 return x + y
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
         model = Model()
         with torch.no_grad():
             torch.manual_seed(0)
-            model = model.to(self.device)
+            model = model.to(device)
             ref_model = copy.deepcopy(model)
             ref_inputs = copy.deepcopy(example_inputs)
             expected = ref_model(*ref_inputs)
@@ -294,7 +301,11 @@ class TestAOTInductorPackage(TestCase):
 
             self.assertEqual(actual, expected)
 
-    def test_load_package_from_directory(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_load_package_from_directory(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -304,12 +315,12 @@ class TestAOTInductorPackage(TestCase):
                 return x + self.linear(y)
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
         model = Model()
         with torch.no_grad():
-            model = model.to(self.device)
+            model = model.to(device)
             ref_model = copy.deepcopy(model)
             ref_inputs = copy.deepcopy(example_inputs)
             expected = ref_model(*ref_inputs)
@@ -320,7 +331,7 @@ class TestAOTInductorPackage(TestCase):
                     ep,
                     package_path=f.name,
                     inductor_configs={
-                        "aot_inductor.package_cpp_only": self.package_cpp_only,
+                        "aot_inductor.package_cpp_only": package_cpp_only,
                     },
                 )
 
@@ -381,7 +392,11 @@ class TestAOTInductorPackage(TestCase):
                 finally:
                     shutil.rmtree(temp_dir)
 
-    def test_linear(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_linear(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -391,18 +406,19 @@ class TestAOTInductorPackage(TestCase):
                 return x + self.linear(y)
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
-        self.check_model(Model(), example_inputs)
+        self.check_model(Model(), example_inputs, device, package_cpp_only)
 
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @unittest.skipIf(
         TEST_CUDA and _get_torch_cuda_version() < TRITON_PTXAS_VERSION,
         "Test is only supported on CUDA {}.{}+".format(*TRITON_PTXAS_VERSION),
     )
-    def test_compile_after_package(self):
-        self.check_package_cpp_only()
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_after_package(self, device, package_cpp_only):
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model(torch.nn.Module):
             def __init__(self) -> None:
@@ -414,14 +430,14 @@ class TestAOTInductorPackage(TestCase):
 
         with torch.no_grad():
             example_inputs = (
-                torch.randn(10, 10, device=self.device),
-                torch.randn(10, 10, device=self.device),
+                torch.randn(10, 10, device=device),
+                torch.randn(10, 10, device=device),
             )
-            model = Model().to(device=self.device)
+            model = Model().to(device=device)
             expected = model(*example_inputs)
 
             options = {
-                "aot_inductor.package_cpp_only": self.package_cpp_only,
+                "aot_inductor.package_cpp_only": package_cpp_only,
                 # Require kernels to be compiled into .o files
                 "aot_inductor.embed_kernel_binary": True,
             }
@@ -432,7 +448,7 @@ class TestAOTInductorPackage(TestCase):
                     model, example_inputs, options, tmp_dir
                 )
 
-                if self.device == GPU_TYPE:
+                if self.device != "cpu":
                     kernel_bin = get_kernel_bin_format(self.device)
                     self.assertTrue(not list(tmp_path.glob(f"*.{kernel_bin}")))
                     # Check that cubin binaries are embedded as object files.
@@ -450,10 +466,11 @@ class TestAOTInductorPackage(TestCase):
 
     @requires_triton_ptxas_compat
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
-    def test_compile_after_package_multi_arch(self):
-        if self.device != GPU_TYPE:
-            raise unittest.SkipTest(f"Only meant to test {GPU_TYPE}")
-        self.check_package_cpp_only()
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_after_package_multi_arch(self, device, package_cpp_only):
+        if device == "cpu":
+            raise unittest.SkipTest(f"Only meant to test gpu")
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model(torch.nn.Module):
             def __init__(self) -> None:
@@ -465,14 +482,14 @@ class TestAOTInductorPackage(TestCase):
 
         with torch.no_grad():
             example_inputs = (
-                torch.randn(10, 10, device=self.device),
-                torch.randn(10, 10, device=self.device),
+                torch.randn(10, 10, device=device),
+                torch.randn(10, 10, device=device),
             )
-            model = Model().to(device=self.device)
+            model = Model().to(device=device)
             expected = model(*example_inputs)
 
             options = {
-                "aot_inductor.package_cpp_only": self.package_cpp_only,
+                "aot_inductor.package_cpp_only": package_cpp_only,
                 # Expect kernel to be embedded in the final binary.
                 # We will make it the default behavior for the standalone mode.
                 "aot_inductor.emit_multi_arch_kernel": True,
@@ -487,16 +504,17 @@ class TestAOTInductorPackage(TestCase):
                 # Check if the .so file was build successfully
                 so_path = build_path / "libaoti_model.so"
                 self.assertTrue(so_path.exists())
-                optimized = torch._export.aot_load(str(so_path), self.device)
+                optimized = torch._export.aot_load(str(so_path), device)
                 actual = optimized(*example_inputs)
                 self.assertTrue(torch.allclose(actual, expected))
 
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
-    def test_compile_after_package_static(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_after_package_static(self, device, package_cpp_only):
         # compile_standalone will set package_cpp_only=True
-        self.check_package_cpp_only()
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model(torch.nn.Module):
             def __init__(self) -> None:
@@ -508,10 +526,10 @@ class TestAOTInductorPackage(TestCase):
 
         with torch.no_grad():
             example_inputs = (
-                torch.randn(10, 10, device=self.device),
-                torch.randn(10, 10, device=self.device),
+                torch.randn(10, 10, device=device),
+                torch.randn(10, 10, device=device),
             )
-            model = Model().to(device=self.device)
+            model = Model().to(device=device)
 
             # Test compilation when no name is passed in
             options = {
@@ -553,9 +571,10 @@ class TestAOTInductorPackage(TestCase):
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
-    def test_compile_standalone_cos(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_standalone_cos(self, device, package_cpp_only):
         # compile_standalone will set package_cpp_only=True
-        self.check_package_cpp_only()
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model(torch.nn.Module):
             def __init__(self) -> None:
@@ -565,8 +584,8 @@ class TestAOTInductorPackage(TestCase):
                 return torch.cos(x)
 
         with torch.no_grad():
-            example_inputs = (torch.randn(8, 32, device=self.device),)
-            model = Model().to(device=self.device)
+            example_inputs = (torch.randn(8, 32, device=device),)
+            model = Model().to(device=device)
 
             # Test compilation when model name is passed in
             options = {
@@ -586,8 +605,9 @@ class TestAOTInductorPackage(TestCase):
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
-    def test_compile_with_exporter(self):
-        self.check_package_cpp_only()
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_with_exporter(self, device, package_cpp_only):
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model1(torch.nn.Module):
             def forward(self, x, y):
@@ -601,8 +621,8 @@ class TestAOTInductorPackage(TestCase):
             return None
 
         example_inputs = (
-            torch.ones(3, 3).to(self.device),
-            torch.ones(3, 3).to(self.device),
+            torch.ones(3, 3).to(device),
+            torch.ones(3, 3).to(device),
         )
 
         package = _ExportPackage()
@@ -636,8 +656,9 @@ class TestAOTInductorPackage(TestCase):
     @requires_triton_ptxas_compat
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
-    def test_compile_with_exporter_weights(self):
-        self.check_package_cpp_only()
+    @parametrize("package_cpp_only", [True, False])
+    def test_compile_with_exporter_weights(self, device, package_cpp_only):
+        self.check_package_cpp_only(package_cpp_only)
 
         class Model(torch.nn.Module):
             def __init__(self):
@@ -651,10 +672,10 @@ class TestAOTInductorPackage(TestCase):
         def default(*args, **kwargs):
             return None
 
-        example_inputs = (torch.ones(3, 3).to(self.device),)
+        example_inputs = (torch.ones(3, 3).to(device),)
 
         package = _ExportPackage()
-        m1 = Model().to(self.device)
+        m1 = Model().to(device)
         exporter1 = package._exporter("Model", m1)._define_overload("default", default)
         exporter1(*example_inputs)
         expected_res = m1(*example_inputs)
@@ -675,7 +696,11 @@ class TestAOTInductorPackage(TestCase):
             true_res = next(iter(tensor_model.parameters()))
             self.assertEqual(expected_res, true_res)
 
-    def test_metadata(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_metadata(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -685,20 +710,20 @@ class TestAOTInductorPackage(TestCase):
                 return x + self.linear(y)
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
         metadata = {"dummy": "moo"}
 
         with torch.no_grad():
             torch.manual_seed(0)
-            model = Model().to(device=self.device)
+            model = Model().to(device=device)
             ref_model = copy.deepcopy(model)
             ref_inputs = copy.deepcopy(example_inputs)
             expected = ref_model(*ref_inputs)
 
             inductor_configs = {
-                "aot_inductor.package_cpp_only": self.package_cpp_only,
+                "aot_inductor.package_cpp_only": package_cpp_only,
                 "aot_inductor.metadata": metadata,
             }
 
@@ -755,7 +780,11 @@ class TestAOTInductorPackage(TestCase):
         loaded_metadata = compiled_model.get_metadata()  # type: ignore[attr-defined]
         self.assertEqual(loaded_metadata.get("dummy"), "moo")
 
-    def test_bool_input(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_bool_input(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         # Specialize on whichever branch the example input for b is
         class Model(torch.nn.Module):
             def forward(self, x, b):
@@ -764,13 +793,17 @@ class TestAOTInductorPackage(TestCase):
                 else:
                     return x + x
 
-        example_inputs = (torch.randn(3, 3, device=self.device), True)
-        self.check_model(Model(), example_inputs)
+        example_inputs = (torch.randn(3, 3, device=device), True)
+        self.check_model(Model(), example_inputs, device, package_cpp_only)
 
-    def test_multiple_methods(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_multiple_methods(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         options = {
             "aot_inductor.package": True,
-            "aot_inductor.package_cpp_only": self.package_cpp_only,
+            "aot_inductor.package_cpp_only": package_cpp_only,
         }
 
         class Model1(torch.nn.Module):
@@ -784,8 +817,8 @@ class TestAOTInductorPackage(TestCase):
         dim0_b = Dim("dim0_b", min=1, max=20)
         dynamic_shapes = {"a": {0: dim0_a}, "b": {0: dim0_b}}
         example_inputs1 = (
-            torch.randn(2, 4, device=self.device),
-            torch.randn(3, 4, device=self.device),
+            torch.randn(2, 4, device=device),
+            torch.randn(3, 4, device=device),
         )
         ep1 = torch.export.export(
             Model1(), example_inputs1, dynamic_shapes=dynamic_shapes, strict=True
@@ -800,12 +833,12 @@ class TestAOTInductorPackage(TestCase):
                 self.device = device
 
             def forward(self, x):
-                t = torch.tensor(x.size(-1), device=self.device, dtype=torch.float)
+                t = torch.tensor(x.size(-1), device=device, dtype=torch.float)
                 t = torch.sqrt(t * 3)
                 return x * t
 
-        example_inputs2 = (torch.randn(5, 5, device=self.device),)
-        ep2 = torch.export.export(Model2(self.device), example_inputs2, strict=True)
+        example_inputs2 = (torch.randn(5, 5, device=device),)
+        ep2 = torch.export.export(Model2(device), example_inputs2, strict=True)
         aoti_files2 = torch._inductor.aot_compile(
             ep2.module(), example_inputs2, options=options
         )
@@ -820,13 +853,13 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(loaded1(*example_inputs1), ep1.module()(*example_inputs1))
         self.assertEqual(loaded2(*example_inputs2), ep2.module()(*example_inputs2))
 
-    @unittest.skipIf(not HAS_GPU, "requires gpu")
-    def test_duplicate_calls(self):
+    @onlyAccelerator
+    @requires_triton()
+    @parametrize("package_cpp_only", [True, False])
+    def test_duplicate_calls(self, device, package_cpp_only):
         options = {
             "aot_inductor.package": True,
         }
-
-        device = GPU_TYPE
 
         class Model1(torch.nn.Module):
             def __init__(self) -> None:
@@ -842,7 +875,7 @@ class TestAOTInductorPackage(TestCase):
             torch.randn(2, 4, device=device),
             torch.randn(3, 4, device=device),
         )
-        self.check_model(Model1(), example_inputs1)
+        self.check_model(Model1(), example_inputs1, device, package_cpp_only)
         ep1 = torch.export.export(
             Model1(), example_inputs1, dynamic_shapes=dynamic_shapes, strict=True
         )
@@ -850,10 +883,9 @@ class TestAOTInductorPackage(TestCase):
             ep1.module(), example_inputs1, options=options
         )
 
-        device = "cpu"
         example_inputs2 = (
-            torch.randn(2, 4, device=device),
-            torch.randn(3, 4, device=device),
+            torch.randn(2, 4, device="cpu"),
+            torch.randn(3, 4, device="cpu"),
         )
         ep2 = torch.export.export(
             Model1(), example_inputs2, dynamic_shapes=dynamic_shapes, strict=True
@@ -876,7 +908,11 @@ class TestAOTInductorPackage(TestCase):
             torch.allclose(loaded2(*example_inputs2), ep2.module()(*example_inputs2))
         )
 
-    def test_specified_output_dir(self):
+    @parametrize("package_cpp_only", [True, False])
+    def test_specified_output_dir(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -885,8 +921,8 @@ class TestAOTInductorPackage(TestCase):
                 return torch.cat([a, b], dim=0)
 
         example_inputs = (
-            torch.randn(2, 4, device=self.device),
-            torch.randn(3, 4, device=self.device),
+            torch.randn(2, 4, device=device),
+            torch.randn(3, 4, device=device),
         )
         ep = torch.export.export(Model(), example_inputs, strict=True)
         aoti_files = torch._inductor.aot_compile(
@@ -895,7 +931,7 @@ class TestAOTInductorPackage(TestCase):
             options={
                 "aot_inductor.output_path": "tmp_output_",
                 "aot_inductor.package": True,
-                "aot_inductor.package_cpp_only": self.package_cpp_only,
+                "aot_inductor.package_cpp_only": package_cpp_only,
             },
         )
         with WritableTempFile(suffix=".pt2") as f:
@@ -905,7 +941,7 @@ class TestAOTInductorPackage(TestCase):
             torch.allclose(loaded(*example_inputs), ep.module()(*example_inputs))
         )
 
-    def test_save_buffer(self):
+    def test_save_buffer(self, device):
         class Model(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -914,8 +950,8 @@ class TestAOTInductorPackage(TestCase):
                 return torch.cat([a, b], dim=0)
 
         example_inputs = (
-            torch.randn(2, 4, device=self.device),
-            torch.randn(3, 4, device=self.device),
+            torch.randn(2, 4, device=device),
+            torch.randn(3, 4, device=device),
         )
         ep = torch.export.export(Model(), example_inputs, strict=True)
 
@@ -941,8 +977,8 @@ class TestAOTInductorPackage(TestCase):
                 return self.linear(a)
 
         M, N, K = 128, 2048, 4096
-        model = Model(N, K, self.device)
-        example_inputs = (torch.randn(M, K, device=self.device),)
+        model = Model(N, K, device)
+        example_inputs = (torch.randn(M, K, device=device),)
 
         inductor_configs = {
             "always_keep_tensor_constants": True,
@@ -956,16 +992,12 @@ class TestAOTInductorPackage(TestCase):
 
         compiled.load_constants(model.state_dict(), check_full_update=True)
 
-        test_inputs = torch.randn(M, K, device=self.device)
+        test_inputs = torch.randn(M, K, device=device)
         expected = model(test_inputs)
         output = compiled(test_inputs)
         self.assertEqual(expected, output)
 
-    @skipif(
-        lambda device, package_cpp_only: package_cpp_only,
-        "No support for cpp only",
-    )
-    def test_package_user_managed_weight(self):
+    def test_package_user_managed_weight(self, device):
         class Model(torch.nn.Module):
             def __init__(self, n, k, device):
                 super().__init__()
@@ -975,8 +1007,8 @@ class TestAOTInductorPackage(TestCase):
                 return self.linear(a)
 
         M, N, K = 128, 4096, 4096
-        model = Model(N, K, self.device)
-        example_inputs = (torch.randn(M, K, device=self.device),)
+        model = Model(N, K, device)
+        example_inputs = (torch.randn(M, K, device=device),)
 
         inductor_configs = {
             "always_keep_tensor_constants": True,
@@ -992,7 +1024,7 @@ class TestAOTInductorPackage(TestCase):
             model.state_dict(), check_full_update=True, user_managed=False
         )
 
-        test_inputs = torch.randn(M, K, device=self.device)
+        test_inputs = torch.randn(M, K, device=device)
         expected = model(test_inputs)
         output = compiled(test_inputs)
         self.assertEqual(expected, output)
@@ -1018,14 +1050,14 @@ class TestAOTInductorPackage(TestCase):
         new_output = new_compiled(test_inputs)
         self.assertEqual(new_output, expected)
 
-    def test_deepcopy_compiled_model(self):
+    def test_deepcopy_compiled_model(self, device):
         class Model(torch.nn.Module):
             def forward(self, x, y):
                 return x + y
 
         example_inputs = (
-            torch.randn(10, 10, device=self.device),
-            torch.randn(10, 10, device=self.device),
+            torch.randn(10, 10, device=device),
+            torch.randn(10, 10, device=device),
         )
 
         model = Model()
@@ -1040,11 +1072,8 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(expected, output)
         self.assertEqual(expected, output_copy)
 
-    @skipif(
-        lambda device, package_cpp_only: package_cpp_only,
-        "No support for cpp only",
-    )
-    def test_update_weights(self):
+    @parametrize("package_cpp_only", [False])
+    def test_update_weights(self, device, package_cpp_only):
         class Model(torch.nn.Module):
             def __init__(self, n, k, device):
                 super().__init__()
@@ -1054,32 +1083,32 @@ class TestAOTInductorPackage(TestCase):
                 return self.linear(a)
 
         M, N, K = 128, 2048, 4096
-        model = Model(N, K, self.device)
-        example_inputs = (torch.randn(M, K, device=self.device),)
+        model = Model(N, K, device)
+        example_inputs = (torch.randn(M, K, device=device),)
 
-        compiled = self.check_model(model, example_inputs)
+        compiled = self.check_model(model, example_inputs, device, package_cpp_only)
 
         new_state_dict = {
-            "linear.weight": torch.randn(N, K, device=self.device),
-            "linear.bias": torch.randn(N, device=self.device),
+            "linear.weight": torch.randn(N, K, device=device),
+            "linear.bias": torch.randn(N, device=device),
         }
         model.load_state_dict(new_state_dict)
 
         compiled.load_constants(model.state_dict(), check_full_update=True)
 
-        test_inputs = torch.randn(M, K, device=self.device)
+        test_inputs = torch.randn(M, K, device=device)
         expected = model(test_inputs)
         output = compiled(test_inputs)
         self.assertEqual(expected, output)
 
-    @skipif(
-        lambda device, package_cpp_only: package_cpp_only,
-        "No support for cpp only",
-    )
-    def test_package_shared_weights(self):
+    @parametrize("package_cpp_only", [False])
+    def test_package_shared_weights(self, device, package_cpp_only):
+        if device == "cpu" and IS_FBCODE and package_cpp_only == True:
+            raise unittest.SkipTest("Skip only cpp package when cpu device in fbcode")
+
         options = {
             "aot_inductor.package": True,
-            "aot_inductor.package_cpp_only": self.package_cpp_only,
+            "aot_inductor.package_cpp_only": package_cpp_only,
             "always_keep_tensor_constants": True,
             "aot_inductor.package_constants_in_so": False,
             "aot_inductor.package_constants_on_disk_format": "pickle_weights",
@@ -1156,14 +1185,11 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(gm1.p1, x + 1)
         self.assertEqual(gm1.p2, y + 1)
 
-    @skipif(
-        lambda device, package_cpp_only: package_cpp_only,
-        "No support for cpp only",
-    )
-    def test_package_weights_on_disk_nested_module(self):
+    @parametrize("package_cpp_only", [False])
+    def test_package_weights_on_disk_nested_module(self, device, package_cpp_only):
         options = {
             "aot_inductor.package": True,
-            "aot_inductor.package_cpp_only": self.package_cpp_only,
+            "aot_inductor.package_cpp_only": package_cpp_only,
             "always_keep_tensor_constants": True,
             "aot_inductor.package_constants_in_so": False,
             "aot_inductor.package_constants_on_disk_format": "pickle_weights",
@@ -1180,8 +1206,8 @@ class TestAOTInductorPackage(TestCase):
             def forward(self, x):
                 return self.linear(x)
 
-        x = torch.randn(3, 3).to(self.device)
-        bar1 = Bar().to(self.device)
+        x = torch.randn(3, 3).to(device)
+        bar1 = Bar().to(device)
         ep = torch.export.export(bar1, (x,))
         package_path = torch._inductor.aoti_compile_and_package(
             ep, inductor_configs=options
@@ -1190,12 +1216,12 @@ class TestAOTInductorPackage(TestCase):
         loaded1 = pt2_contents.aoti_runners["model"]
         self.assertEqual(loaded1(x), bar1(x))
 
-    def test_loading_wrong_model(self):
+    def test_loading_wrong_model(self, device):
         class Model(torch.nn.Module):
             def forward(self, x):
                 return x + 1
 
-        example_inputs = (torch.randn(10, 10, device=self.device),)
+        example_inputs = (torch.randn(10, 10, device=device),)
         model = Model()
         ep = torch.export.export(model, example_inputs)
         package_path = torch._inductor.aoti_compile_and_package(ep)
@@ -1207,8 +1233,10 @@ class TestAOTInductorPackage(TestCase):
             load_package(package_path, model_name="forward")
 
 
+instantiate_device_type_tests(TestAOTInductorPackage, globals(), allow_xpu=True)
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_GPU or sys.platform == "darwin":
+    if HAS_TRITON or sys.platform == "darwin":
         run_tests(needs="filelock")
