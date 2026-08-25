@@ -167,7 +167,6 @@ def get_gpu_type() -> str:
     return chosen
 
 
-from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.utils import detect_fake_mode
 from torch.autograd import DeviceType
 from torch.autograd.profiler_util import EventList
@@ -3509,7 +3508,7 @@ def get_cloned_parameter_buffer_name(name: str) -> str:
 
 
 def is_gpu(device: str | None) -> bool:
-    return device in GPU_TYPES
+    return device in _gpu_types()
 
 
 def is_rocm() -> bool:

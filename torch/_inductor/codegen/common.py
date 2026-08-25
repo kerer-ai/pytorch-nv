@@ -14,7 +14,6 @@ import re
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from enum import auto, Enum
 from itertools import chain
 from typing import Any, cast, ClassVar, Generic, NamedTuple, TYPE_CHECKING
 from typing_extensions import Self, TypeVar
@@ -23,6 +22,10 @@ import sympy
 
 import torch
 import torch.fx
+
+# BackendFeature moved to torch._dynamo.device_interface; re-exported here so
+# existing `from .common import BackendFeature` consumers keep working.
+from torch._dynamo.device_interface import BackendFeature
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from torch.utils import _pytree as pytree
 from torch.utils._config_module import ConfigModule
