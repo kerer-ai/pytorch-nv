@@ -25,7 +25,6 @@ from torch.testing._internal.common_utils import (
     TestCase,
     xfailIfNoAcceleratorTriton,
 )
-from torch.testing._internal.triton_utils import requires_cuda_and_triton
 from torch.utils.flop_counter import sdpa_backward_flop_count, sdpa_flop_count
 
 
@@ -36,8 +35,6 @@ try:
 except ImportError:
     HAS_TORCHVISION = False
 skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
-
-HAS_CUDA = torch.cuda.is_available()
 
 
 def FlopCounterMode(*args, **kwargs):
@@ -506,27 +503,39 @@ class TestFlopCounter(TestCase):
                 self.a = Foo()
                 self.b = Foo()
 
-            def forward(self, x):
-                return self.b(self.a(x))
+            with FlopCounterMode() as fake_flop_counter_mode:
+                torch.ops.aten._flash_attention_forward(
+                    fake_x,
+                    fake_x,
+                    fake_x,
+                    fake_offsets,
+                    fake_offsets,
+                    max_seqlen,
+                    max_seqlen,
+                    0.0,
+                    False,
+                    False,
+                )
 
-        mod = Mod()
-        with FlopCounterMode() as mode:
-            mod({"a": torch.randn(10, 10, requires_grad=True).clone()})[
-                "a"
-            ].sum().backward()
-        self.assertExpectedInline(
-            (mode.flop_counts["Mod"][torch.ops.aten.mm]), """12000"""
-        )
+        dense_x = torch.randn(4, 40, 4, 16, dtype=torch.bfloat16, device=device)
 
-        class Mod2(torch.nn.Module):
-            def forward(self, x):
-                return (torch.mm(x, x),)
+        with FlopCounterMode() as real_flop_counter_mode:
+            torch.ops.aten._flash_attention_forward(
+                dense_x,
+                dense_x,
+                dense_x,
+                None,
+                None,
+                max_seqlen,
+                max_seqlen,
+                0.0,
+                False,
+                False,
+            )
 
-        mod = Mod2()
-        with FlopCounterMode() as mode:
-            mod(torch.randn(10, 10, requires_grad=True))[0].sum().backward()
-        self.assertExpectedInline(
-            (mode.flop_counts["Mod2"][torch.ops.aten.mm]), """6000"""
+        self.assertEqual(
+            int(get_total_flops(fake_flop_counter_mode)),
+            int(get_total_flops(real_flop_counter_mode)),
         )
 
     def test_warning(self):
