@@ -28,6 +28,8 @@ from torch.testing._internal.common_modules import (
     ModuleInfo,
     ModuleInput,
     modules,
+    tol,
+    toleranceOverride,
 )
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.testing._internal.opinfo.core import DecorateInfo, OpInfo
@@ -251,6 +253,78 @@ class TestSupportedOpsWithOverrides(TestCase):
     @ops([op_combined_supported, op_combined_skip, op_combined_unsupported])
     def test_combined_filter(self, device, dtype, op):
         type(self)._executed_combined[op.name] += 1
+
+
+class TestToleranceAndPrecisionOverrides(TestCase):
+    """Verify that tolerance_overrides and precision_overrides from
+    set_test_configs() apply to non-OpInfo tests and that decorator-level
+    overrides take precedence over class-level configs.
+    """
+
+    _actual_precisions: dict = {}
+    _actual_rtols: dict = {}
+    _expected_values: dict = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        expected = cls._expected_values
+        actual_precisions = cls._actual_precisions
+        actual_rtols = cls._actual_rtols
+        for key, (exp_prec, exp_rtol) in expected.items():
+            if key not in actual_precisions:
+                raise AssertionError(f"Test variant {key} never executed")
+            act_prec = actual_precisions[key]
+            act_rtol = actual_rtols[key]
+            if act_prec != exp_prec or act_rtol != exp_rtol:
+                raise AssertionError(
+                    f"Test variant {key}: expected precision={exp_prec}, rtol={exp_rtol}, "
+                    f"got precision={act_prec}, rtol={act_rtol}"
+                )
+        super().tearDownClass()
+
+    @dtypes(torch.float32, torch.float64)
+    def test_tolerance_overrides_applied(self, device, dtype):
+        key = ("test_tolerance_overrides_applied", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @dtypes(torch.float32)
+    def test_precision_overrides_applied(self, device, dtype):
+        key = ("test_precision_overrides_applied", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @precisionOverride({torch.float32: 1e-5})
+    @dtypes(torch.float32)
+    def test_decorator_wins_over_config(self, device, dtype):
+        key = ("test_decorator_wins_over_config", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @toleranceOverride({torch.float32: tol(atol=5e-3, rtol=5e-4)})
+    @dtypes(torch.float32)
+    def test_tolerance_decorator_wins(self, device, dtype):
+        key = ("test_tolerance_decorator_wins", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @dtypes(torch.float32)
+    def test_tol_overrides_prec(self, device, dtype):
+        key = ("test_tol_overrides_prec", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @dtypes(torch.float32, torch.float64)
+    def test_wildcard_fallback(self, device, dtype):
+        key = ("test_wildcard_fallback", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
+
+    @ops([op_precision])
+    def test_op_override_still_wins(self, device, dtype, op):
+        key = ("test_op_override_still_wins", dtype)
+        type(self)._actual_precisions[key] = self.precision
+        type(self)._actual_rtols[key] = self.rel_tol
 
 
 OPENREG_OP_OVERRIDES = {
