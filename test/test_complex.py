@@ -15,6 +15,9 @@ from torch.testing._internal.common_utils import (
 )
 
 
+devices = (torch.device("cpu"), torch.device("cuda:0"))
+
+
 class TestComplexTensor(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
     _default_dtype_check_enabled = True
