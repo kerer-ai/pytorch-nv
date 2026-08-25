@@ -372,12 +372,6 @@ class Capability:
 
         generic = "stream.generic"
 
-    class collective:
-        """Collective communication capabilities (reconfigure, etc.)."""
-
-        reconfigure = "collective.reconfigure"
-        work_result = "collective.work_result"
-
 
 def _check_capabilities(test_case, required_capabilities) -> None:
     device_caps = type(test_case).get_capabilities()
@@ -448,18 +442,6 @@ class DeviceTypeTestBase(TestCase):
     # Keys are OpInfo.full_name (e.g. "add", "mul", "linalg.norm").
     # If None (default), all ops in the @ops decorator's op_list generate variants.
     op_allowlist = None  # type: Optional[Collection[str]]
-
-    # Decorators and skips to apply to tests that are parametrized by modules.
-    # Keys are ModuleInfo.name (e.g. "nn.Linear", "nn.Conv2d"). Unlike OpInfo,
-    # ModuleInfo has no variant concept, so there is no "full_name" distinction.
-    module_overrides = None  # type: Optional[dict[str, list[DecorateInfo]]]
-
-    # An optional mechanism to limit which modules generate test variants.
-    # When set, only modules whose name is in this collection will generate tests.
-    # Keys are ModuleInfo.name (e.g. "nn.Linear", "nn.Conv2d").
-    # If None (default), all modules in the @modules decorator's module_info_list
-    # generate variants.
-    module_allowlist = None  # type: Optional[Collection[str]]
 
     # An optional skip mechanism built upon instantiate_device_type_tests(),
     # designed to filter generated tests at different granularities.
@@ -535,33 +517,6 @@ class DeviceTypeTestBase(TestCase):
 
         super().setUp()
 
-    # An optional mechanism to set per-dtype precision overrides (atol only) for
-    # tests parametrized by @dtypes. Mirrors the @precisionOverride decorator but
-    # settable by out-of-tree backends via set_test_configs().
-    #
-    # Format:
-    #   precision_overrides = {
-    #       "TestClassName": {
-    #           "test_method": {torch.float32: 1e-2},
-    #           "*": {torch.float16: 1e-1},
-    #       },
-    #   }
-    precision_overrides = None  # type: Optional[dict[str, dict[str, dict[torch.dtype, float]]]]
-
-    # An optional mechanism to set per-dtype tolerance overrides (atol + rtol) for
-    # tests parametrized by @dtypes. Mirrors the @toleranceOverride decorator but
-    # settable by out-of-tree backends via set_test_configs().
-    #
-    # Takes precedence over precision_overrides when both match the same test+dtype.
-    #
-    # Format:
-    #   tolerance_overrides = {
-    #       "TestClassName": {
-    #           "test_method": {torch.float32: tol(atol=1e-2, rtol=1e-3)},
-    #       },
-    #   }
-    tolerance_overrides = None  # type: Optional[dict[str, dict[str, dict[torch.dtype, tol]]]]
-
     # Flag to disable test suite early due to unrecoverable error such as CUDA error.
     _stop_test_suite = False
 
@@ -572,7 +527,7 @@ class DeviceTypeTestBase(TestCase):
 
     @property
     def precision(self):
-        return getattr(self._tls, "precision", TestCase._precision)
+        return self._tls.precision
 
     @precision.setter
     def precision(self, prec):
@@ -580,64 +535,39 @@ class DeviceTypeTestBase(TestCase):
 
     @property
     def rel_tol(self):
-        return getattr(self._tls, "rel_tol", TestCase._rel_tol)
+        return self._tls.rel_tol
 
     @rel_tol.setter
     def rel_tol(self, prec):
         self._tls.rel_tol = prec
 
     @classmethod
-    def _apply_class_overrides(cls, info_dict, class_overrides):
-        """Stamps each class_overrides decorator's device_type to this test
-        base's device type and appends it to the matching entry of info_dict
-        (keyed by OpInfo.full_name or ModuleInfo.name).
-        """
-        for name, decorators in class_overrides.items():
+    def _apply_op_overrides(cls, ops, test=None):
+        class_overrides = cls.op_overrides or {}
+        test_overrides = {} if test is None else getattr(test, "_op_overrides", {})
+
+        if not class_overrides and not test_overrides:
+            return
+
+        op_dict = {op.full_name: op for op in copy.deepcopy(ops.op_list)}
+
+        for op_name, decorators in class_overrides.items():
             for decorator in decorators:
                 if cls.device_type == "privateuse1":
                     decorator.device_type = torch._C._get_privateuse1_backend_name()
                 else:
                     decorator.device_type = cls.device_type
-                # name may not be in info_dict if @ops()/@modules() has
-                # restricted the list to a smaller set than overrides covers.
-                if name in info_dict:
-                    info_dict[name].decorators += (decorator,)
-
-    @classmethod
-    def _apply_op_overrides(cls, op_list, test=None):
-        class_overrides = cls.op_overrides or {}
-        test_overrides = {} if test is None else getattr(test, "_op_overrides", {})
-
-        if not class_overrides and not test_overrides:
-            return op_list
-
-        op_dict = {op.full_name: op for op in copy.deepcopy(op_list)}
-        if len(op_dict) != len(op_list):
-            raise AssertionError("Duplicate op full_names in @ops op_list")
-
-        cls._apply_class_overrides(op_dict, class_overrides)
+                # op_name may not be in op_dict if @ops() has restricted the
+                # OpInfo list to a smaller set than op_overrides covers.
+                if op_name in op_dict:
+                    op_dict[op_name].decorators += (decorator,)
 
         for op_name, decorators in test_overrides.items():
             for decorator in decorators:
                 if op_name in op_dict:
                     op_dict[op_name].decorators += (decorator,)
 
-        return list(op_dict.values())
-
-    @classmethod
-    def _apply_module_overrides(cls, module_info_list):
-        class_overrides = cls.module_overrides or {}
-
-        if not class_overrides:
-            return module_info_list
-
-        module_dict = {m.name: m for m in copy.deepcopy(module_info_list)}
-        if len(module_dict) != len(module_info_list):
-            raise AssertionError("Duplicate module names in @modules module_info_list")
-
-        cls._apply_class_overrides(module_dict, class_overrides)
-
-        return list(module_dict.values())
+        ops.op_list = list(op_dict.values())
 
     # Returns a string representing the device that single device tests should use.
     # Note: single device tests use this device exclusively.
@@ -653,19 +583,6 @@ class DeviceTypeTestBase(TestCase):
         import torch.distributed as dist
 
         return dist.get_default_backend_for_device(cls.device_type)
-
-    @classmethod
-    def has_sufficient_memory(cls, size: int) -> bool:
-        """
-        Returns True if there is sufficient memory available for the given size.
-
-        Device-specific test bases should override this to support
-        memory-aware tests. The default implementation raises an error
-        for device types that do not implement this hook.
-        """
-        raise NotImplementedError(
-            f"{cls.__name__}.has_sufficient_memory() is not implemented"
-        )
 
     @classmethod
     def _get_test_exclusions(cls, test_class_name):
@@ -723,38 +640,21 @@ class DeviceTypeTestBase(TestCase):
         return _check_dtype()
 
     @classmethod
-    def _apply_op_allowlist(cls, op_list):
-        """Filters op_list to only include ops declared in op_allowlist.
+    def _apply_op_allowlist(cls, ops):
+        """Filters ops.op_list to only include ops declared in op_allowlist.
 
         If op_allowlist is None (default), no filtering is applied.
         If op_allowlist is set, only ops whose full_name is in the collection
         will generate test variants.
 
         Args:
-            op_list: The list of OpInfo entries to filter.
+            ops: The ops decorator instance whose op_list will be filtered.
         """
         if cls.op_allowlist is None:
-            return op_list
+            return
 
         supported_set = set(cls.op_allowlist)
-        return [op for op in op_list if op.full_name in supported_set]
-
-    @classmethod
-    def _apply_module_allowlist(cls, module_info_list):
-        """Filters module_info_list to only include modules in module_allowlist.
-
-        If module_allowlist is None (default), no filtering is applied.
-        If module_allowlist is set, only modules whose name is in the collection
-        will generate test variants.
-
-        Args:
-            module_info_list: The list of ModuleInfo entries to filter.
-        """
-        if cls.module_allowlist is None:
-            return module_info_list
-
-        supported_set = set(cls.module_allowlist)
-        return [m for m in module_info_list if m.name in supported_set]
+        ops.op_list = [op for op in ops.op_list if op.full_name in supported_set]
 
     @classmethod
     def _init_and_get_primary_device(cls):
@@ -774,12 +674,7 @@ class DeviceTypeTestBase(TestCase):
     #   mechanism of acquiring all available devices.
     @classmethod
     def get_all_devices(cls):
-        devices = [cls.get_primary_device()]
-        for i in range(torch.accelerator.device_count()):
-            device_str = f"{cls.device_type}:{i}"
-            if device_str not in devices:
-                devices.append(device_str)
-        return devices
+        return [cls.get_primary_device()]
 
     # Returns the dtypes the test has requested.
     # Prefers device-specific dtype specifications over generic ones.
@@ -813,53 +708,12 @@ class DeviceTypeTestBase(TestCase):
             self.precision, self.rel_tol = self._get_tolerance_override(test, dtype)
 
     @classmethod
-    def _bake_class_level_overrides(cls, test, generic_cls, param_kwargs):
-        """Bake class-level tolerance/precision overrides into test function attrs."""
-
-        if generic_cls is None:
-            return
-
-        dtype = param_kwargs.get("dtypes", param_kwargs.get("dtype"))
-        if not dtype or isinstance(dtype, (list, tuple)):
-            return
-
-        def _resolve_class_override(key):
-            class_overrides = getattr(cls, key)
-            if class_overrides is None:
-                return None
-            test_overrides = class_overrides.get(generic_cls.__name__)
-            if test_overrides is None:
-                return None
-            for override_key in (test.__name__, "*"):
-                dtype_overrides = test_overrides.get(override_key)
-                if dtype_overrides is not None:
-                    override = dtype_overrides.get(dtype)
-                    if override is not None:
-                        return override
-            return None
-
-        for key in ("tolerance_overrides", "precision_overrides"):
-            test_overrides = getattr(test, key, None)
-            # class-level overrides should not overwrite test-level overrides
-            if test_overrides is not None and test_overrides.get(dtype) is not None:
-                continue
-            override = _resolve_class_override(key)
-            if override is not None:
-                if test_overrides is None:
-                    setattr(test, key, {})
-                getattr(test, key)[dtype] = override
-
-    @classmethod
     def set_test_configs(
         cls,
         *,
         op_overrides=None,
         op_allowlist=None,
-        module_overrides=None,
-        module_allowlist=None,
         test_exclusions=None,
-        tolerance_overrides=None,
-        precision_overrides=None,
     ):
         """
         Sets or resets the test configuration fields.
@@ -871,11 +725,7 @@ class DeviceTypeTestBase(TestCase):
         """
         cls.op_overrides = op_overrides
         cls.op_allowlist = op_allowlist
-        cls.module_overrides = module_overrides
-        cls.module_allowlist = module_allowlist
         cls.test_exclusions = test_exclusions
-        cls.tolerance_overrides = tolerance_overrides
-        cls.precision_overrides = precision_overrides
 
     # Creates device-specific tests.
     @classmethod
@@ -896,10 +746,6 @@ class DeviceTypeTestBase(TestCase):
             for decorator in decorator_fn(param_kwargs):
                 test = decorator(test)
 
-            # Bake class-level tolerance/precision overrides (set via
-            # set_test_configs) into the test function
-            cls._bake_class_level_overrides(test, generic_cls, param_kwargs)
-
             # Constructs the test
             @wraps(test)
             def instantiated_test(self, param_kwargs=param_kwargs):
@@ -908,12 +754,6 @@ class DeviceTypeTestBase(TestCase):
                 guard_precision = self.precision
                 guard_rel_tol = self.rel_tol
                 try:
-                    resolve = getattr(self, "_resolve_injected_device", None)
-                    if resolve is not None and "device" in param_kwargs:
-                        param_kwargs = {
-                            **param_kwargs,
-                            "device": resolve(param_kwargs["device"]),
-                        }
                     self._apply_precision_override_for_test(test, param_kwargs)
                     result = test(self, **param_kwargs)
                 except RuntimeError as rte:
@@ -1028,24 +868,6 @@ class DeviceTypeTestBase(TestCase):
 class CPUTestBase(DeviceTypeTestBase):
     device_type = "cpu"
 
-    @classmethod
-    def has_sufficient_memory(cls, size: int) -> bool:
-        if not HAS_PSUTIL:
-            raise RuntimeError("Need psutil to query available system memory")
-
-        # The sanitizers have significant memory overheads
-        if TEST_WITH_ASAN or TEST_WITH_TSAN or TEST_WITH_UBSAN:
-            size *= 10
-
-        # don't try using all RAM on s390x, leave some for service processes
-        if IS_S390X:
-            size *= 2
-
-        available = psutil.virtual_memory().available
-        if available < size:
-            gc.collect()
-        return psutil.virtual_memory().available >= size
-
     # No critical error should stop CPU test suite
     def _should_stop_test_suite(self):
         return False
@@ -1081,14 +903,6 @@ class CPUTestBase(DeviceTypeTestBase):
                 Capability.stream: {
                     Capability.stream.generic: lambda: False,
                 },
-                Capability.collective: {
-                    # gloo (the default CPU backend) supports reconfigure; it is built
-                    # whenever distributed is built. gloo does not report WorkResult.
-                    Capability.collective.reconfigure: lambda: _distributed_backend_available(
-                        cls.device_type
-                    ),
-                    Capability.collective.work_result: lambda: False,
-                },
             }
         )
         capabilities[Capability.lib].update(
@@ -1111,7 +925,6 @@ class CUDATestBase(DeviceTypeTestBase):
 
     @classmethod
     def _capabilities(cls):
-        import torch.distributed as dist
         from torch.testing._internal.common_cuda import (
             PLATFORM_SUPPORTS_FLASH_ATTENTION,
             PLATFORM_SUPPORTS_FP8,
@@ -1119,9 +932,6 @@ class CUDATestBase(DeviceTypeTestBase):
             SM80OrLater,
         )
         from torch.utils._triton import has_triton
-
-        def nccl2_available():
-            return dist.is_available() and dist.is_backend_available("nccl2")
 
         capabilities = super()._capabilities()
         capabilities.update(
@@ -1156,12 +966,6 @@ class CUDATestBase(DeviceTypeTestBase):
                         cls.device_type
                     ),
                 },
-                Capability.collective: {
-                    # nccl2 is the reconfigure-capable CUDA backend (default "nccl" is
-                    # not) and is the only backend that reports WorkResult.
-                    Capability.collective.reconfigure: nccl2_available,
-                    Capability.collective.work_result: nccl2_available,
-                },
             }
         )
         capabilities[Capability.lib].update(
@@ -1186,22 +990,6 @@ class CUDATestBase(DeviceTypeTestBase):
             if idx != primary_device_idx
         ]
         return [prim_device] + non_primary_devices
-
-    @classmethod
-    def has_sufficient_memory(cls, size: int) -> bool:
-        device = torch.cuda.current_device()
-        available = int(
-            torch.cuda.memory.mem_get_info(device)[0]
-            * torch.cuda.memory.get_per_process_memory_fraction(device)
-        )
-        if available < size:
-            gc.collect()
-            torch.cuda.empty_cache()
-            available = int(
-                torch.cuda.memory.mem_get_info(device)[0]
-                * torch.cuda.memory.get_per_process_memory_fraction(device)
-            )
-        return available >= size
 
     @classmethod
     def setUpClass(cls):
@@ -1253,22 +1041,6 @@ class MPSTestBase(DeviceTypeTestBase):
         # currently only one device is supported on MPS backend
         prim_device = cls.get_primary_device()
         return [prim_device]
-
-    @classmethod
-    def has_sufficient_memory(cls, size: int) -> bool:
-        if not HAS_PSUTIL:
-            raise RuntimeError("Need psutil to query available system memory")
-        if TEST_WITH_ASAN or TEST_WITH_TSAN or TEST_WITH_UBSAN:
-            size *= 10
-        if IS_S390X:
-            size *= 2
-        available = psutil.virtual_memory().available
-        if available < size:
-            gc.collect()
-            # Sync and cleanup MPS memory before checking available memory
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
-        return psutil.virtual_memory().available >= size
 
     @classmethod
     def setUpClass(cls):
@@ -1349,16 +1121,6 @@ class XPUTestBase(DeviceTypeTestBase):
         return [prim_device] + non_primary_devices
 
     @classmethod
-    def has_sufficient_memory(cls, size: int) -> bool:
-        device = torch.xpu.current_device()
-        available = torch.xpu.memory.mem_get_info(device)[0]
-        if available < size:
-            gc.collect()
-            torch.xpu.empty_cache()
-            available = torch.xpu.memory.mem_get_info(device)[0]
-        return available >= size
-
-    @classmethod
     def setUpClass(cls):
         cls.primary_device = f"xpu:{torch.xpu.current_device()}"
 
@@ -1399,37 +1161,11 @@ class HPUTestBase(DeviceTypeTestBase):
         cls.primary_device = "hpu:0"
 
 
-# Out-of-tree PrivateUse1 backends (e.g. NPU, MTIA) share this single
-# PrivateUse1TestBase class. Rather than have every backend edit the same
-# `_capabilities()` method body (which would force unrelated backends'
-# PRs to conflict with each other), each backend registers its own
-# capability provider here, at module import time, before any test runs:
-#
-#     register_privateuse1_capabilities(lambda: {
-#         Capability.dtype.bf16: lambda: True,
-#     })
-#
-# `_capabilities()` merges every registered provider's map, so a provider
-# registered later wins on a key an earlier one already declared.
-_PRIVATEUSE1_CAPABILITY_PROVIDERS: list[Callable[[], dict]] = []
-
-
-def register_privateuse1_capabilities(provider: Callable[[], dict]) -> None:
-    _PRIVATEUSE1_CAPABILITY_PROVIDERS.append(provider)
-
-
 class PrivateUse1TestBase(DeviceTypeTestBase):
     primary_device: ClassVar[str]
     device_mod = None
     device_type = "privateuse1"
     bypass_device_restrictions = False
-
-    @classmethod
-    def _capabilities(cls):
-        capabilities = super()._capabilities()
-        for provider in _PRIVATEUSE1_CAPABILITY_PROVIDERS:
-            capabilities.update(provider())
-        return capabilities
 
     @classmethod
     def get_primary_device(cls):
@@ -1742,10 +1478,7 @@ def instantiate_device_type_tests(
                     device_type_test_class.instantiate_test(name, copy.deepcopy(test))
             # Ports non-test member. Setup / teardown have already been handled above
             elif name not in device_type_test_class.__dict__:
-                # Avoid invoking descriptors while copying members to the generated
-                # class. In particular, getattr() unwraps staticmethod and classmethod,
-                # changing how they bind when accessed through a test instance.
-                nontest = inspect.getattr_static(generic_test_class, name)
+                nontest = getattr(generic_test_class, name)
                 setattr(device_type_test_class, name, nontest)
 
         # Mimics defining the instantiated class in the caller's file
@@ -1948,10 +1681,10 @@ class ops(_TestParametrizer):
 
         # Order matters: op_allowlist filters first, then op_overrides adds decorators
         # This ensures op_overrides only applies to ops that passed the op_allowlist filter
-        op_list = device_cls._apply_op_allowlist(self.op_list)
-        op_list = device_cls._apply_op_overrides(op_list, test)
+        device_cls._apply_op_allowlist(self)
+        device_cls._apply_op_overrides(self, test)
         op = check_exhausted_iterator = object()
-        for op in op_list:
+        for op in self.op_list:
             # Determine the set of dtypes to use.
             dtypes: set[torch.dtype] | set[None]
             if isinstance(self.opinfo_dtypes, Sequence):
@@ -2280,20 +2013,7 @@ def largeTensorTest(size, device=None, inductor=TEST_WITH_TORCHINDUCTOR):
             # an additional array of the same size as the input.
             if inductor and torch._inductor.config.cpp_wrapper and _device != "cpu":
                 size_bytes *= 2
-            # When device is explicitly given for a *different* device type
-            # (e.g. device="cpu" on a CUDA test class), skip the class hook
-            # and use the generic helper directly.
-            if device is not None and device != getattr(self, "device_type", None):
-                ok = _has_sufficient_memory(_device, size_bytes)
-            else:
-                # Try the class hook first (e.g. CUDATestBase.has_sufficient_memory),
-                # falling back to the generic _has_sufficient_memory helper.
-                check_fn = getattr(self, "has_sufficient_memory", None)
-                if callable(check_fn):
-                    ok = check_fn(size_bytes)
-                else:
-                    ok = _has_sufficient_memory(_device, size_bytes)
-            if not ok:
+            if not _has_sufficient_memory(_device, size_bytes):
                 raise unittest.SkipTest(f"Insufficient {_device} memory")
 
             return fn(self, *args, **kwargs)
