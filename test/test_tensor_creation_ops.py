@@ -1112,6 +1112,7 @@ class TestTensorCreation(TestCase):
                 else:
                     self.assertEqual(from_tensor, to_tensor, exact_dtype=False)
 
+    @onlyCPU
     @dtypes(torch.half, torch.double, torch.int)
     def test_cat2(self, device, dtype):
         SIZE = 10
