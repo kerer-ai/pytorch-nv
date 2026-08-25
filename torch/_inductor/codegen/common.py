@@ -64,6 +64,7 @@ from ..virtualized import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, MutableMapping, Sequence
+    from importlib.metadata import EntryPoint
 
     from torch.fx import GraphModule
 
@@ -455,6 +456,84 @@ def register_backend_for_device(
     custom_backend_codegen_configs[device] = device_custom_config
 
 
+# Third-party (vendor) inductor backends, imported on first codegen for the device.
+#
+# Vendor packages declare a loader callable via the "torch.inductor.device_backends"
+# entry-point group (mirroring dynamo's "torch_dynamo_backends").  On first use of
+# a device that is not already registered, ``_load_device_backend`` discovers and
+# invokes the matching loader.  The loader must call ``register_backend_for_device``
+# to populate the four registries (scheduling, wrapper codegen, custom pass, custom
+# config) and may also call ``register_device_op_overrides`` for op-level overrides.
+_device_backend_loaders: dict[str, Callable[[], None]] = {}
+# Tracks devices for which a loader attempt has been made (success or no-op).
+# Renamed from _loaded_device_backends to clarify semantics.
+_attempted_device_backends: OrderedSet[str] = OrderedSet()
+_device_backend_lock = threading.Lock()
+
+# Public entry-point group name — vendor packages use this to declare their loader.
+INDUCTOR_DEVICE_BACKENDS_GROUP = "torch.inductor.device_backends"
+
+
+def register_device_backend_loader(device: str, loader: Callable[[], None]) -> None:
+    """Register ``loader`` to run the first time inductor codegens for ``device``;
+    the loader must call ``register_backend_for_device`` itself."""
+    _device_backend_loaders[device] = loader
+
+
+@functools.cache
+def _discover_device_backend_entrypoints() -> None:
+    # Vendor packages declare loaders via the "torch.inductor.device_backends"
+    # entry-point group (mirrors dynamo's "torch_dynamo_backends").
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group=INDUCTOR_DEVICE_BACKENDS_GROUP):
+        _device_backend_loaders.setdefault(ep.name, _make_entrypoint_loader(ep))
+
+
+def _make_entrypoint_loader(ep: EntryPoint) -> Callable[[], None]:
+    # ep.load() returns the vendor's loader callable; defer it to first use.
+    def _load() -> None:
+        ep.load()()
+
+    return _load
+
+
+def _load_device_backend(device: str) -> None:
+    """Load the vendor backend for ``device`` on first use. The device is claimed
+    before invoking the loader to short-circuit re-entrant queries (its import
+    may itself trigger scheduling lookups); the claim is released on failure so
+    a later resolve can retry.
+
+    Thread-safety: a lock guards the claim-and-load critical section so that
+    concurrent callers observe consistent state rather than a transient
+    half-registered device.
+    """
+    # Fast path: already registered or already attempted — O(1) set/dict check.
+    if device in device_codegens or device in _attempted_device_backends:
+        return
+    with _device_backend_lock:
+        # Re-check under the lock to avoid duplicate work by concurrent callers.
+        if device in device_codegens or device in _attempted_device_backends:
+            return
+        _attempted_device_backends.add(device)
+        _discover_device_backend_entrypoints()
+        loader = _device_backend_loaders.get(device)
+        if loader is None:
+            _attempted_device_backends.discard(device)
+            return
+        try:
+            loader()
+        except Exception:
+            _attempted_device_backends.discard(device)
+            raise
+        if device not in device_codegens:
+            log.warning(
+                "inductor device backend loader for %r returned without "
+                "registering the device via register_backend_for_device",
+                device,
+            )
+
+
 class BackendFeature(Enum):
     FOREACH = auto()
     BUCKETIZE = auto()
@@ -498,12 +577,14 @@ def has_backend_feature(
 
 
 def get_scheduling_for_device(device: str) -> SchedulingConstructor | None:
+    _load_device_backend(device)
     return device_codegens[device].scheduling if device in device_codegens else None
 
 
 def get_wrapper_codegen_for_device(
     device: str, cpp_wrapper: bool = False, fx_wrapper: bool = False
 ) -> WrapperConstructor | None:
+    _load_device_backend(device)
     if device in device_codegens:
         wrapper_codegen_obj: DeviceCodegen = device_codegens[device]
         if fx_wrapper:
@@ -526,10 +607,12 @@ def get_wrapper_codegen_for_device(
 
 
 def get_custom_backend_pass_for_device(device: str) -> CustomGraphModulePass | None:
+    _load_device_backend(device)
     return custom_backend_passes.get(device)
 
 
 def get_custom_backend_config_for_device(device: str) -> ConfigModule | None:
+    _load_device_backend(device)
     return custom_backend_codegen_configs.get(device)
 
 
@@ -553,7 +636,7 @@ def init_backend_registration() -> None:
     from .wrapper_fxir import WrapperFxCodegen
     from .xpu.xpu_combined_scheduling import XPUCombinedScheduling
 
-    if get_scheduling_for_device("cpu") is None:
+    if "cpu" not in device_codegens:
         cpu_backends = {
             "cpp": CppScheduling,
             "halide": HalideScheduling,
@@ -572,7 +655,7 @@ def init_backend_registration() -> None:
             WrapperFxCodegen,
         )
 
-    if get_scheduling_for_device("cuda") is None:
+    if "cuda" not in device_codegens:
         # CUDACombinedScheduling combines Triton and CUDA C++ scheduling for CUDA devices via delegation
         cuda_backends = {
             "triton": CUDACombinedScheduling,
@@ -587,7 +670,7 @@ def init_backend_registration() -> None:
             WrapperFxCodegen,
         )
 
-    if get_scheduling_for_device("tpu") is None:
+    if "tpu" not in device_codegens:
         register_backend_for_device(
             "tpu",
             PallasScheduling,
@@ -596,7 +679,7 @@ def init_backend_registration() -> None:
             # WrapperFxCodegen,
         )
 
-    if get_scheduling_for_device("xpu") is None:
+    if "xpu" not in device_codegens:
         register_backend_for_device(
             "xpu",
             XPUCombinedScheduling,
@@ -605,7 +688,7 @@ def init_backend_registration() -> None:
             WrapperFxCodegen,
         )
 
-    if get_scheduling_for_device("tpu") is None:
+    if "tpu" not in device_codegens:
         tpu_backends = {
             "pallas": PallasScheduling,
         }
@@ -615,7 +698,7 @@ def init_backend_registration() -> None:
             PythonWrapperCodegen,
         )
 
-    if get_scheduling_for_device("mps") is None:
+    if "mps" not in device_codegens:
         register_backend_for_device(
             "mps",
             MetalScheduling,
@@ -624,7 +707,7 @@ def init_backend_registration() -> None:
             WrapperFxCodegen,
         )
 
-    if get_scheduling_for_device("mtia") is None:
+    if "mtia" not in device_codegens:
         register_backend_for_device(
             "mtia",
             TritonScheduling,
@@ -634,10 +717,7 @@ def init_backend_registration() -> None:
         )
 
     private_backend = torch._C._get_privateuse1_backend_name()
-    if (
-        private_backend != "privateuseone"
-        and get_scheduling_for_device(private_backend) is None
-    ):
+    if private_backend != "privateuseone" and private_backend not in device_codegens:
         from torch.utils.backend_registration import _get_custom_mod_func
 
         try:
@@ -702,6 +782,7 @@ def get_device_op_overrides(device: str) -> DeviceOpOverrides:
     if not isinstance(device, str):
         raise AssertionError(type(device))
     _initialize_device_op_overrides()
+    _load_device_backend(device)
     return device_op_overrides_dict[device]
 
 
