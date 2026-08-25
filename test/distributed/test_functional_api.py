@@ -28,12 +28,26 @@ from torch.testing._internal.common_distributed import (
 )
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+    instantiate_parametrized_tests,
     IS_LINUX,
     run_tests,
     skipIfHpu,
     TEST_WITH_ROCM,
     TestCase,
 )
+
+
+# DEVICE = the accelerator used by comms-requiring tests (falls back to "cpu"
+# when no accelerator is available, so the file still collects/runs on gloo).
+# devices = every type (CPU + accelerator) the tests run on.
+# Detected dynamically via torch.accelerator so out-of-tree backends registered
+# under privateuse1 are included without a per-device if/elif chain.
+devices = ["cpu"]
+DEVICE = "cpu"
+if torch.accelerator.is_available():
+    accel_type = torch.accelerator.current_accelerator().type
+    devices.append(accel_type)
+    DEVICE = accel_type
 
 
 def new_subgroups(group_size: int, pg_tag=None):
@@ -441,6 +455,8 @@ class TestMakeFx(TestCase):
 
 
 class TestAllGatherViewOptimization(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     """Validate that all_gather_tensor delays wait() when the view optimization
     applies and calls wait() early when the fallback path is needed."""
 
