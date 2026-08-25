@@ -10,6 +10,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     TestCase,
 )
+from torch.testing._internal.common_utils import run_tests, maybe_to_accelerator, TEST_ACCELERATOR
 
 
 EXAMPLES = [
