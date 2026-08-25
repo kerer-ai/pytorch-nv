@@ -794,6 +794,7 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
             self.skipTest(f"{device_type} does not support get_rng_state")
 
         torch.manual_seed(0)
+        device_mod = torch.get_device_module(self.device_type)
         results = []
         rng_states = [device_module.get_rng_state()]
         for _ in range(num_runs):
