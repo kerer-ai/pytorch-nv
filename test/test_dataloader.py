@@ -3056,6 +3056,8 @@ class TestDataLoaderDevice(TestCase):
 
 
 class IntegrationTestDataLoaderDataPipe(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     r"""
     Verify the behavior of a certain ``DataPipes`` with ``DataLoader``
     """
