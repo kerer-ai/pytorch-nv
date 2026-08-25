@@ -26,11 +26,15 @@ from torch.nn.attention.flex_attention import (
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+    instantiate_parametrized_tests,
     parametrize,
     run_tests,
     TestCase,
 )
-from torch.testing._internal.distributed._tensor.common_dtensor import MLPModule
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DEVICE_TYPE,
+    MLPModule,
+)
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils._pytree import register_pytree_node
 
@@ -189,6 +193,7 @@ class DTensorExportTest(TestCase):
         dist.init_process_group(
             backend="fake", rank=0, world_size=self.world_size, store=store
         )
+        self.device_type = DEVICE_TYPE
 
     def _run_test(self, export_fn, device, test_annotation=False):
         device_type = torch.device(device).type
@@ -555,6 +560,7 @@ class DTensorExportCUDATest(TestCase):
         dist.init_process_group(
             backend="fake", rank=0, world_size=self.world_size, store=store
         )
+        self.device_type = "cuda"
 
     @parametrize(
         "export_fn",
