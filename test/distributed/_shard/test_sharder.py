@@ -10,11 +10,17 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._shard.sharder import Sharder
 from torch.distributed._shard.sharding_plan import ShardingPlan
 from torch.distributed._shard.sharding_spec import ChunkShardingSpec
-from torch.testing._internal.common_distributed import (
-    requires_accelerator_dist_backend,
-    skip_if_lt_x_gpu,
+from torch.testing._internal.common_device_type import (
+    Capability,
+    instantiate_device_type_tests,
+    requires_capabilities,
 )
-from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
+from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TEST_WITH_DEV_DBG_ASAN,
+)
 from torch.testing._internal.distributed._shard.sharded_tensor import (
     ShardedTensorTestBase,
     TEST_GPU_NUM,
@@ -107,10 +113,14 @@ class CustomSharder(Sharder):
 
 
 class TestCustomSharder(ShardedTensorTestBase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @with_comms(init_rpc=False, backend=BACKEND)
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
-    @requires_accelerator_dist_backend(["nccl", "xccl"])
-    def test_custom_sharder(self):
+    @requires_capabilities(Capability.distributed.backend)
+    def test_custom_sharder(self, device):
+        dev_type = torch.device(device).type
+
         class MyModule(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -120,7 +130,7 @@ class TestCustomSharder(ShardedTensorTestBase):
                 return self.ebc(inputs)
 
         custom_sharder = CustomSharder(
-            devices=[f"rank:{i}/{device_type}:{i}" for i in range(TEST_GPU_NUM)],
+            devices=[f"rank:{i}/{dev_type}:{i}" for i in range(TEST_GPU_NUM)],
             split_sharding_idx=TEST_GPU_NUM // 2,
         )
 
@@ -130,7 +140,7 @@ class TestCustomSharder(ShardedTensorTestBase):
             }
         )
 
-        local_model = MyModule().to(f"{device_type}:{self.rank}")
+        local_model = MyModule().to(f"{dev_type}:{self.rank}")
         sharded_model = copy.deepcopy(local_model)
 
         # shard the module with the provided sharding plan
@@ -151,7 +161,7 @@ class TestCustomSharder(ShardedTensorTestBase):
 
         # make sure we can run sharded computation and compare outputs
         # with the local model version
-        input = torch.arange(8).reshape((2, 4)).to(f"{device_type}:{self.rank}")
+        input = torch.arange(8).reshape((2, 4)).to(f"{dev_type}:{self.rank}")
         local_output = local_model(input)
         sharded_output = sharded_model(input)
 
@@ -159,10 +169,11 @@ class TestCustomSharder(ShardedTensorTestBase):
 
     @with_comms(init_rpc=False, backend=BACKEND)
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
-    @requires_accelerator_dist_backend(["nccl", "xccl"])
-    def test_custom_sharder_errors(self):
+    @requires_capabilities(Capability.distributed.backend)
+    def test_custom_sharder_errors(self, device):
+        dev_type = torch.device(device).type
         custom_sharder = CustomSharder(
-            devices=[f"rank:{i}/{device_type}:{i}" for i in range(TEST_GPU_NUM)],
+            devices=[f"rank:{i}/{dev_type}:{i}" for i in range(TEST_GPU_NUM)],
             split_sharding_idx=TEST_GPU_NUM // 2,
         )
 
@@ -173,7 +184,7 @@ class TestCustomSharder(ShardedTensorTestBase):
         )
 
         sharded_model = CustomEmbeddingBagCollection(10, 10, 8).to(
-            f"{device_type}:{self.rank}"
+            f"{dev_type}:{self.rank}"
         )
 
         with self.assertRaisesRegex(
@@ -184,7 +195,7 @@ class TestCustomSharder(ShardedTensorTestBase):
 
         # test conflicted sharding plan
         spec = ChunkShardingSpec(
-            dim=0, placements=[f"rank:0/{device_type}:0", f"rank:1/{device_type}:1"]
+            dim=0, placements=[f"rank:0/{dev_type}:0", f"rank:1/{dev_type}:1"]
         )
         sharding_plan = ShardingPlan(
             plan={
@@ -198,6 +209,11 @@ class TestCustomSharder(ShardedTensorTestBase):
         ):
             # shard the module with the provided sharding plan
             shard_module(sharded_model, sharding_plan)
+
+
+instantiate_device_type_tests(
+    TestCustomSharder, globals(), except_for="cpu", allow_xpu=True
+)
 
 
 if __name__ == "__main__":
