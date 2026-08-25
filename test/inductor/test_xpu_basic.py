@@ -2,8 +2,10 @@
 import importlib
 import os
 import sys
+import unittest
 
 import torch
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 importlib.import_module("filelock")
@@ -22,7 +24,10 @@ from inductor.test_torchinductor import (  # @manual=fbcode//caffe2/test/inducto
 # Will remove this file when pass full test in test/inductor/*.
 
 
+@unittest.skipUnless(torch.xpu.is_available(), "requires XPU")
 class XpuBasicTests(TestCase):
+    hw_classification = HardwareClassification.XPU
+
     common = check_model_gpu
     device = "xpu"
 
@@ -53,7 +58,7 @@ class XpuBasicTests(TestCase):
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
-    from torch.testing._internal.inductor_utils import HAS_XPU_AND_TRITON
+    from torch.testing._internal.inductor_utils import HAS_TRITON
 
-    if HAS_XPU_AND_TRITON:
+    if torch.xpu.is_available() and HAS_TRITON:
         run_tests(needs="filelock")
