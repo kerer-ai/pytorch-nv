@@ -118,7 +118,10 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         from the view's layout.
 
         """
-        from torch._inductor.runtime.benchmarking import benchmarker
+        from torch._inductor.runtime.benchmarking import (
+            benchmarker,
+            has_graph_benchmarker,
+        )
 
         input_tensors = tuple(x.to_tensor() for x in self.input_tensor_meta)
         if out is None:
@@ -127,7 +130,11 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         fn = self.make_run_fn(*input_tensors, out=out)
         try:
             if self.benchmark_with_cudagraphs:
-                res = benchmarker.benchmark_gpu_with_cuda_graph(fn)
+                device = benchmarker.infer_device(*input_tensors, out)
+                if has_graph_benchmarker(device):
+                    res = benchmarker.benchmark_gpu_with_graph(fn, device=device)
+                else:
+                    res = self.do_bench(fn, *input_tensors, out=out)
             else:
                 res = self.do_bench(fn, *input_tensors, out=out)
         finally:
