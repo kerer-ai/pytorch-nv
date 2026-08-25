@@ -33,6 +33,7 @@ from torch.distributed._symmetric_memory._shmem_triton import requires_shmem
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     HardwareClassification,
+    instantiate_parametrized_tests,
     parametrize,
     run_tests,
     skip_but_pass_in_sandcastle_if,
