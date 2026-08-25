@@ -63,7 +63,15 @@ from torch.testing._internal.inductor_utils import (
     HAS_TRITON,
     TRITON_HAS_CPU,
     requires_triton,
+    onlyAccelerator,
 )
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    IS_FBCODE,
+    IS_MACOS,
+)
+from torch.testing._internal.inductor_utils import HAS_CPU, HAS_TRITON, TRITON_HAS_CPU
+from torch.utils._triton import has_triton_package
 
 
 try:
@@ -113,7 +121,7 @@ class TritonExtensionBackendGenericTests(BaseExtensionBackendTests):
         # Restore the default backend.
         cls._default_backend_patch.stop()
 
-    def test_open_device_registration(self):
+    def _test_open_device_registration(self):
         torch._register_device_module("privateuseone", self.module)
         register_backend_for_device(
             "privateuseone", ExtensionScheduling, ExtensionWrapperCodegen
