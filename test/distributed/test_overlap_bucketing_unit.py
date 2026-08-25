@@ -24,7 +24,14 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_distributed import requires_accelerator_dist_backend
+from torch.testing._internal.common_device_type import (
+    Capability,
+    instantiate_device_type_tests,
+    onlyAccelerator,
+    requires_capabilities,
+)
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
@@ -41,8 +48,6 @@ aten = torch.ops.aten
 
 from torch.testing._internal.common_fsdp import get_devtype
 
-
-device_type = get_devtype().type
 
 
 import torch
@@ -105,8 +110,9 @@ def build_collective_info(graph, hiding_annotations):
 
 @requires_accelerator_dist_backend()
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-@instantiate_parametrized_tests
-class TestOverlapPreservingBucketing(InductorTestCase):
+class TestOverlapPreservingBucketingDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """
     Unit tests for overlap-preserving bucketing pass.
     """
@@ -118,14 +124,15 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         dist.destroy_process_group()
 
-    def test_can_bucket_independent_collectives(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_can_bucket_independent_collectives(self, device):
         """
         Test that independent collectives with separate hiding nodes CAN bucket.
 
@@ -157,8 +164,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
 
             # Trace with make_fx
             traced = make_fx(func)(a, b)
@@ -200,7 +207,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             graph_str
         )
 
-    def test_cant_bucket_nested_hiding_intervals(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_cant_bucket_nested_hiding_intervals(self, device):
         """
         Test that nested hiding intervals prevent bucketing.
 
@@ -240,8 +249,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
 
             # Trace with make_fx
             traced = make_fx(func)(a, b)
@@ -287,8 +296,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             graph_str
         )
 
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
     @parametrize("final_mm_hidden", (True, False))
-    def test_cant_bucket_ag_with_rs_hiding_interval_between(self, final_mm_hidden):
+    def test_cant_bucket_ag_with_rs_hiding_interval_between(self, device, final_mm_hidden):
         """
         Test that all_gathers can't bucket when a reduce_scatter's hiding interval is between them.
 
@@ -337,9 +348,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(8, 4, device=self.device)
-            c = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(8, 4, device=device)
+            c = torch.ones(4, 4, device=device)
 
             # Trace with make_fx
             traced = make_fx(func)(a, b, c)
@@ -398,7 +409,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
                 "%all_gather_into_tensor_out", 1, exactly=False
             ).run(graph_str)
 
-    def test_can_bucket_all_reduce(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_can_bucket_all_reduce(self, device):
         """
         Test that all_reduce operations CAN bucket together.
 
@@ -425,8 +438,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
 
             # Trace with make_fx
             traced = make_fx(func)(a, b)
@@ -471,7 +484,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             "split_with_sizes"
         ).check_count("%mm", 2).run(graph_str)
 
-    def test_manual_bucket_splits_dependent_all_reduce(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_manual_bucket_splits_dependent_all_reduce(self, device):
         """Bucketing must split dependent same-key all_reduces, not fuse them.
 
         Reproduces the loss-parallel cross-entropy pattern with two independent
@@ -497,10 +512,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return result0.sum() + result1.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
-            c = torch.ones(4, 4, device=self.device)
-            d = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
+            c = torch.ones(4, 4, device=device)
+            d = torch.ones(4, 4, device=device)
             traced = make_fx(func)(a, b, c, d)
 
         collective_info = build_collective_info(traced.graph, {})
@@ -547,7 +562,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertEqual(len(all_reduces), 2)
         self.assertEqual(len(cats), 2)
 
-    def test_no_cross_type_bucketing_ar_and_rs(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_no_cross_type_bucketing_ar_and_rs(self, device):
         """
         Test that all_reduce and reduce_scatter on the same PG with
         matching reduce_op and dtype are NOT bucketed together.
@@ -579,8 +596,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return ar1_out.sum() + ar2_out.sum() + rs1_out.sum() + rs2_out.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
             traced = make_fx(func)(a, b)
 
         ar1, ar2 = traced.graph.find_nodes(
@@ -624,7 +641,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
         self.assertEqual(len(rs_nodes), 1)
 
-    def test_reduce_scatter_coalesced_mode(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_reduce_scatter_coalesced_mode(self, device):
         """
         Test that 'coalesced' bucket mode uses reduce_scatter_tensor_coalesced
         instead of cat + single reduce_scatter.
@@ -647,8 +666,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return rs1_out.sum() + rs2_out.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
             traced = make_fx(func)(a, b)
 
         rs1, rs2 = traced.graph.find_nodes(
@@ -676,7 +695,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertIn("reduce_scatter_tensor_coalesced", graph_str)
         self.assertNotIn("cat.default", graph_str)
 
-    def test_all_gather_coalesced_mode_falls_back(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_all_gather_coalesced_mode_falls_back(self, device):
         """
         Test that 'coalesced' bucket mode falls back to default bucketing
         for all_gather (coalesced is only supported for reduce_scatter).
@@ -699,8 +720,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return ag1_out.sum() + ag2_out.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
             traced = make_fx(func)(a, b)
 
         ag1, ag2 = traced.graph.find_nodes(
@@ -729,7 +750,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertIn("cat.default", graph_str)
         self.assertNotIn("all_gather_into_tensor_coalesced", graph_str)
 
-    def test_reduce_scatter_coalesced_mode_single_rs(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_reduce_scatter_coalesced_mode_single_rs(self, device):
         """
         Test that 'coalesced' bucket mode correctly identifies the collective
         start node even when there is only a single reduce_scatter (so only
@@ -750,7 +773,7 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return rs1_out.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
             traced = make_fx(func)(a)
 
         rs_nodes = traced.graph.find_nodes(
@@ -781,7 +804,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         graph_str = str(traced.graph)
         self.assertIn("reduce_scatter_tensor", graph_str)
 
-    def test_can_bucket_multidtype_collectives(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_can_bucket_multidtype_collectives(self, device):
         """
         Test that all_gathers with different dtypes CAN bucket together.
 
@@ -818,8 +843,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device, dtype=torch.float32)
-            b = torch.ones(4, 4, device=self.device, dtype=torch.bfloat16)
+            a = torch.ones(4, 4, device=device, dtype=torch.float32)
+            b = torch.ones(4, 4, device=device, dtype=torch.bfloat16)
 
             # Trace with make_fx
             traced = make_fx(func)(a, b)
@@ -865,7 +890,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             graph_str
         )
 
-    def test_can_bucket_with_multiple_hiding_nodes(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_can_bucket_with_multiple_hiding_nodes(self, device):
         """
         Test that collectives with multiple hiding nodes CAN bucket.
 
@@ -903,8 +930,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
         # Use fake mode to trace without executing
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
 
             # Trace with make_fx
             traced = make_fx(func)(a, b)
@@ -954,7 +981,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             str(traced.graph)
         )
 
-    def test_can_bucket_with_convert_dtype_as_hiding_nodes(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_can_bucket_with_convert_dtype_as_hiding_nodes(self, device):
         """
         Test that all_gathers can bucket when convert_element_type ops ARE the hiding nodes.
 
@@ -990,9 +1019,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return ag1_out, ag2_out, ag3_out, mm
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device, dtype=torch.float32)
-            b = torch.ones(4, 4, device=self.device, dtype=torch.float32)
-            c = torch.ones(4, 4, device=self.device, dtype=torch.float32)
+            a = torch.ones(4, 4, device=device, dtype=torch.float32)
+            b = torch.ones(4, 4, device=device, dtype=torch.float32)
+            c = torch.ones(4, 4, device=device, dtype=torch.float32)
 
             traced = make_fx(func)(a, b, c)
 
@@ -1042,8 +1071,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         f.check("pre_bucket_all_gather").check("all_gather_into_tensor_out")
         f.run(graph_str)
 
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
     @torch._inductor.config.patch(deterministic=True)
-    def test_deterministic_mode_no_benchmark_error(self):
+    def test_deterministic_mode_no_benchmark_error(self, device):
         """
         Test that deterministic mode doesn't error when running overlap scheduling.
 
@@ -1071,14 +1102,16 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return (pointwise + ag_out).sum()
 
         with FakeTensorMode():
-            a = torch.randn(16, 16, device=self.device)
-            b = torch.randn(16, 16, device=self.device)
+            a = torch.randn(16, 16, device=device)
+            b = torch.randn(16, 16, device=device)
             gm = make_fx(func)(a, b)
 
         # Should not error in deterministic mode (would have errored before fix)
         schedule_overlap_bucketing(gm)
 
-    def test_assume_bucketed_latency_exceeds_exposed_time(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_assume_bucketed_latency_exceeds_exposed_time(self, device):
         """
         When assume_bucketing_reduces_latency is True and two same-type
         collectives are in-flight, the latency subtraction in
@@ -1111,8 +1144,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             return mm1.sum() + ag1_out.sum() + ag2_out.sum()
 
         with FakeTensorMode():
-            a = torch.randn(4, 4, device=self.device)
-            b = torch.randn(4, 4, device=self.device)
+            a = torch.randn(4, 4, device=device)
+            b = torch.randn(4, 4, device=device)
             gm = make_fx(func)(a, b)
 
         def custom_runtime(node: fx.Node, override_size: int | None) -> float | None:
@@ -1131,6 +1164,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
 
+instantiate_device_type_tests(TestOverlapPreservingBucketingDevice, globals(), except_for="cpu")
+
+
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 @instantiate_parametrized_tests
@@ -1146,7 +1182,6 @@ class TestCrossPGOverlap(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
-        cls.device = "cuda"
 
         # Create two separate process groups for cross-PG testing
         cls.pg1 = dist.new_group(ranks=[0, 1])
@@ -1161,7 +1196,9 @@ class TestCrossPGOverlap(InductorTestCase):
         dist.destroy_process_group(cls.pg2)
         dist.destroy_process_group()
 
-    def test_cross_pg_prefetch_during_exposed_wait(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_cross_pg_prefetch_during_exposed_wait(self, device):
         """
         Test that ag2 on PG2 gets prefetched during exposed wait of ag1 on PG1.
         """
@@ -1188,8 +1225,8 @@ class TestCrossPGOverlap(InductorTestCase):
             return mm1 + mm2
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device) * 2
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device) * 2
 
             traced = make_fx(func)(a, b)
 
@@ -1314,8 +1351,8 @@ class TestCrossPGOverlap(InductorTestCase):
             return mm3.sum() + rs1_out.sum() + rs2_out.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
             traced = make_fx(func)(a, b)
 
         from torch._inductor.fx_passes.overlap_scheduling import (
@@ -1344,13 +1381,15 @@ class TestCrossPGOverlap(InductorTestCase):
         last_mm = max(mm_positions)
         self.assertTrue(
             any(p < last_mm for p in rs_starts),
-            lambda msg: f"{msg}\nOff-path reduce_scatters drifted to end: rs={rs_starts}, mm={mm_positions}, names={node_names}",
+            f"Off-path reduce_scatters drifted to end: rs={rs_starts}, mm={mm_positions}, names={node_names}",
         )
 
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
     @torch._inductor.config.patch(
         {"test_configs.assume_bucketing_reduces_latency": False}
     )
-    def test_prefetch_prioritizes_larger_hidden_time(self):
+    def test_prefetch_prioritizes_larger_hidden_time(self, device):
         """
         When multiple future collectives have the same semantic priority, choose
         the one that can consume more of the current overlap window first.
@@ -1373,9 +1412,9 @@ class TestCrossPGOverlap(InductorTestCase):
             return mm.sum() + wait_small.sum() + wait_large.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
-            c = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
+            c = torch.ones(4, 4, device=device)
             traced = make_fx(func)(a, b, c)
 
         ag_small, ag_large = traced.graph.find_nodes(
@@ -1423,10 +1462,14 @@ class TestCrossPGOverlap(InductorTestCase):
         )
 
 
+instantiate_device_type_tests(TestCrossPGOverlapDevice, globals(), except_for="cpu")
+
+
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-@instantiate_parametrized_tests
-class TestFusibleNodeOverlap(InductorTestCase):
+class TestFusibleNodeOverlapDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """Test that fusible nodes are used for overlapping with collectives."""
 
     @classmethod
@@ -1436,14 +1479,15 @@ class TestFusibleNodeOverlap(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         dist.destroy_process_group()
 
-    def test_fusible_nodes_hide_collective(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_fusible_nodes_hide_collective(self, device):
         """Test that fusible (non-mm) nodes can hide collectives."""
 
         def func(a):
@@ -1461,7 +1505,7 @@ class TestFusibleNodeOverlap(InductorTestCase):
             return ag_out.sum() + b.sum()
 
         with FakeTensorMode():
-            a = torch.ones(1024, 1024, device=self.device)
+            a = torch.ones(1024, 1024, device=device)
             traced = make_fx(func)(a)
 
         from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
@@ -1495,7 +1539,9 @@ class TestFusibleNodeOverlap(InductorTestCase):
             "sub"
         ).check("wait_tensor").run(graph_str)
 
-    def test_fusion_regions_hide_collective(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_fusion_regions_hide_collective(self, device):
         """Test that fusion regions can hide collectives when enabled."""
 
         def func(a):
@@ -1512,7 +1558,7 @@ class TestFusibleNodeOverlap(InductorTestCase):
             return ag_out.sum() + b.sum()
 
         with FakeTensorMode():
-            a = torch.ones(1024, 1024, device=self.device)
+            a = torch.ones(1024, 1024, device=device)
             traced = make_fx(func)(a)
 
         from torch._inductor.fx_passes.overlap_scheduling import OverlapScheduler
@@ -1543,8 +1589,10 @@ class TestFusibleNodeOverlap(InductorTestCase):
             "sub"
         ).check("wait_tensor").run(graph_str)
 
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
     @parametrize("enable_fusion_regions", [False, True])
-    def test_precomputed_estimations_via_custom_runtime(self, enable_fusion_regions):
+    def test_precomputed_estimations_via_custom_runtime(self, device, enable_fusion_regions):
         """Pre-computed estimations from gather_node_runtime_estimations can be
         fed into OverlapScheduler via custom_runtime_estimation wrapping a dict."""
 
@@ -1560,7 +1608,7 @@ class TestFusibleNodeOverlap(InductorTestCase):
             return ag_out.sum() + b.sum()
 
         with FakeTensorMode():
-            a = torch.ones(1024, 1024, device=self.device)
+            a = torch.ones(1024, 1024, device=device)
             traced = make_fx(func)(a)
 
         from torch._inductor.fx_passes.overlap_scheduling import (
@@ -1697,7 +1745,9 @@ class TestOverlapSchedulingNoMemoryLimit(InductorTestCase):
 
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-class TestOverlapSchedulingFixes(InductorTestCase):
+class TestOverlapSchedulingFixesDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """
     Test cases for specific bug fixes in overlap scheduling.
     These tests would fail without their corresponding fixes.
@@ -1710,14 +1760,15 @@ class TestOverlapSchedulingFixes(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=16, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         dist.destroy_process_group()
 
-    def test_no_self_dependency_cycle_with_dtype_conversion(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_no_self_dependency_cycle_with_dtype_conversion(self, device):
         """
         Test that bucketing collectives with dtype conversion doesn't create
         self-dependency cycles.
@@ -1769,10 +1820,10 @@ class TestOverlapSchedulingFixes(InductorTestCase):
             return w1.sum() + w2.sum() + w3.sum() + w4.sum() + mm.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
-            c = torch.ones(4, 4, device=self.device)
-            d = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
+            c = torch.ones(4, 4, device=device)
+            d = torch.ones(4, 4, device=device)
 
             traced = make_fx(func)(a, b, c, d)
 
@@ -1797,7 +1848,9 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         result = scheduler.run()
         result.graph.lint()
 
-    def test_no_cycle_with_fusion_regions_and_bucketing(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_no_cycle_with_fusion_regions_and_bucketing(self, device):
         """Test that fusion regions + bucketing doesn't create cycles."""
 
         def func(a, b, c, d):
@@ -1846,10 +1899,10 @@ class TestOverlapSchedulingFixes(InductorTestCase):
             return w1.sum() + w2.sum() + w3.sum() + w4.sum() + x.sum() + y.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
-            c = torch.ones(4, 4, device=self.device)
-            d = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
+            c = torch.ones(4, 4, device=device)
+            d = torch.ones(4, 4, device=device)
 
             traced = make_fx(func)(a, b, c, d)
 
@@ -1872,7 +1925,9 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         result = scheduler.run()
         result.graph.lint()
 
-    def test_no_cycle_from_dtype_convert_timeline_deps(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_no_cycle_from_dtype_convert_timeline_deps(self, device):
         """
         Test that transfer_erased_node_deps doesn't create cycles when
         convert_element_type nodes with timeline deps get fused into a
@@ -1902,8 +1957,8 @@ class TestOverlapSchedulingFixes(InductorTestCase):
             return w1.sum() + w2.sum()
 
         with FakeTensorMode():
-            a = torch.ones(4, 4, device=self.device)
-            b = torch.ones(4, 4, device=self.device)
+            a = torch.ones(4, 4, device=device)
+            b = torch.ones(4, 4, device=device)
             traced = make_fx(func)(a, b)
 
         graph = traced.graph
@@ -1949,7 +2004,9 @@ class TestOverlapSchedulingFixes(InductorTestCase):
             "Cycle: pre_bucket <-> new_start via data + extra deps",
         )
 
-    def test_graphsafe_rng_state_with_insert_overlap_deps(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_graphsafe_rng_state_with_insert_overlap_deps(self, device):
         from torch._inductor.fx_passes.control_dependencies import control_deps
         from torch._inductor.fx_passes.overlap_scheduling import (
             schedule_overlap_bucketing,
@@ -1970,8 +2027,8 @@ class TestOverlapSchedulingFixes(InductorTestCase):
 
         fake_mode = FakeTensorMode()
         with fake_mode:
-            a = torch.empty(4, 4, device=self.device)
-            b = torch.empty(4, 4, device=self.device)
+            a = torch.empty(4, 4, device=device)
+            b = torch.empty(4, 4, device=device)
             gen = torch.cuda.default_generators[0].clone_state()
             traced = make_fx(func)(a, b, gen)
 
@@ -2009,11 +2066,18 @@ class TestOverlapSchedulingFixes(InductorTestCase):
             graph.run(a, b, gen)
 
 
+instantiate_device_type_tests(TestOverlapSchedulingFixesDevice, globals(), except_for="cpu")
+
+
+@requires_accelerator_dist_backend()
 class TestForeachGroupsUnit(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """Unit tests for _compute_foreach_groups and _pre_bucket_all_gather foreach optimization."""
 
-    @unittest.skipIf(not HAS_GPU, "Requires GPU")
-    def test_foreach_groups_correctness(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_foreach_groups_correctness(self, device):
         """Test that foreach grouping computes correct groups and copies data correctly."""
         from torch._inductor.fx_passes.bucketing import (
             _ALL_DTYPES,
@@ -2021,9 +2085,9 @@ class TestForeachGroupsUnit(InductorTestCase):
             _pre_bucket_all_gather,
         )
 
-        t1 = torch.randn(10, device="cuda")
-        t2 = torch.randn(20, device="cuda", dtype=torch.float16)
-        t3 = torch.randn(10, device="cuda")
+        t1 = torch.randn(10, device=device)
+        t2 = torch.randn(20, device=device, dtype=torch.float16)
+        t3 = torch.randn(10, device=device)
         ag_ins = [t1, t2, t3]
         out_dtypes = [torch.float32, torch.float16, torch.float32]
         out_dtype_ints = [_ALL_DTYPES.index(d) for d in out_dtypes]
@@ -2043,7 +2107,12 @@ class TestForeachGroupsUnit(InductorTestCase):
         self.assertTrue(torch.allclose(result_with, result_without))
 
 
+instantiate_device_type_tests(TestForeachGroupsUnit, globals(), except_for="cpu")
+
+
 class TestNodeRuntimeEstimationUnit(InductorTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_compute_estimation_logging_handles_symbolic_scalar_meta(self):
         from torch._inductor.fx_passes.node_runtime_estimation import (
             _log_compute_estimations,
@@ -2167,6 +2236,8 @@ def _load_pge_profile(data):
 
 
 class TestProfileGuidedEstimation(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_profile_loading_and_lookup(self):
         """Load a trace with collectives, aten ops, and a custom op; verify lookups."""
         with torch.library._scoped_library("test_pge", "DEF") as lib:
@@ -2295,9 +2366,10 @@ class TestProfileGuidedEstimation(TestCase):
 
 
 @requires_accelerator_dist_backend(["nccl", "xccl"])
-@requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-class TestCoalescedCollectiveOverlap(InductorTestCase):
+class TestCoalescedCollectiveOverlapDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """
     Tests for coalesced collective support in overlap scheduling.
 
@@ -2314,7 +2386,6 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=8, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
@@ -2344,12 +2415,14 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
             return mm1.sum() + mm2.sum() + sum(w.sum() for w in waited)
 
         with FakeTensorMode():
-            inputs = [torch.ones(8, 8, device=self.device) for _ in range(num_tensors)]
+            inputs = [torch.ones(8, 8, device=device) for _ in range(num_tensors)]
             traced = make_fx(func)(*inputs)
 
         return traced
 
-    def test_identify_collectives_coalesced(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_identify_collectives_coalesced(self, device):
         """
         _identify_collectives should register one CollectiveInfo per coalesced
         collective, not overwrite for each wait.
@@ -2382,7 +2455,9 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         starts = set(scheduler.wait_to_start.values())
         self.assertEqual(len(starts), 1)
 
-    def test_overlap_scheduler_coalesced_runs(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_overlap_scheduler_coalesced_runs(self, device):
         """
         Full overlap scheduler run with coalesced collectives should not crash.
         Previously crashed with assertion errors in _handle_wait and
@@ -2414,7 +2489,9 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         self.assertIn("reduce_scatter_tensor_coalesced", graph_str)
         self.assertIn("wait_tensor", graph_str)
 
-    def test_gather_node_runtime_estimations_coalesced(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_gather_node_runtime_estimations_coalesced(self, device):
         """
         gather_node_runtime_estimations should estimate coalesced collectives
         exactly once (not once per wait).
@@ -2442,7 +2519,9 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         }
         self.assertEqual(len(rs_estimations), 1)
 
-    def test_estimate_fx_collective_size_coalesced(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_estimate_fx_collective_size_coalesced(self, device):
         """
         estimate_fx_collective_size should handle coalesced collectives
         whose output meta is a list of tensors, not a single tensor.
@@ -2461,9 +2540,14 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         self.assertGreater(size, 0)
 
 
+instantiate_device_type_tests(TestCoalescedCollectiveOverlapDevice, globals(), except_for="cpu")
+
+
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-class TestProfileGuidedEstimatorIntegration(InductorTestCase):
+class TestProfileGuidedEstimatorIntegrationDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     """Integration tests: ProfileGuidedEstimator.__call__ on traced FX graphs."""
 
     @classmethod
@@ -2473,14 +2557,15 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         dist.destroy_process_group()
 
-    def test_estimator_call_on_fx_graph(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_estimator_call_on_fx_graph(self, device):
         """ProfileGuidedEstimator returns estimates for collective and mm nodes in a traced graph."""
         group_name = dist.distributed_c10d._get_default_group().group_name
         pg_ranks = tuple(sorted(dist.get_process_group_ranks(dist.group.WORLD)))
@@ -2523,8 +2608,8 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
                 return ar_out + mm
 
             with FakeTensorMode():
-                a = torch.randn(16, 16, device=self.device)
-                b = torch.randn(16, 16, device=self.device)
+                a = torch.randn(16, 16, device=device)
+                b = torch.randn(16, 16, device=device)
                 gm = make_fx(func)(a, b)
 
             # Call estimator on each node
@@ -2549,9 +2634,14 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
             os.unlink(trace_path)
 
 
+instantiate_device_type_tests(TestProfileGuidedEstimatorIntegrationDevice, globals(), except_for="cpu")
+
+
 @requires_accelerator_dist_backend()
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-class TestPreBucketingFsdpCollectives(InductorTestCase):
+class TestPreBucketingFsdpCollectivesDevice(InductorTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -2559,14 +2649,15 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=64, store=store)
-        cls.device = "cuda"
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         dist.destroy_process_group()
 
-    def test_saturation_model(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_saturation_model(self, device):
         """IB floor activates for small groups; NVLink uses formula; monotonic."""
         from torch._inductor.comm_analysis import (
             compute_min_saturation_bytes,
@@ -2594,7 +2685,9 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         self.assertGreater(sat_nv, 50 * _MB)
         self.assertLess(sat_nv, 200 * _MB)
 
-    def test_pre_bucketing_only_merges_fsdp_collectives(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_pre_bucketing_only_merges_fsdp_collectives(self, device):
         """Pre-bucketing merges FSDP all-gathers but leaves TP all-gathers alone."""
         from torch._inductor.fx_passes.bucketing import is_all_gather_into_tensor
         from torch._inductor.fx_passes.fsdp import (
@@ -2622,7 +2715,7 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
 
         with FakeTensorMode():
             traced = make_fx(func)(
-                *(torch.ones(4, 4, device=self.device) for _ in range(4))
+                *(torch.ones(4, 4, device=device) for _ in range(4))
             )
 
         def count_ag(group):
@@ -2640,7 +2733,9 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         self.assertEqual(count_ag(fsdp_group), 1)  # 2 merged into 1
         self.assertEqual(count_ag(tp_group), 1)  # TP untouched
 
-    def test_pre_bucketing_handles_dtype_cast(self):
+    @onlyAccelerator
+    @requires_capabilities(Capability.distributed.backend)
+    def test_pre_bucketing_handles_dtype_cast(self, device):
         """Parameter -> dtype cast -> all_gather is identified as FSDP."""
         from torch._inductor.fx_passes.bucketing import is_all_gather_into_tensor
         from torch._inductor.fx_passes.fsdp import (
@@ -2663,8 +2758,8 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
 
         with FakeTensorMode():
             traced = make_fx(func)(
-                torch.ones(4, 4, device=self.device),
-                torch.ones(4, 4, device=self.device),
+                torch.ones(4, 4, device=device),
+                torch.ones(4, 4, device=device),
             )
 
         def count_ag(group):
@@ -2681,7 +2776,12 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         self.assertEqual(count_ag(fsdp_group), 1)
 
 
+instantiate_device_type_tests(TestPreBucketingFsdpCollectivesDevice, globals(), except_for="cpu")
+
+
 class TestBitsetAncestors(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     """Tests for BitsetAncestors -- int-bitset transitive ancestor sets."""
 
     def _make_graph(self):
