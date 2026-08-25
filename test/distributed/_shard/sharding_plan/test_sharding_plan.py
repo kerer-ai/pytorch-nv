@@ -37,13 +37,19 @@ DEVICE_TYPE = (
 BACKEND = torch.distributed.get_default_backend_for_device(DEVICE_TYPE)
 
 
+device_type = (
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+)
+backend = dist.get_default_backend_for_device(device_type)
+
+
 # Example ShardingPlanner that chunks every parameter in the module
 # to all available devices defined.
 class ChunkAllShardingPlanner(ShardingPlanner):
     dim = 0
     devices = []
 
-    def __init__(self, chunk_dim=0, device_count=0):
+    def __init__(self, chunk_dim=0, device_count=0, device_type="cuda"):
         self.dim = chunk_dim
         self.devices = [f"rank:{i}/{DEVICE_TYPE}:{i}" for i in range(device_count)]
 
@@ -74,7 +80,6 @@ class TestShardingPlan(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             TypeError, "Only `ShardingSpec` and `Sharder` are supported to shard"
         ):
-            # shard the module with the provided sharding plan
             shard_module(megatron_lm, sharding_plan_wrong_plan)
 
         sharding_plan_wrong_output_plan = ShardingPlan(
@@ -87,7 +92,6 @@ class TestShardingPlan(ShardedTensorTestBase):
         with self.assertRaisesRegex(
             TypeError, "Only `ShardingSpec` is supported as output_plan"
         ):
-            # shard the module with the provided sharding plan
             shard_module(megatron_lm, sharding_plan_wrong_output_plan)
 
         sharding_plan_wrong_module_path = ShardingPlan(
@@ -96,7 +100,6 @@ class TestShardingPlan(ShardedTensorTestBase):
             },
         )
         with self.assertRaisesRegex(AttributeError, "has no attribute"):
-            # shard the module with the provided sharding plan
             shard_module(megatron_lm, sharding_plan_wrong_module_path)
 
         sharding_plan_wrong_param_path = ShardingPlan(
@@ -105,7 +108,6 @@ class TestShardingPlan(ShardedTensorTestBase):
             },
         )
         with self.assertRaisesRegex(AttributeError, "has no attribute"):
-            # shard the module with the provided sharding plan
             shard_module(megatron_lm, sharding_plan_wrong_param_path)
 
     @with_comms(init_rpc=False, backend=BACKEND)
@@ -115,12 +117,10 @@ class TestShardingPlan(ShardedTensorTestBase):
         megatron_lm = SimpleMegatronLM([[17, 12], [12, 29]], rank=self.rank).to(
             self.rank
         )
-        planner = ChunkAllShardingPlanner(device_count=TEST_GPU_NUM)
         sharding_plan = planner.build_plan(megatron_lm)
 
         shard_module(megatron_lm, sharding_plan)
 
-        # check to make sure the module already been sharded
         self.assertTrue(isinstance(megatron_lm.fc1.weight, ShardedTensor))
         self.assertTrue(isinstance(megatron_lm.fc2.weight, ShardedTensor))
         self.assertTrue(isinstance(megatron_lm.fc1.bias, ShardedTensor))
@@ -156,6 +156,9 @@ class TestShardingPlan(ShardedTensorTestBase):
 
         if self.rank >= 2:
             shard_module(megatron_lm, sharding_plan, process_group=pg)
+
+
+instantiate_device_type_tests(TestShardingPlan, globals(), except_for="cpu")
 
 
 if __name__ == "__main__":
