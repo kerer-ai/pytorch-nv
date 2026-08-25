@@ -354,6 +354,8 @@ class Capability:
 
         flash_attention = "attention.flash_attention"
         mem_efficient_attention = "attention.mem_efficient_attention"
+        flex_attention = "attention.flex_attention"
+        fused_attention = "attention.fused_attention"
 
     class compile:
         """Device compiler integration capabilities."""
@@ -1075,6 +1077,19 @@ class MPSTestBase(DeviceTypeTestBase):
     def _should_stop_test_suite(self):
         return False
 
+    @classmethod
+    def _capabilities(cls):
+        return {
+            Capability.dtype.fp8: lambda: False,
+            Capability.dtype.bf16: lambda: True,
+            Capability.attention.flash_attention: lambda: False,
+            Capability.attention.mem_efficient_attention: lambda: False,
+            Capability.attention.flex_attention: lambda: (
+                IS_FLEX_ATTENTION_MPS_PLATFORM_SUPPORTED
+            ),
+            Capability.attention.fused_attention: lambda: False,
+        }
+
 
 class XPUTestBase(DeviceTypeTestBase):
     device_type = "xpu"
@@ -1292,9 +1307,7 @@ device_type_test_bases = get_device_type_test_bases()
 
 def filter_desired_device_types(device_type_test_bases, except_for=None, only_for=None):
     # device type cannot appear in both except_for and only_for
-    intersect = set(except_for if except_for else []) & set(
-        only_for if only_for else []
-    )
+    intersect = set(except_for or []) & set(only_for or [])
     if intersect:
         raise AssertionError(
             f"device ({intersect}) appeared in both except_for and only_for"
