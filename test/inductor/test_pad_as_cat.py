@@ -2,11 +2,14 @@
 """Tests for cat multi-consumer and pad-as-cat optimizations."""
 
 import torch
+import unittest
 from torch._dynamo.utils import counters
 from torch._inductor import metrics
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
-from torch.testing._internal.inductor_utils import GPU_TYPE, requires_gpu
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import HardwareClassification
+from torch.utils._triton import has_triton
 
 
 # required so that metrics.num_bytes_accessed is populated
@@ -14,17 +17,19 @@ torch._logging.set_logs(inductor_metrics=True)
 
 
 class TestCatMultiConsumer(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @torch._inductor.config.patch(fx_graph_cache=False)
-    @requires_gpu()
-    def test_cat_to_fp16(self):
+    @unittest.skipUnless(has_triton(), "Triton not available")
+    def test_cat_to_fp16(self, device):
         """Multi-consumer cat avoids duplicate computation."""
 
         def fn(x):
-            z = torch.cat([x, torch.zeros([6, 768], device=GPU_TYPE)], dim=0)
+            z = torch.cat([x, torch.zeros([6, 768], device=device)], dim=0)
             y = x.to(torch.float16)
             return z, y
 
-        x = torch.randn(1024, 768, device=GPU_TYPE)
+        x = torch.randn(1024, 768, device=device)
         compiled = torch.compile(fn)
         metrics.reset()
         result = compiled(x)
@@ -49,14 +54,14 @@ class TestCatMultiConsumer(TestCase):
         )
 
     @torch._inductor.config.patch(fx_graph_cache=False)
-    @requires_gpu()
-    def test_single_consumer_cat_unchanged(self):
+    @unittest.skipUnless(has_triton(), "Triton not available")
+    def test_single_consumer_cat_unchanged(self, device):
         """Single-consumer cat unchanged."""
 
         def fn(x):
-            return torch.cat([x, torch.zeros([6, 768], device=GPU_TYPE)], dim=0)
+            return torch.cat([x, torch.zeros([6, 768], device=device)], dim=0)
 
-        x = torch.randn(1024, 768, device=GPU_TYPE)
+        x = torch.randn(1024, 768, device=device)
         compiled = torch.compile(fn)
         metrics.reset()
         result = compiled(x)
@@ -77,8 +82,10 @@ class TestCatMultiConsumer(TestCase):
 
 
 class TestPadAsCat(TestCase):
-    @requires_gpu()
-    def test_mul_pad_addmm(self):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @unittest.skipUnless(has_triton(), "Triton not available")
+    def test_mul_pad_addmm(self, device):
         """Multi-consumer F.pad uses ConcatKernel zero-copy."""
         counters.clear()
 
@@ -88,10 +95,10 @@ class TestPadAsCat(TestCase):
             mm_result = torch.addmm(bias, mul_result, weight)
             return padded, mm_result
 
-        x = torch.randn(128, 2880, device=GPU_TYPE, dtype=torch.bfloat16)
-        scale = torch.randn(128, 2880, device=GPU_TYPE, dtype=torch.bfloat16)
-        bias = torch.randn(1024, device=GPU_TYPE, dtype=torch.bfloat16)
-        weight = torch.randn(2880, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
+        x = torch.randn(128, 2880, device=device, dtype=torch.bfloat16)
+        scale = torch.randn(128, 2880, device=device, dtype=torch.bfloat16)
+        bias = torch.randn(1024, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(2880, 1024, device=device, dtype=torch.bfloat16)
 
         compiled = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled, x, scale, bias, weight)
@@ -102,16 +109,16 @@ class TestPadAsCat(TestCase):
         self.assertIn("reinterpret_tensor", code)
         self.assertGreater(counters["inductor"]["pad_rewritten_as_cat"], 0)
 
-    @requires_gpu()
-    def test_single_consumer_pad(self):
+    @unittest.skipUnless(has_triton(), "Triton not available")
+    def test_single_consumer_pad(self, device):
         """Single-consumer F.pad is decomposed into cat, which fuses via pointwise_cat."""
         counters.clear()
 
         def fn(x, scale):
             return torch.nn.functional.pad(x * scale, [0, 192])
 
-        x = torch.randn(128, 2880, device=GPU_TYPE)
-        scale = torch.randn(128, 2880, device=GPU_TYPE)
+        x = torch.randn(128, 2880, device=device)
+        scale = torch.randn(128, 2880, device=device)
 
         compiled = torch.compile(fn)
         result = compiled(x, scale)
@@ -119,6 +126,14 @@ class TestPadAsCat(TestCase):
 
         self.assertEqual(result, ref)
         self.assertGreater(counters["inductor"]["pad_rewritten_as_cat"], 0)
+
+
+instantiate_device_type_tests(
+    TestCatMultiConsumer, globals(), except_for="cpu", allow_xpu=True
+)
+instantiate_device_type_tests(
+    TestPadAsCat, globals(), except_for="cpu", allow_xpu=True
+)
 
 
 if __name__ == "__main__":
