@@ -25,6 +25,7 @@ from torch._dynamo.exc import TritonUnavailableError
 from torch._dynamo.testing import AotEagerAndRecordGraphs
 from torch._dynamo.utils import detect_fake_mode
 from torch._inductor import config as inductor_config, utils as inductor_utils
+from torch._inductor import config as inductor_config, ir as inductor_ir
 from torch._inductor.compile_fx import _get_subgraph_names
 from torch._inductor.cudagraph_utils import check_multiple_devices_or_any_cpu_nodes
 from torch._inductor.fx_utils import (
