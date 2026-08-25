@@ -40,8 +40,8 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.common_device_type import (
     expectedFailureMeta, instantiate_device_type_tests, deviceCountAtLeast,
-    onlyCPU, largeTensorTest, precisionOverride, dtypes,
-    onlyCUDA, skipCPUIf, dtypesIfCUDA, dtypesIfCPU, skipMeta, onlyAccelerator, expectedFailureXLA)
+    largeTensorTest, precisionOverride, dtypes, onlyCPU, onlyCUDA,
+    skipCPUIf, dtypesIfCUDA, dtypesIfCPU, skipMeta, onlyAccelerator, expectedFailureXLA)
 from torch.testing._internal.common_dtype import (
     all_types_and_complex, all_types_and_complex_and, all_types_and, floating_and_complex_types, complex_types,
     floating_types, floating_and_complex_types_and, integral_types, integral_types_and, get_all_dtypes,
@@ -88,6 +88,15 @@ def _rand_shape(dim, min_size, max_size):
         shape.append(random.randint(min_size, max_size))
     return tuple(shape)
 
+
+def _float_to_int_conversion_helper(test_case, vals, device, dtype, refs=None):
+    if refs is None:
+        a = np.array(vals, dtype=np.float32).astype(torch_to_numpy_dtype_dict[dtype])
+        refs = torch.from_numpy(a)
+    t = torch.tensor(vals, device=device, dtype=torch.float).to(dtype)
+    test_case.assertEqual(refs, t.cpu())
+
+
 # Test suite for tensor creation ops
 #
 # Includes creation functions like torch.eye, random creation functions like
@@ -98,9 +107,9 @@ def _rand_shape(dim, min_size, max_size):
 # See https://pytorch.org/docs/main/torch.html#creation-ops
 
 class TestTensorCreation(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
     exact_dtype = True
 
-    @onlyCPU
     @dtypes(torch.float)
     def test_diag_embed(self, device, dtype):
         x = torch.arange(3 * 4, dtype=dtype, device=device).view(3, 4)
@@ -684,22 +693,22 @@ class TestTensorCreation(TestCase):
         self.assertEqual(res1, res2)
         self.assertTrue(res1.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_channels_last_large_inputs(self, device):
         num_tensors = 130
-        inputs_cuda = [
+        inputs_device = [
             torch.randn((2, 3, 4, 4), device=device).contiguous(memory_format=torch.channels_last)
             for _ in range(num_tensors)
         ]
-        inputs_cpu = [t.cpu() for t in inputs_cuda]
+        inputs_cpu = [t.cpu() for t in inputs_device]
 
-        result = torch.cat(inputs_cuda, dim=1)
+        result = torch.cat(inputs_device, dim=1)
         expected = torch.cat(inputs_cpu, dim=1)
 
         self.assertEqual(result.cpu(), expected)
         self.assertTrue(result.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_out_memory_format(self, device):
         inp_size = (4, 4, 4, 4)
         expected_size = (8, 4, 4, 4)
@@ -740,7 +749,7 @@ class TestTensorCreation(TestCase):
 
         self.assertTrue(res3_cuda.is_contiguous(memory_format=torch.channels_last))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat_stack_cross_devices(self, device):
         cuda = torch.randn((3, 3), device=device)
         cpu = torch.randn((3, 3), device='cpu')
@@ -755,7 +764,7 @@ class TestTensorCreation(TestCase):
 
     # TODO: reconcile with other cat tests
     # TODO: Compare with a NumPy reference instead of CPU
-    @onlyCUDA
+    @onlyAccelerator
     def test_cat(self, device):
         SIZE = 10
         for dim in range(-3, 3):
@@ -778,9 +787,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(z.size(), (21, SIZE, SIZE))
 
     # TODO: update this test to compare against NumPy instead of CPU
-    @onlyCUDA
-    @dtypesIfCUDA(torch.half, torch.float, torch.double)
-    @dtypes(torch.float, torch.double)
+    @onlyAccelerator
+    @dtypes(torch.half, torch.float, torch.double)
     def test_device_rounding(self, device, dtype):
         # test half-to-even
         a = [-5.8, -3.5, -2.3, -1.5, -0.5, 0.5, 1.5, 2.3, 3.5, 5.8]
@@ -1044,13 +1052,6 @@ class TestTensorCreation(TestCase):
             a = np.array(val, dtype=torch_to_numpy_dtype_dict[dtype])
             self.assertEqual(t, torch.from_numpy(a))
 
-    def _float_to_int_conversion_helper(self, vals, device, dtype, refs=None):
-        if refs is None:
-            a = np.array(vals, dtype=np.float32).astype(torch_to_numpy_dtype_dict[dtype])
-            refs = torch.from_numpy(a)
-        t = torch.tensor(vals, device=device, dtype=torch.float).to(dtype)
-        self.assertEqual(refs, t.cpu())
-
     # Checks that float->integer casts don't produce undefined behavior errors.
     # Note: In C++, casting from a floating value to an integral dtype
     # is undefined if the floating point value is not within the integral
@@ -1095,29 +1096,7 @@ class TestTensorCreation(TestCase):
             # extremes.
             vals = (-2, -1.5, -.5, 0, .5, 1.5, 2)
 
-        self._float_to_int_conversion_helper(vals, device, dtype, refs)
-
-    # Note: CUDA will fail this test on most dtypes, often dramatically.
-    # Note: This test validates undefined behavior consistency in float-to-ints casts
-    # NB: torch.uint16, torch.uint32, torch.uint64 excluded as this
-    # nondeterministically fails, warning "invalid value encountered in cast"
-    @onlyCPU
-    @unittest.skipIf(IS_S390X, "Test fails for int16 on s390x. Needs investigation.")
-    @dtypes(torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
-    def test_float_to_int_conversion_nonfinite(self, device, dtype):
-        vals = (float('-inf'), float('inf'), float('nan'))
-
-        if dtype == torch.bool:
-            refs = (True, True, True)
-        elif IS_ARM64:
-            refs = (torch.iinfo(dtype).min, torch.iinfo(dtype).max, 0)
-            if dtype in (torch.int8, torch.int16):
-                refs = (0, -1, 0)
-        else:
-            refs = (0, 0, 0)
-            if dtype in (torch.int32, torch.int64):
-                refs = (torch.iinfo(dtype).min, ) * 3
-        self._float_to_int_conversion_helper(vals, device, dtype, refs)
+        _float_to_int_conversion_helper(self, vals, device, dtype, refs)
 
     def test_complex_type_conversions(self, device):
         dtypes = [torch.float, torch.complex64, torch.complex128]
@@ -1133,18 +1112,6 @@ class TestTensorCreation(TestCase):
                 else:
                     self.assertEqual(from_tensor, to_tensor, exact_dtype=False)
 
-    @slowTest
-    @onlyCPU
-    def test_cat_big(self, device):
-        SIZE1 = 6500
-        SIZE2 = 4500
-        concat_list = []
-        concat_list.append(torch.ones((SIZE1, 1024 * 512), dtype=torch.uint8, device=device))
-        concat_list.append(torch.ones((SIZE2, 1024 * 512), dtype=torch.uint8, device=device))
-        result = torch.cat(concat_list)
-        self.assertEqual(result.size(0), SIZE1 + SIZE2)
-
-    @onlyCPU
     @dtypes(torch.half, torch.double, torch.int)
     def test_cat2(self, device, dtype):
         SIZE = 10
@@ -1397,37 +1364,37 @@ class TestTensorCreation(TestCase):
         y = x[2:]
         self.assertEqual(int(y), 3)
 
-    def test_meshgrid_empty(self):
+    def test_meshgrid_empty(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'expects a non-empty TensorList'):
             torch.meshgrid()
 
-    def test_meshgrid_unsupported_indexing(self):
+    def test_meshgrid_unsupported_indexing(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'indexing must be one of "xy" or "ij"'):
-            torch.meshgrid(torch.tensor([1, 2]), indexing='')
+            torch.meshgrid(torch.tensor([1, 2], device=device), indexing='')
 
-    def test_meshgrid_non_1d_tensor(self):
+    def test_meshgrid_non_1d_tensor(self, device):
         with self.assertRaisesRegex(RuntimeError,
                                     'Expected 0D or 1D tensor'):
-            torch.meshgrid(torch.tensor([[1, 2], [3, 4]]))
+            torch.meshgrid(torch.tensor([[1, 2], [3, 4]], device=device))
 
-    def test_meshgrid_inconsistent_dtype(self):
+    def test_meshgrid_inconsistent_dtype(self, device):
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same dtype'):
-            torch.meshgrid(torch.tensor([1], dtype=torch.int),
-                           torch.tensor([2], dtype=torch.float))
+            torch.meshgrid(torch.tensor([1], dtype=torch.int, device=device),
+                           torch.tensor([2], dtype=torch.float, device=device))
 
-    def test_meshgrid_inconsistent_device(self):
+    def test_meshgrid_inconsistent_device(self, device):
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same device'):
-            torch.meshgrid(torch.tensor([1], device='cpu'),
+            torch.meshgrid(torch.tensor([1], device=device),
                            torch.tensor([2], device='meta'))
 
-    def test_meshgrid_warns_if_no_indexing(self):
+    def test_meshgrid_warns_if_no_indexing(self, device):
         with self.assertWarnsOnceRegex(
                 UserWarning, '.*will be required to pass the indexing arg.*'):
-            torch.meshgrid(torch.tensor([1, 2]))
+            torch.meshgrid(torch.tensor([1, 2], device=device))
 
     def test_meshgrid_default_indexing(self, device):
         a = torch.tensor(1, device=device)
@@ -1952,7 +1919,7 @@ class TestTensorCreation(TestCase):
         dtypes = get_all_dtypes(include_half=False, include_bfloat16=False, include_complex32=True)
         if device_type == 'cpu':
             do_test_empty_full(self, dtypes, torch.strided, torch_device)
-        if device_type == 'cuda':
+        if torch.accelerator.is_available() and device_type == torch.accelerator.current_accelerator().type:
             do_test_empty_full(self, dtypes, torch.strided, None)
             do_test_empty_full(self, dtypes, torch.strided, torch_device)
 
@@ -1970,42 +1937,42 @@ class TestTensorCreation(TestCase):
             self.assertEqual('cpu',
                              torch.tensor(torch.ones((2, 3), dtype=torch.float32), device='cpu:0').device.type)
             self.assertEqual('cpu', torch.tensor(np.random.randn(2, 3), device='cpu').device.type)
-        if device_type == 'cuda':
-            self.assertEqual('cuda:0', str(torch.tensor(5).cuda(0).device))
-            self.assertEqual('cuda:0', str(torch.tensor(5).cuda('cuda:0').device))
-            self.assertEqual('cuda:0',
+        if torch.accelerator.is_available() and device_type == torch.accelerator.current_accelerator().type:
+            self.assertEqual(f'{device_type}:0', str(getattr(torch.tensor(5), device_type)(0).device))
+            self.assertEqual(f'{device_type}:0', str(getattr(torch.tensor(5), device_type)(f'{device_type}:0').device))
+            self.assertEqual(f'{device_type}:0',
                              str(torch.tensor(5, dtype=torch.int64, device=0).device))
-            self.assertEqual('cuda:0',
-                             str(torch.tensor(5, dtype=torch.int64, device='cuda:0').device))
-            self.assertEqual('cuda:0',
-                             str(torch.tensor(torch.ones((2, 3), dtype=torch.float32), device='cuda:0').device))
+            self.assertEqual(f'{device_type}:0',
+                             str(torch.tensor(5, dtype=torch.int64, device=f'{device_type}:0').device))
+            self.assertEqual(f'{device_type}:0',
+                             str(torch.tensor(torch.ones((2, 3), dtype=torch.float32), device=f'{device_type}:0').device))
 
-            self.assertEqual('cuda:0', str(torch.tensor(np.random.randn(2, 3), device='cuda:0').device))
+            self.assertEqual(f'{device_type}:0', str(torch.tensor(np.random.randn(2, 3), device=f'{device_type}:0').device))
 
             for device in devices:
-                with torch.cuda.device(device):
-                    device_string = 'cuda:' + str(torch.cuda.current_device())
+                with torch.accelerator.device_index(torch.device(device).index):
+                    device_string = f'{device_type}:' + str(torch.accelerator.current_device_index())
                     self.assertEqual(device_string,
-                                     str(torch.tensor(5, dtype=torch.int64, device='cuda').device))
+                                     str(torch.tensor(5, dtype=torch.int64, device=device_type).device))
 
             with self.assertRaises(RuntimeError):
-                torch.tensor(5).cuda('cpu')
+                getattr(torch.tensor(5), device_type)('cpu')
             with self.assertRaises(RuntimeError):
-                torch.tensor(5).cuda('cpu:0')
+                getattr(torch.tensor(5), device_type)('cpu:0')
 
             if len(devices) > 1:
-                self.assertEqual('cuda:1', str(torch.tensor(5).cuda(1).device))
-                self.assertEqual('cuda:1', str(torch.tensor(5).cuda('cuda:1').device))
-                self.assertEqual('cuda:1',
+                self.assertEqual(f'{device_type}:1', str(getattr(torch.tensor(5), device_type)(1).device))
+                self.assertEqual(f'{device_type}:1', str(getattr(torch.tensor(5), device_type)(f'{device_type}:1').device))
+                self.assertEqual(f'{device_type}:1',
                                  str(torch.tensor(5, dtype=torch.int64, device=1).device))
-                self.assertEqual('cuda:1',
-                                 str(torch.tensor(5, dtype=torch.int64, device='cuda:1').device))
-                self.assertEqual('cuda:1',
+                self.assertEqual(f'{device_type}:1',
+                                 str(torch.tensor(5, dtype=torch.int64, device=f'{device_type}:1').device))
+                self.assertEqual(f'{device_type}:1',
                                  str(torch.tensor(torch.ones((2, 3), dtype=torch.float32),
-                                     device='cuda:1').device))
+                                     device=f'{device_type}:1').device))
 
-                self.assertEqual('cuda:1',
-                                 str(torch.tensor(np.random.randn(2, 3), device='cuda:1').device))
+                self.assertEqual(f'{device_type}:1',
+                                 str(torch.tensor(np.random.randn(2, 3), device=f'{device_type}:1').device))
 
     # TODO: this test should be updated
     def test_as_strided_neg(self, device):
@@ -2085,175 +2052,6 @@ class TestTensorCreation(TestCase):
         # test chalf
         self.assertEqual(torch.ones(100, 100, device=device, dtype=torch.chalf),
                          torch.ones(100, 100, device=device, dtype=torch.cfloat), exact_dtype=False)
-
-    # TODO: this test should be updated
-    @suppress_warnings
-    @onlyCPU
-    def test_tensor_factory_copy_var(self, device):
-        def check_copy(copy, is_leaf, requires_grad, data_ptr=None):
-            if data_ptr is None:
-                data_ptr = copy.data_ptr
-            self.assertEqual(copy, source, exact_dtype=False)
-            self.assertTrue(copy.is_leaf == is_leaf)
-            self.assertTrue(copy.requires_grad == requires_grad)
-            self.assertTrue(copy.data_ptr == data_ptr)
-
-        source = torch.randn(5, 5, dtype=torch.double, requires_grad=True)
-        # test torch.tensor()
-        check_copy(torch.tensor(source), True, False)
-        check_copy(torch.tensor(source, requires_grad=False), True, False)
-        check_copy(torch.tensor(source, requires_grad=True), True, True)
-
-        # test tensor.new_tensor()
-        copy = torch.randn(1)
-        check_copy(copy.new_tensor(source), True, False)
-        check_copy(copy.new_tensor(source, requires_grad=False), True, False)
-        check_copy(copy.new_tensor(source, requires_grad=True), True, True)
-
-        # test torch.as_tensor()
-        check_copy(torch.as_tensor(source), source.is_leaf, source.requires_grad, source.data_ptr)  # not copy
-        check_copy(torch.as_tensor(source, dtype=torch.float), False, True)  # copy and keep the graph
-
-    # TODO: this test should be updated
-    @onlyCPU
-    def test_tensor_factory_type_inference(self, device):
-        def test_inference(default_dtype):
-            default_complex_dtype = torch.complex64 if default_dtype == torch.float32 else torch.complex128
-            self.assertIs(default_dtype, torch.tensor(()).dtype)
-            self.assertIs(default_dtype, torch.tensor(5.).dtype)
-            self.assertIs(torch.int64, torch.tensor(5).dtype)
-            self.assertIs(torch.bool, torch.tensor(True).dtype)
-            self.assertIs(torch.int32, torch.tensor(5, dtype=torch.int32).dtype)
-            self.assertIs(default_dtype, torch.tensor(((7, 5), (9, 5.))).dtype)
-            self.assertIs(default_dtype, torch.tensor(((5., 5), (3, 5))).dtype)
-            self.assertIs(torch.int64, torch.tensor(((5, 3), (3, 5))).dtype)
-            self.assertIs(default_complex_dtype, torch.tensor(((5, 3 + 2j), (3, 5 + 4j))).dtype)
-
-            self.assertIs(torch.float64, torch.tensor(np.array(())).dtype)
-            self.assertIs(torch.float64, torch.tensor(np.array(5.)).dtype)
-            if np.array(5).dtype == np.int64:  # np long, which can be 4 bytes (e.g. on windows)
-                self.assertIs(torch.int64, torch.tensor(np.array(5)).dtype)
-            else:
-                self.assertIs(torch.int32, torch.tensor(np.array(5)).dtype)
-            self.assertIs(torch.uint8, torch.tensor(np.array(3, dtype=np.uint8)).dtype)
-            self.assertIs(default_dtype, torch.tensor(((7, np.array(5)), (np.array(9), 5.))).dtype)
-            self.assertIs(torch.float64, torch.tensor(((7, 5), (9, np.array(5.)))).dtype)
-            self.assertIs(torch.int64, torch.tensor(((5, np.array(3)), (np.array(3), 5))).dtype)
-
-        for dtype in [torch.float64, torch.float32]:
-            with set_default_dtype(dtype):
-                test_inference(dtype)
-
-    # TODO: this test should be updated
-    @suppress_warnings
-    @onlyCPU
-    def test_new_tensor(self, device):
-        expected = torch.autograd.Variable(torch.ByteTensor([1, 1]))
-        # test data
-        res1 = expected.new_tensor([1, 1])
-        self.assertEqual(res1, expected)
-        res1 = expected.new_tensor([1, 1], dtype=torch.int)
-        self.assertEqual(res1, expected, exact_dtype=False)
-        self.assertIs(torch.int, res1.dtype)
-
-        # test copy
-        res2 = expected.new_tensor(expected)
-        self.assertEqual(res2, expected)
-        res2[1] = 2
-        self.assertEqual(expected, torch.ones_like(expected))
-        res2 = expected.new_tensor(expected, dtype=torch.int)
-        self.assertEqual(res2, expected, exact_dtype=False)
-        self.assertIs(torch.int, res2.dtype)
-
-        # test copy with numpy
-        a = np.array([5.])
-        res1 = torch.tensor(a)
-        res1 = res1.new_tensor(a)
-        self.assertEqual(5., res1[0].item())
-        a[0] = 7.
-        self.assertEqual(5., res1[0].item())
-
-        if torch.cuda.device_count() >= 2:
-            expected = expected.cuda(1)
-            res1 = expected.new_tensor([1, 1])
-            self.assertEqual(res1.get_device(), expected.get_device())
-            res1 = expected.new_tensor([1, 1], dtype=torch.int)
-            self.assertIs(torch.int, res1.dtype)
-            self.assertEqual(res1.get_device(), expected.get_device())
-
-            res2 = expected.new_tensor(expected)
-            self.assertEqual(res2.get_device(), expected.get_device())
-            res2 = expected.new_tensor(expected, dtype=torch.int)
-            self.assertIs(torch.int, res1.dtype)
-            self.assertEqual(res2.get_device(), expected.get_device())
-            res2 = expected.new_tensor(expected, dtype=torch.int, device=0)
-            self.assertIs(torch.int, res1.dtype)
-            self.assertEqual(res2.get_device(), 0)
-
-            res1 = expected.new_tensor(1)
-            self.assertEqual(res1.get_device(), expected.get_device())
-            res1 = expected.new_tensor(1, dtype=torch.int)
-            self.assertIs(torch.int, res1.dtype)
-            self.assertEqual(res1.get_device(), expected.get_device())
-
-    # TODO: this test should be updated
-    @onlyCPU
-    def test_as_tensor(self, device):
-        # from python data
-        x = [[0, 1], [2, 3]]
-        self.assertEqual(torch.tensor(x), torch.as_tensor(x))
-        self.assertEqual(torch.tensor(x, dtype=torch.float32), torch.as_tensor(x, dtype=torch.float32))
-
-        # python data with heterogeneous types
-        z = [0, 'torch']
-        with self.assertRaisesRegex(TypeError, "invalid data type"):
-            torch.tensor(z)
-            torch.as_tensor(z)
-
-        # python data with self-referential lists
-        z = [0]
-        z += [z]
-        with self.assertRaisesRegex(TypeError, "self-referential lists are incompatible"):
-            torch.tensor(z)
-            torch.as_tensor(z)
-
-        z = [[1, 2], z]
-        with self.assertRaisesRegex(TypeError, "self-referential lists are incompatible"):
-            torch.tensor(z)
-            torch.as_tensor(z)
-
-        # from tensor (doesn't copy unless type is different)
-        y = torch.tensor(x)
-        self.assertIs(y, torch.as_tensor(y))
-        self.assertIsNot(y, torch.as_tensor(y, dtype=torch.float32))
-        if torch.cuda.is_available():
-            self.assertIsNot(y, torch.as_tensor(y, device='cuda'))
-            y_cuda = y.to('cuda')
-            self.assertIs(y_cuda, torch.as_tensor(y_cuda))
-            self.assertIs(y_cuda, torch.as_tensor(y_cuda, device='cuda'))
-
-        # doesn't copy
-        for dtype in [np.float64, np.int64, np.int8, np.uint8]:
-            n = np.random.rand(5, 6).astype(dtype)
-            n_astensor = torch.as_tensor(n)
-            self.assertEqual(torch.tensor(n), n_astensor)
-            n_astensor[0][0] = 25.7
-            self.assertEqual(torch.tensor(n), n_astensor)
-
-        # changing dtype causes copy
-        n = np.random.rand(5, 6).astype(np.float32)
-        n_astensor = torch.as_tensor(n, dtype=torch.float64)
-        self.assertEqual(torch.tensor(n, dtype=torch.float64), n_astensor)
-        n_astensor[0][1] = 250.8
-        self.assertNotEqual(torch.tensor(n, dtype=torch.float64), n_astensor)
-
-        # changing device causes copy
-        if torch.cuda.is_available():
-            n = np.random.randn(5, 6)
-            n_astensor = torch.as_tensor(n, device='cuda')
-            self.assertEqual(torch.tensor(n, device='cuda'), n_astensor)
-            n_astensor[0][2] = 250.9
-            self.assertNotEqual(torch.tensor(n, device='cuda'), n_astensor)
 
     # TODO: this test should be updated
     @suppress_warnings
@@ -2424,38 +2222,6 @@ class TestTensorCreation(TestCase):
         # check that it holds a consistent output shape on precision-cornered step sizes
         d = torch.arange(-4.0, 4.0, 0.01, dtype=torch.float32, device=device)
         self.assertEqual(d.shape[0], 800)
-
-    # TODO: this test should be updated
-    @onlyCPU
-    def test_arange_inference(self, device):
-        # end only
-        self.assertIs(torch.float32, torch.arange(1.).dtype)
-        self.assertIs(torch.float32, torch.arange(torch.tensor(1.)).dtype)
-        self.assertIs(torch.float32, torch.arange(torch.tensor(1., dtype=torch.float64)).dtype)
-
-        self.assertIs(torch.int64, torch.arange(1).dtype)
-        self.assertIs(torch.int64, torch.arange(torch.tensor(1)).dtype)
-        self.assertIs(torch.int64, torch.arange(torch.tensor(1, dtype=torch.int16)).dtype)
-
-        # start, end, [step]
-        self.assertIs(torch.float32, torch.arange(1., 3).dtype)
-        self.assertIs(torch.float32, torch.arange(torch.tensor(1., dtype=torch.float64), 3).dtype)
-        self.assertIs(torch.float32, torch.arange(1, 3.).dtype)
-        self.assertIs(torch.float32, torch.arange(torch.tensor(1, dtype=torch.int16), torch.tensor(3.)).dtype)
-        self.assertIs(torch.float32, torch.arange(1, 3, 1.).dtype)
-        self.assertIs(torch.float32,
-                      torch.arange(torch.tensor(1),
-                                   torch.tensor(3, dtype=torch.int16),
-                                   torch.tensor(1., dtype=torch.float64)).dtype)
-
-        self.assertIs(torch.int64, torch.arange(1, 3).dtype)
-        self.assertIs(torch.int64, torch.arange(torch.tensor(1), 3).dtype)
-        self.assertIs(torch.int64, torch.arange(torch.tensor(1), torch.tensor(3, dtype=torch.int16)).dtype)
-        self.assertIs(torch.int64, torch.arange(1, 3, 1).dtype)
-        self.assertIs(torch.int64,
-                      torch.arange(torch.tensor(1),
-                                   torch.tensor(3),
-                                   torch.tensor(1, dtype=torch.int16)).dtype)
 
     # cannot call storage() on meta tensor
     @skipMeta
@@ -2628,7 +2394,7 @@ class TestTensorCreation(TestCase):
             self.assertEqual(t[0], a[0])
             self.assertEqual(t[steps - 1], a[steps - 1])
 
-    @onlyCUDA
+    @onlyAccelerator
     @largeTensorTest('16GB')
     def test_range_factories_64bit_indexing(self, device):
         bigint = 2 ** 31 + 1
@@ -2673,8 +2439,8 @@ class TestTensorCreation(TestCase):
                 self.assertEqual(op(values).device, torch_device)
                 self.assertEqual(op(values, dtype=torch.float64).device, torch_device)
 
-                if self.device_type == 'cuda':
-                    with torch.cuda.device(device):
+                if torch.accelerator.is_available() and self.device_type == torch.accelerator.current_accelerator().type:
+                    with torch.accelerator.device_index(torch.device(device).index):
                         self.assertEqual(op(values.cpu()).device, torch.device('cpu'))
 
         # Tests sparse ctor
@@ -2689,13 +2455,13 @@ class TestTensorCreation(TestCase):
         sparse_with_dtype = torch.sparse_coo_tensor(indices, values, sparse_size, dtype=torch.float64)
         self.assertEqual(sparse_with_dtype.device, torch_device)
 
-        if self.device_type == 'cuda':
-            with torch.cuda.device(device):
+        if torch.accelerator.is_available() and self.device_type == torch.accelerator.current_accelerator().type:
+            with torch.accelerator.device_index(torch.device(device).index):
                 sparse_with_dtype = torch.sparse_coo_tensor(indices.cpu(), values.cpu(),
                                                             sparse_size, dtype=torch.float64)
                 self.assertEqual(sparse_with_dtype.device, torch.device('cpu'))
 
-    @onlyCUDA
+    @onlyAccelerator
     def test_new_tensor_device(self, device):
         torch_device = torch.device(device)
         cpu_device = torch.device('cpu')
@@ -2839,9 +2605,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual((1, 1, 0), torch.tensor([[[]]], device=device).shape)
         self.assertEqual((1, 1, 0), torch.as_tensor([[[]]], device=device).shape)
 
-    @onlyCUDA
-    def test_tensor_factory_gpu_type_inference(self, device):
-        with set_default_tensor_type(torch.cuda.DoubleTensor):
+    @onlyAccelerator
+    def test_tensor_factory_device_type_inference(self, device):
+        with set_default_dtype(torch.float64), torch.device(device):
             with set_default_dtype(torch.float32):
                 self.assertIs(torch.float32, torch.tensor(0.).dtype)
                 self.assertEqual(torch.device(device), torch.tensor(0.).device)
@@ -2849,16 +2615,16 @@ class TestTensorCreation(TestCase):
                 self.assertIs(torch.float64, torch.tensor(0.).dtype)
                 self.assertEqual(torch.device(device), torch.tensor(0.).device)
 
-    @onlyCUDA
-    def test_tensor_factory_gpu_type(self, device):
-        with set_default_tensor_type(torch.cuda.FloatTensor):
+    @onlyAccelerator
+    def test_tensor_factory_device_type(self, device):
+        with set_default_dtype(torch.float), torch.device(device):
             x = torch.zeros((5, 5))
             self.assertIs(torch.float32, x.dtype)
-            self.assertTrue(x.is_cuda)
-        with set_default_tensor_type(torch.cuda.DoubleTensor):
+            self.assertEqual(x.device, torch.device(device))
+        with set_default_dtype(torch.float64), torch.device(device):
             x = torch.zeros((5, 5))
             self.assertIs(torch.float64, x.dtype)
-            self.assertTrue(x.is_cuda)
+            self.assertEqual(x.device, torch.device(device))
 
     @skipCPUIf(True, 'compares device with cpu')
     @dtypes(torch.int, torch.long, torch.float, torch.double)
@@ -3138,7 +2904,23 @@ class TestTensorCreation(TestCase):
             t = torch.tensor(a)
             self.assertEqual(len(w), 0)
 
-    @onlyCPU
+    @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
+    def test_refs_tensor(self, device, dtype):
+        self.assertEqual(torch._refs.tensor([], device=device, dtype=dtype), torch.tensor([], device=device, dtype=dtype))
+
+    @onlyAccelerator
+    def test_as_tensor_device(self, device):
+        n = np.random.randn(5, 6).astype(np.float32)
+        n_astensor = torch.as_tensor(n, device=device)
+        self.assertEqual(torch.tensor(n, device=device), n_astensor)
+        n_astensor[0][2] = 250.9
+        self.assertNotEqual(torch.tensor(n, device=device), n_astensor)
+
+
+class TestTensorCreationCpuOnly(TestCase):
+    hw_classification = HardwareClassification.CPU
+    exact_dtype = True
+
     @parametrize('shared', [True, False])
     @unittest.skipIf(IS_WINDOWS, "NamedTemporaryFile on windows")
     def test_from_file(self, device, shared):
@@ -3154,19 +2936,40 @@ class TestTensorCreation(TestCase):
             s = torch.UntypedStorage.from_file(f.name, shared, nbytes=t.numel() * dtype.itemsize)
             self.assertTrue(s.filename == expected_filename)
 
-    @onlyCPU
     def test_storage_filename(self, device):
         t = torch.randn(2, 5, device=device)
         self.assertIsNone(t.untyped_storage().filename)
 
-    @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
-    def test_refs_tensor(self, device, dtype):
-        self.assertEqual(torch._refs.tensor([], device=device, dtype=dtype), torch.tensor([], device=device, dtype=dtype))
+    # CPU-only: CUDA diverges on most dtypes, often dramatically.
+    # Note: This test validates undefined behavior consistency in float-to-ints casts
+    # NB: torch.uint16, torch.uint32, torch.uint64 excluded as this
+    # nondeterministically fails, warning "invalid value encountered in cast"
+    @unittest.skipIf(IS_S390X, "Test fails for int16 on s390x. Needs investigation.")
+    @dtypes(torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+    def test_float_to_int_conversion_nonfinite(self, device, dtype):
+        vals = (float('-inf'), float('inf'), float('nan'))
 
+        if dtype == torch.bool:
+            refs = (True, True, True)
+        elif IS_ARM64:
+            refs = (torch.iinfo(dtype).min, torch.iinfo(dtype).max, 0)
+            if dtype in (torch.int8, torch.int16):
+                refs = (0, -1, 0)
+        else:
+            refs = (0, 0, 0)
+            if dtype in (torch.int32, torch.int64):
+                refs = (torch.iinfo(dtype).min, ) * 3
+        _float_to_int_conversion_helper(self, vals, device, dtype, refs)
 
-class TestTensorCreationCpuOnly(TestCase):
-    hw_classification = HardwareClassification.CPU
-    exact_dtype = True
+    @slowTest
+    def test_cat_big(self, device):
+        SIZE1 = 6500
+        SIZE2 = 4500
+        concat_list = []
+        concat_list.append(torch.ones((SIZE1, 1024 * 512), dtype=torch.uint8, device=device))
+        concat_list.append(torch.ones((SIZE2, 1024 * 512), dtype=torch.uint8, device=device))
+        result = torch.cat(concat_list)
+        self.assertEqual(result.size(0), SIZE1 + SIZE2)
 
     # TODO: this test should be updated
     def test_constructor_dtypes(self, device):
@@ -3292,6 +3095,189 @@ class TestTensorCreationCpuOnly(TestCase):
         k = torch.tensor((1e323, -1e323, float('inf'), -float('inf')), dtype=torch.bool)
         self.assertEqual(j, k)
 
+    # TODO: this test should be updated
+    @suppress_warnings
+    def test_tensor_factory_copy_var(self, device):
+        def check_copy(copy, is_leaf, requires_grad, data_ptr=None):
+            if data_ptr is None:
+                data_ptr = copy.data_ptr
+            self.assertEqual(copy, source, exact_dtype=False)
+            self.assertTrue(copy.is_leaf == is_leaf)
+            self.assertTrue(copy.requires_grad == requires_grad)
+            self.assertTrue(copy.data_ptr == data_ptr)
+
+        source = torch.randn(5, 5, dtype=torch.double, requires_grad=True)
+        # test torch.tensor()
+        check_copy(torch.tensor(source), True, False)
+        check_copy(torch.tensor(source, requires_grad=False), True, False)
+        check_copy(torch.tensor(source, requires_grad=True), True, True)
+
+        # test tensor.new_tensor()
+        copy = torch.randn(1)
+        check_copy(copy.new_tensor(source), True, False)
+        check_copy(copy.new_tensor(source, requires_grad=False), True, False)
+        check_copy(copy.new_tensor(source, requires_grad=True), True, True)
+
+        # test torch.as_tensor()
+        check_copy(torch.as_tensor(source), source.is_leaf, source.requires_grad, source.data_ptr)  # not copy
+        check_copy(torch.as_tensor(source, dtype=torch.float), False, True)  # copy and keep the graph
+
+    # TODO: this test should be updated
+    def test_tensor_factory_type_inference(self, device):
+        def test_inference(default_dtype):
+            default_complex_dtype = torch.complex64 if default_dtype == torch.float32 else torch.complex128
+            self.assertIs(default_dtype, torch.tensor(()).dtype)
+            self.assertIs(default_dtype, torch.tensor(5.).dtype)
+            self.assertIs(torch.int64, torch.tensor(5).dtype)
+            self.assertIs(torch.bool, torch.tensor(True).dtype)
+            self.assertIs(torch.int32, torch.tensor(5, dtype=torch.int32).dtype)
+            self.assertIs(default_dtype, torch.tensor(((7, 5), (9, 5.))).dtype)
+            self.assertIs(default_dtype, torch.tensor(((5., 5), (3, 5))).dtype)
+            self.assertIs(torch.int64, torch.tensor(((5, 3), (3, 5))).dtype)
+            self.assertIs(default_complex_dtype, torch.tensor(((5, 3 + 2j), (3, 5 + 4j))).dtype)
+
+            self.assertIs(torch.float64, torch.tensor(np.array(())).dtype)
+            self.assertIs(torch.float64, torch.tensor(np.array(5.)).dtype)
+            if np.array(5).dtype == np.int64:  # np long, which can be 4 bytes (e.g. on windows)
+                self.assertIs(torch.int64, torch.tensor(np.array(5)).dtype)
+            else:
+                self.assertIs(torch.int32, torch.tensor(np.array(5)).dtype)
+            self.assertIs(torch.uint8, torch.tensor(np.array(3, dtype=np.uint8)).dtype)
+            self.assertIs(default_dtype, torch.tensor(((7, np.array(5)), (np.array(9), 5.))).dtype)
+            self.assertIs(torch.float64, torch.tensor(((7, 5), (9, np.array(5.)))).dtype)
+            self.assertIs(torch.int64, torch.tensor(((5, np.array(3)), (np.array(3), 5))).dtype)
+
+        for dtype in [torch.float64, torch.float32]:
+            with set_default_dtype(dtype):
+                test_inference(dtype)
+
+    # TODO: this test should be updated
+    def test_as_tensor(self, device):
+        # from python data
+        x = [[0, 1], [2, 3]]
+        self.assertEqual(torch.tensor(x), torch.as_tensor(x))
+        self.assertEqual(torch.tensor(x, dtype=torch.float32), torch.as_tensor(x, dtype=torch.float32))
+
+        # python data with heterogeneous types
+        z = [0, 'torch']
+        with self.assertRaisesRegex(TypeError, "invalid data type"):
+            torch.tensor(z)
+            torch.as_tensor(z)
+
+        # python data with self-referential lists
+        z = [0]
+        z += [z]
+        with self.assertRaisesRegex(TypeError, "self-referential lists are incompatible"):
+            torch.tensor(z)
+            torch.as_tensor(z)
+
+        z = [[1, 2], z]
+        with self.assertRaisesRegex(TypeError, "self-referential lists are incompatible"):
+            torch.tensor(z)
+            torch.as_tensor(z)
+
+        # from tensor (doesn't copy unless type is different)
+        y = torch.tensor(x)
+        self.assertIs(y, torch.as_tensor(y))
+        self.assertIsNot(y, torch.as_tensor(y, dtype=torch.float32))
+
+        # doesn't copy
+        for dtype in [np.float64, np.int64, np.int8, np.uint8]:
+            n = np.random.rand(5, 6).astype(dtype)
+            n_astensor = torch.as_tensor(n)
+            self.assertEqual(torch.tensor(n), n_astensor)
+            n_astensor[0][0] = 25.7
+            self.assertEqual(torch.tensor(n), n_astensor)
+
+        # changing dtype causes copy
+        n = np.random.rand(5, 6).astype(np.float32)
+        n_astensor = torch.as_tensor(n, dtype=torch.float64)
+        self.assertEqual(torch.tensor(n, dtype=torch.float64), n_astensor)
+        n_astensor[0][1] = 250.8
+        self.assertNotEqual(torch.tensor(n, dtype=torch.float64), n_astensor)
+
+    # TODO: this test should be updated
+    @suppress_warnings
+    def test_new_tensor(self, device):
+        expected = torch.autograd.Variable(torch.ByteTensor([1, 1]))
+        # test data
+        res1 = expected.new_tensor([1, 1])
+        self.assertEqual(res1, expected)
+        res1 = expected.new_tensor([1, 1], dtype=torch.int)
+        self.assertEqual(res1, expected, exact_dtype=False)
+        self.assertIs(torch.int, res1.dtype)
+
+        # test copy
+        res2 = expected.new_tensor(expected)
+        self.assertEqual(res2, expected)
+        res2[1] = 2
+        self.assertEqual(expected, torch.ones_like(expected))
+        res2 = expected.new_tensor(expected, dtype=torch.int)
+        self.assertEqual(res2, expected, exact_dtype=False)
+        self.assertIs(torch.int, res2.dtype)
+
+        # test copy with numpy
+        a = np.array([5.])
+        res1 = torch.tensor(a)
+        res1 = res1.new_tensor(a)
+        self.assertEqual(5., res1[0].item())
+        a[0] = 7.
+        self.assertEqual(5., res1[0].item())
+
+        if torch.accelerator.device_count() >= 2:
+            backend = torch.accelerator.current_accelerator().type
+            expected = expected.to(f"{backend}:1")
+            res1 = expected.new_tensor([1, 1])
+            self.assertEqual(res1.get_device(), expected.get_device())
+            res1 = expected.new_tensor([1, 1], dtype=torch.int)
+            self.assertIs(torch.int, res1.dtype)
+            self.assertEqual(res1.get_device(), expected.get_device())
+
+            res2 = expected.new_tensor(expected)
+            self.assertEqual(res2.get_device(), expected.get_device())
+            res2 = expected.new_tensor(expected, dtype=torch.int)
+            self.assertIs(torch.int, res1.dtype)
+            self.assertEqual(res2.get_device(), expected.get_device())
+            res2 = expected.new_tensor(expected, dtype=torch.int, device=0)
+            self.assertIs(torch.int, res1.dtype)
+            self.assertEqual(res2.get_device(), 0)
+
+            res1 = expected.new_tensor(1)
+            self.assertEqual(res1.get_device(), expected.get_device())
+            res1 = expected.new_tensor(1, dtype=torch.int)
+            self.assertIs(torch.int, res1.dtype)
+            self.assertEqual(res1.get_device(), expected.get_device())
+
+    # TODO: this test should be updated
+    def test_arange_inference(self, device):
+        # end only
+        self.assertIs(torch.float32, torch.arange(1.).dtype)
+        self.assertIs(torch.float32, torch.arange(torch.tensor(1.)).dtype)
+        self.assertIs(torch.float32, torch.arange(torch.tensor(1., dtype=torch.float64)).dtype)
+
+        self.assertIs(torch.int64, torch.arange(1).dtype)
+        self.assertIs(torch.int64, torch.arange(torch.tensor(1)).dtype)
+        self.assertIs(torch.int64, torch.arange(torch.tensor(1, dtype=torch.int16)).dtype)
+
+        # start, end, [step]
+        self.assertIs(torch.float32, torch.arange(1., 3).dtype)
+        self.assertIs(torch.float32, torch.arange(torch.tensor(1., dtype=torch.float64), 3).dtype)
+        self.assertIs(torch.float32, torch.arange(1, 3.).dtype)
+        self.assertIs(torch.float32, torch.arange(torch.tensor(1, dtype=torch.int16), torch.tensor(3.)).dtype)
+        self.assertIs(torch.float32, torch.arange(1, 3, 1.).dtype)
+        self.assertIs(torch.float32,
+                      torch.arange(torch.tensor(1),
+                                   torch.tensor(3, dtype=torch.int16),
+                                   torch.tensor(1., dtype=torch.float64)).dtype)
+
+        self.assertIs(torch.int64, torch.arange(1, 3).dtype)
+        self.assertIs(torch.int64, torch.arange(torch.tensor(1), 3).dtype)
+        self.assertIs(torch.int64, torch.arange(torch.tensor(1), torch.tensor(3, dtype=torch.int16)).dtype)
+        self.assertIs(torch.int64, torch.arange(1, 3, 1).dtype)
+        self.assertIs(torch.int64,
+                      torch.arange(torch.tensor(1),
+                                   torch.tensor(3),
+                                   torch.tensor(1, dtype=torch.int16)).dtype)
 
 class TestTensorCreationCudaOnly(TestCase):
     hw_classification = HardwareClassification.CUDA
