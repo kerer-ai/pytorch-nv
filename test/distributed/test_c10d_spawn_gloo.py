@@ -9,7 +9,7 @@ from test_c10d_spawn import _torch_dist_nn_available, TestDistributedNNFunctions
 import torch
 import torch.distributed as c10d
 import torch.nn as nn
-from torch.testing._internal.common_cuda import TEST_CUDA
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import requires_gloo, skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import (
     HardwareClassification,
@@ -79,7 +79,7 @@ class DistributedDataParallelSingleProcessTest(_DDPSingleProcessBase):
     hw_classification = HardwareClassification.GENERIC
 
     @requires_gloo()
-    def test_cpu(self):
+    def test_cpu(self, device):
         self._test_base(nn.Linear(2, 2), [torch.randn(30, 2)])
 
 
@@ -87,13 +87,11 @@ class DistributedDataParallelSingleProcessCUDATest(_DDPSingleProcessBase):
     hw_classification = HardwareClassification.CUDA
 
     @requires_gloo()
-    @skip_but_pass_in_sandcastle_if(not TEST_CUDA, "At least 1 CUDA GPUS needed")
-    def test_cuda(self):
+    def test_cuda(self, device):
         self._test_base(nn.Linear(2, 2).to(0), [torch.randn(30, 2).to(0)])
 
     @requires_gloo()
-    @skip_but_pass_in_sandcastle_if(not TEST_CUDA, "At least 1 CUDA GPUS needed")
-    def test_rnn(self):
+    def test_rnn(self, device):
         # This test is inspired by the bug reported in
         # https://github.com/pytorch/pytorch/issues/36268
         BATCH_SIZE = 12  # Divisible by 2, 3, 4
@@ -134,6 +132,14 @@ class DistributedDataParallelSingleProcessCUDATest(_DDPSingleProcessBase):
         self._test_base(net, inp, check_allclose=False)
 
 
+instantiate_device_type_tests(
+    DistributedDataParallelSingleProcessTest, globals(), only_for=("cpu",)
+)
+instantiate_device_type_tests(
+    DistributedDataParallelSingleProcessTestCUDA, globals(), only_for=("cuda",)
+)
+
+
 # Skip dev-asan as torch + multiprocessing spawn have known issues
 if not TEST_WITH_DEV_DBG_ASAN:
 
@@ -146,35 +152,15 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_broadcast(self):
+        def test_broadcast(self, device):
             self._test_broadcast("gloo")
-
-        @requires_gloo()
-        @skip_but_pass_in_sandcastle_if(
-            not _torch_dist_nn_available, "torch.distributed.nn is not available"
-        )
-        def test_broadcast_subgroup_with_nonzero_global_src(self):
-            store = c10d.FileStore(self.file_name, self.world_size)
-            c10d.init_process_group(
-                store=store,
-                rank=self.rank,
-                world_size=self.world_size,
-                backend="gloo",
-            )
-            group = c10d.new_group([1])
-
-            if self.rank == 1:
-                x = torch.ones(5, 5, requires_grad=True)
-                y = torch.distributed.nn.broadcast(x, 1, group=group)
-                y.sum().backward()
-                self.assertEqual(x.grad, torch.ones_like(x))
 
         @requires_gloo()
         @skip_if_lt_x_gpu(2)
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_reduce(self):
+        def test_reduce(self, device):
             self._test_reduce("gloo")
 
         @requires_gloo()
@@ -182,7 +168,7 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_allreduce(self):
+        def test_allreduce(self, device):
             self._test_allreduce("gloo")
 
         @requires_gloo()
@@ -190,7 +176,7 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_all_gather(self):
+        def test_all_gather(self, device):
             self._test_all_gather("gloo")
 
         @requires_gloo()
@@ -198,7 +184,7 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_all_to_all(self):
+        def test_all_to_all(self, device):
             self._test_all_to_all("gloo")
 
         @requires_gloo()
@@ -206,7 +192,7 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_all_to_all_single(self):
+        def test_all_to_all_single(self, device):
             self._test_all_to_all_single("gloo")
 
         # Test Ops only supported in GLOO.
@@ -215,14 +201,14 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_gather(self):
+        def test_gather(self, device):
             store = c10d.FileStore(self.file_name, self.world_size)
             # This is required because these functions calls directly to the .dist and needs
             # the world to be initialized
             c10d.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="gloo"
             )
-            device = torch.device(f"cuda:{self.rank}")
+            device = torch.device(torch.device(device).type, self.rank)
             x = torch.ones(5, 5, device=device) + self.rank
             x.requires_grad = True
             tensors = torch.distributed.nn.gather(x, 1)
@@ -246,14 +232,14 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_but_pass_in_sandcastle_if(
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
-        def test_scatter(self):
+        def test_scatter(self, device):
             store = c10d.FileStore(self.file_name, self.world_size)
             # This is required because these functions calls directly to the .dist and needs
             # the world to be initialized
             c10d.init_process_group(
                 store=store, rank=self.rank, world_size=self.world_size, backend="gloo"
             )
-            device = torch.device(f"cuda:{self.rank}")
+            device = torch.device(torch.device(device).type, self.rank)
             x0 = torch.ones(5, 5, device=device)
             x1 = torch.ones(5, 5, device=device) + 1
             x0.requires_grad = True
@@ -275,6 +261,36 @@ if not TEST_WITH_DEV_DBG_ASAN:
                 self.assertEqual(x1.grad, x1_s)
             if self.rank == 0:
                 self.assertEqual(x0.grad, torch.zeros(5, 5, device=device))
+
+    class TestDistributedNNFunctionsGloo(TestDistributedNNFunctions):
+        hw_classification = HardwareClassification.CPU
+
+        @requires_gloo()
+        @skip_but_pass_in_sandcastle_if(
+            not _torch_dist_nn_available, "torch.distributed.nn is not available"
+        )
+        def test_broadcast_subgroup_with_nonzero_global_src(self, device):
+            store = c10d.FileStore(self.file_name, self.world_size)
+            c10d.init_process_group(
+                store=store,
+                rank=self.rank,
+                world_size=self.world_size,
+                backend="gloo",
+            )
+            group = c10d.new_group([1])
+
+            if self.rank == 1:
+                x = torch.ones(5, 5, requires_grad=True)
+                y = torch.distributed.nn.broadcast(x, 1, group=group)
+                y.sum().backward()
+                self.assertEqual(x.grad, torch.ones_like(x))
+
+    instantiate_device_type_tests(
+        TestDistributedNNFunctionsGlooCUDA, globals(), only_for=("cuda",)
+    )
+    instantiate_device_type_tests(
+        TestDistributedNNFunctionsGloo, globals(), only_for=("cpu",)
+    )
 
 
 if __name__ == "__main__":
