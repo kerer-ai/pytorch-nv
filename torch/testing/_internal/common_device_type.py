@@ -13,7 +13,7 @@ import unittest
 from collections import namedtuple
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import Enum
-from functools import partial, wraps
+from functools import cache, partial, wraps
 from typing import Any, ClassVar, TypeVar
 from typing_extensions import ParamSpec
 
@@ -1437,6 +1437,28 @@ def requires_capabilities(*caps: str):
 #
 # See note "Writing Test Templates"
 # TODO: remove "allow_xpu" option after Intel GPU support all test case instantiate by this function.
+
+
+def requires_capabilities(*caps: str):
+    """Declare that a test method requires device capabilities.
+
+    Wraps the test to call ``type(self).get_capabilities()`` at runtime
+    and skip if any required capability is missing.
+    """
+    caps_set = frozenset(caps)
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            _check_capabilities(self, caps_set)
+            return fn(self, *args, **kwargs)
+
+        wrapper._required_capabilities = (
+            frozenset(getattr(fn, "_required_capabilities", ())) | caps_set
+        )
+        return wrapper
+
+    return decorator
 
 
 def instantiate_device_type_tests(
