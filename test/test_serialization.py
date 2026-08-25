@@ -933,6 +933,8 @@ class ClassThatUsesBuildInstructionSomeSlots(ClassThatUsesBuildInstructionAllSlo
     c: str
 
 class TestBothSerialization(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     @parametrize("weights_only", (True, False))
     def test_serialization_new_format_old_format_compat(self, device, weights_only):
         x = [torch.ones(200, 200, device=device) for i in range(30)]
@@ -5209,6 +5211,8 @@ class TestEmptySubclass(torch.Tensor):
 
 
 class TestSubclassSerialization(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_tensor_subclass_wrapper_serialization(self):
         wrapped_tensor = torch.rand(2)
         my_tensor = TestWrapperSubclass(wrapped_tensor)
