@@ -16,6 +16,8 @@ class TestSplit(TestCase):
     hw_classification = HardwareClassification.GENERIC
     """Comprehensive tests for first-class dimension split operations."""
 
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
         super().setUp()
         self.batch, self.height, self.width = dims(3)
