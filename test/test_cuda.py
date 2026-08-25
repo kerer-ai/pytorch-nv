@@ -2100,6 +2100,8 @@ import torch
 from torch.testing._internal.common_utils import (TestCase, run_tests, slowTest)
 
 class TestThatContainsCUDAAssertFailure(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
 
     @slowTest
     def test_index_bounds_cuda(self):
@@ -8047,6 +8049,8 @@ class TestCachingHostAllocatorConfig(TestCase):
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 class TestCachingHostAllocatorCudaGraph(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
     # As soon as pinned host memory allocated by a private pool is
     # used (by copy_ in this case) during stream capture, it can never
     # be recycled.
@@ -11429,6 +11433,8 @@ class TestCudaDeviceParametrized(TestCase):
 
 
 class TestFXMemoryProfiler(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
     """Tests for memory profiler augmentation with original stack traces."""
 
     hw_classification = HardwareClassification.CUDA

@@ -10,7 +10,7 @@ from torch.testing._internal.common_cuda import (
     TEST_MULTIGPU,
     TEST_NUMBA_CUDA,
 )
-from torch.testing._internal.common_utils import TEST_NUMPY
+from torch.testing._internal.common_utils import HardwareClassification, TEST_NUMPY
 
 
 if TEST_NUMPY:
