@@ -20,17 +20,17 @@ from torch.distributed._shard.api import (
     shard_parameter,
 )
 from torch.distributed._shard.sharded_tensor import (
-    custom_sharded_op_impl,
-    pre_load_state_dict_hook,
     Shard,
     ShardedTensor,
     ShardedTensorBase,
     ShardedTensorMetadata,
+    custom_sharded_op_impl,
+    pre_load_state_dict_hook,
     state_dict_hook,
 )
 from torch.distributed._shard.sharded_tensor.api import (
-    _create_tensor_from_params,
     TensorProperties,
+    _create_tensor_from_params,
 )
 from torch.distributed._shard.sharded_tensor.utils import (
     _parse_and_validate_remote_device,
@@ -41,6 +41,12 @@ from torch.distributed._shard.sharding_spec import (
     ShardMetadata,
 )
 from torch.distributed.remote_device import _remote_device
+from torch.testing._internal.common_device_type import (
+    Capability,
+    instantiate_device_type_tests,
+    onlyAccelerator,
+    requires_capabilities,
+)
 from torch.testing._internal.common_distributed import (
     requires_accelerator_dist_backend,
     requires_nccl,
@@ -56,15 +62,22 @@ from torch.testing._internal.common_utils import (
     TEST_WITH_DEV_DBG_ASAN,
     TEST_XPU,
     TestCase,
+    run_tests,
+    skipIfRocm,
 )
 from torch.testing._internal.distributed._shard.sharded_tensor import (
     ShardedTensorTestBase,
     with_comms,
 )
 from torch.testing._internal.distributed._shard.sharded_tensor._test_st_common import (
-    _chunk_sharding_specs_list_for_test,
     MyShardedModel1,
+    _chunk_sharding_specs_list_for_test,
 )
+
+device_type = (
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+)
+backend = dist.Backend.default_device_backend_map.get(device_type, "gloo")
 
 
 DEVICE_TYPE = (
@@ -81,27 +94,28 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedTensorMetadata(TestCase):
+    hw_classification = HardwareClassification.GENERIC
     def test_serialize_and_deserialize(self):
         shard_metadatas = [
             ShardMetadata(
                 shard_offsets=[0, 0],
                 shard_sizes=[5, 5],
-                placement="rank:0/cuda:0",
+                placement="rank:0/cpu",
             ),
             ShardMetadata(
                 shard_offsets=[0, 5],
                 shard_sizes=[5, 5],
-                placement="rank:1/cuda:1",
+                placement="rank:1/cpu",
             ),
             ShardMetadata(
                 shard_offsets=[5, 0],
                 shard_sizes=[5, 5],
-                placement="rank:2/cuda:2",
+                placement="rank:2/cpu",
             ),
             ShardMetadata(
                 shard_offsets=[5, 5],
                 shard_sizes=[5, 5],
-                placement="rank:3/cuda:3",
+                placement="rank:3/cpu",
             ),
         ]
 
@@ -374,6 +388,7 @@ class TestShardTensor(ShardedTensorTestBase):
 
 
 class TestModuleHookApi(ShardedTensorTestBase):
+    hw_classification = HardwareClassification.ACCELERATOR
     class DummyNNModule(torch.nn.Module):
         def __init__(self, spec, tensor_size):
             super().__init__()
@@ -586,6 +601,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_create_sharded_tensor_with_ones(self):
         """Test sharded_tensor.ones(...)"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -614,6 +630,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_gather_even(self) -> None:
         """Test _sharded_tensor.gather(...) with evenly distributed._shards"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -647,6 +664,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_gather_uneven(self) -> None:
         """Test _sharded_tensor.gather(...) with unevenly distributed._shards"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -681,6 +699,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_create_sharded_tensor_with_zeros(self):
         """Test sharded_tensor.zeros(...)"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -709,6 +728,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_create_sharded_tensor_with_rand(self):
         """Test sharded_tensor.rand(...)/randn(...)"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -760,6 +780,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_create_sharded_tensor_with_full(self):
         """Test sharded_tensor.full(...)"""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -794,6 +815,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_create_sharded_tensor_like(self):
         """Test tensor like methods, i.e. torch.zeros_like(...), torch.full_like, etc."""
 
+        device_type = torch.device(device).type
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -1012,6 +1034,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                 self.assertEqual((2, 20), shard.tensor.size())
                 self.assertEqual(rpc_rank, remote_shard.owner().id)
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_sharding_columns(self):
@@ -1051,6 +1074,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
                     f"rank:{rank}/{DEVICE_TYPE}:{rank}", str(shard_metadata.placement)
                 )
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_invalid_sharding(self):
@@ -1117,6 +1141,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         with self.assertRaisesRegex(ValueError, "Invalid worker name"):
             sharded_tensor.empty(spec, 10, 20, init_rrefs=True)
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_invalid_pg_rpc_ranks(self):
@@ -1141,6 +1166,7 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         ):
             sharded_tensor.empty(spec, 10, 20, init_rrefs=True)
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_insufficient_sharding_dims(self):
@@ -1358,11 +1384,14 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
         self.assertEqual(m.weight, module_load.weight)
         self.assertEqual(m.bias, module_load.bias)
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_load_state_dict_errors(self):
         self.init_rpc()
 
+        # Use dynamic backend instead of hardcoded "nccl" to support
+        # out-of-tree backends (e.g., hccl for NPU).
         dist.init_process_group(
             backend=BACKEND,
             world_size=self.world_size,
@@ -1590,6 +1619,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
     def test_create_sharded_tensor_with_ones(self):
         """Test sharded_tensor.ones(...)"""
 
+        device_type = torch.device(device).type
         spec = EnumerableShardingSpec(
             [
                 ShardMetadata(
@@ -1633,6 +1663,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
     def test_gather_even(self) -> None:
         """Test _sharded_tensor.gather(...) with evenly distributed._shards"""
 
+        device_type = torch.device(device).type
         spec = EnumerableShardingSpec(
             [
                 ShardMetadata(
@@ -1678,6 +1709,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
     def test_gather_uneven(self) -> None:
         """Test _sharded_tensor.gather(...) with unevenly distributed._shards"""
 
+        device_type = torch.device(device).type
         spec = EnumerableShardingSpec(
             [
                 ShardMetadata(
@@ -1804,10 +1836,12 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         for meta in metas:
             self.assertEqual(str(meta.placement.device()), "cpu")
 
-    @with_comms
+    @onlyAccelerator
+    @with_comms(backend=backend)
     @skip_if_lt_x_gpu(4)
-    @requires_nccl()
-    def test_sharded_tensor_to_cuda(self):
+    @requires_capabilities(Capability.distributed.backend)
+    def test_sharded_tensor_to_cuda(self, device):
+        device_type = torch.device(device).type
         cpu_spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -1820,19 +1854,18 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
-                "rank:0/cuda:0",
-                "rank:1/cuda:1",
-                "rank:2/cuda:2",
-                "rank:3/cuda:3",
+                f"rank:0/{device_type}:0",
+                f"rank:1/{device_type}:1",
+                f"rank:2/{device_type}:2",
+                f"rank:3/{device_type}:3",
             ],
         )
         h, w = 10, 20
         # CUDA sharded tensor should return a new ShardedTensor, but same
         # local shards(no movements)
         st_cuda = sharded_tensor.zeros(spec, h, w)
-        new_st_cuda = st_cuda.cuda()
+        new_st_cuda = st_cuda.to(device_type, copy=True)
         self.assertTrue(st_cuda is not new_st_cuda)
-        self.assertTrue(st_cuda.local_tensor() is new_st_cuda.local_tensor())
 
         gloo_pg = dist.new_group(backend="gloo")
 
@@ -1840,7 +1873,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         st_cpu = sharded_tensor.zeros(cpu_spec, h, w, process_group=gloo_pg)
         # test ability to move st to GPU
         spec_before_move = st_cpu.sharding_spec()
-        new_st_gpu = st_cpu.cuda()
+        new_st_gpu = st_cpu.to(device_type)
         # check the spec is still ChunkShardingSpec
         spec_after_move = new_st_gpu.sharding_spec()
         self.assertIsInstance(spec_after_move, ChunkShardingSpec)
@@ -1853,12 +1886,12 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
             remote_device_before = spec_before_move.placements[i]
             self.assertEqual(remote_device_before.rank(), remote_device_after.rank())
             self.assertEqual(str(remote_device_before.device().type), "cpu")
-            self.assertEqual(str(remote_device_after.device().type), "cuda")
+            self.assertEqual(str(remote_device_after.device().type), device_type)
 
         # ensure metadata also get changed to GPU
         metas = new_st_gpu.metadata().shards_metadata
         for meta in metas:
-            self.assertEqual(str(meta.placement.device().type), "cuda")
+            self.assertEqual(str(meta.placement.device().type), device_type)
 
     @with_comms(backend=BACKEND)
     @skip_if_lt_x_gpu(4)
@@ -1958,6 +1991,7 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
         st_cpu = st.to(device=cpu_device)
         self.assertEqual(st_cpu.device, cpu_device)
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_uneven_shards(self):
@@ -2343,7 +2377,8 @@ class TestShardedTensorEnumerable(ShardedTensorTestBase):
 
 
 class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
-    def _generate_st_from_chunk_local_tensor(self, st_size, sharding_spec):
+    hw_classification = HardwareClassification.ACCELERATOR
+    def _generate_st_from_chunk_local_tensor(self, st_size, sharding_spec, device_type):
         tensor_meta = sharding_spec.build_metadata(st_size, TensorProperties())
         pg = dist.distributed_c10d._get_default_group()
 
@@ -2356,7 +2391,7 @@ class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
             )
             rank_to_metadata[rank] = shard_metadata
             if rank == self.rank:
-                local_tensor = torch.rand(shard_metadata.shard_sizes).cuda(device)
+                local_tensor = torch.rand(shard_metadata.shard_sizes).to(device)
                 local_shard_metadata = shard_metadata
 
         # TODO: figure out what the API should behave when some rank have no shard
@@ -2375,7 +2410,7 @@ class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
         # Verify local shard.
         local_shard = st.local_shards()[0]
         self.assertEqual(st.local_tensor(), local_tensor)
-        self.assertEqual(torch.device(f"cuda:{self.rank}"), local_shard.tensor.device)
+        self.assertEqual(torch.device(device_type, self.rank), local_shard.tensor.device)
 
         # Verify local shard metadata.
         self.assertEqual(
@@ -2406,16 +2441,18 @@ class TestShardedTensorFromLocalTensor(ShardedTensorTestBase):
                     )
 
     @skipIfRocm
-    @with_comms
+    @onlyAccelerator
+    @with_comms(backend=backend)
     @skip_if_lt_x_gpu(4)
-    @requires_nccl()
-    def test_init_from_local_tensor(self):
+    @requires_capabilities(Capability.distributed.backend)
+    def test_init_from_local_tensor(self, device):
+        device_type = torch.device(device).type
         chunk_specs = _chunk_sharding_specs_list_for_test([0, 1, 1, 0], seed=31)
         for spec in chunk_specs:
-            self._generate_st_from_chunk_local_tensor([20, 10], spec)
-            self._generate_st_from_chunk_local_tensor([21, 11], spec)
-            self._generate_st_from_chunk_local_tensor([23, 16], spec)
-            self._generate_st_from_chunk_local_tensor([44, 16, 8], spec)
+            self._generate_st_from_chunk_local_tensor([20, 10], spec, device_type)
+            self._generate_st_from_chunk_local_tensor([21, 11], spec, device_type)
+            self._generate_st_from_chunk_local_tensor([23, 16], spec, device_type)
+            self._generate_st_from_chunk_local_tensor([44, 16, 8], spec, device_type)
 
     @with_comms(backend=BACKEND)
     @skip_if_lt_x_gpu(4)
@@ -2675,8 +2712,10 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             st.local_shards()[0].metadata.placement, local_shard_metadata.placement
         )
 
+    @onlyAccelerator
     @skip_if_lt_x_gpu(4)
-    def test_st_base_init_from_local_shards_and_global_metadata(self):
+    def test_st_base_init_from_local_shards_and_global_metadata(self, device):
+        device_type = torch.device(device).type
         world_size = 4
         shards_metadata = []
         shards = []
@@ -3188,43 +3227,6 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             placement=f"rank:{self.rank}/cpu",
         )
 
-    @with_comms(init_rpc=False, backend="gloo")
-    @skip_if_lt_x_gpu(4)
-    def test_init_from_local_shards_invalid_pin_memory(self):
-        # pin memory can only be on dense cpu
-        local_shard_metadata = ShardMetadata(
-            shard_offsets=[(self.rank // 2) * 5, (self.rank % 2) * 5],
-            shard_sizes=[5, 5],
-            placement=f"rank:{self.rank}/cpu",
-        )
-        wrong_pin_memory_local_shards = [
-            sharded_tensor.Shard(
-                torch.randn(5, 5, pin_memory=True), local_shard_metadata
-            ),
-            sharded_tensor.Shard(
-                torch.randn(5, 5, pin_memory=False), local_shard_metadata
-            ),
-        ]
-        with self.assertRaisesRegex(
-            ValueError, "Local shards' tensor pin_memory property need to be the same"
-        ):
-            sharded_tensor.init_from_local_shards(
-                wrong_pin_memory_local_shards, [10, 10], init_rrefs=True
-            )
-
-        tensor_pin_memory = self.rank == 0
-        wrong_pin_memory_shards_cross_ranks = [
-            sharded_tensor.Shard(
-                torch.randn(5, 5, pin_memory=tensor_pin_memory), local_shard_metadata
-            )
-        ]
-        with self.assertRaisesRegex(
-            ValueError,
-            "ShardedTensor pin_memory property does not match from different ranks!",
-        ):
-            sharded_tensor.init_from_local_shards(
-                wrong_pin_memory_shards_cross_ranks, [10, 10], init_rrefs=True
-            )
 
     @with_comms(backend=BACKEND)
     @skip_if_lt_x_gpu(4)
@@ -3421,6 +3423,47 @@ class TestShardedTensorFromLocalShards(ShardedTensorTestBase):
             )
 
 
+class TestShardedTensorFromLocalShardsPinMemory(ShardedTensorTestBase):
+    hw_classification = HardwareClassification.CPU
+
+    @with_comms(init_rpc=False, backend="gloo")
+    def test_init_from_local_shards_invalid_pin_memory(self):
+        # pin memory can only be on dense cpu
+        local_shard_metadata = ShardMetadata(
+            shard_offsets=[(self.rank // 2) * 5, (self.rank % 2) * 5],
+            shard_sizes=[5, 5],
+            placement=f"rank:{self.rank}/cpu",
+        )
+        wrong_pin_memory_local_shards = [
+            sharded_tensor.Shard(
+                torch.randn(5, 5, pin_memory=True), local_shard_metadata
+            ),
+            sharded_tensor.Shard(
+                torch.randn(5, 5, pin_memory=False), local_shard_metadata
+            ),
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "Local shards' tensor pin_memory property need to be the same"
+        ):
+            sharded_tensor.init_from_local_shards(
+                wrong_pin_memory_local_shards, [10, 10], init_rrefs=True
+            )
+
+        tensor_pin_memory = self.rank == 0
+        wrong_pin_memory_shards_cross_ranks = [
+            sharded_tensor.Shard(
+                torch.randn(5, 5, pin_memory=tensor_pin_memory), local_shard_metadata
+            )
+        ]
+        with self.assertRaisesRegex(
+            ValueError,
+            "ShardedTensor pin_memory property does not match from different ranks!",
+        ):
+            sharded_tensor.init_from_local_shards(
+                wrong_pin_memory_shards_cross_ranks, [10, 10], init_rrefs=True
+            )
+
+
 class TestShardedTensorCustomOps(ShardedTensorTestBase):
     @with_comms(backend=BACKEND)
     @skip_if_lt_x_gpu(4)
@@ -3515,6 +3558,7 @@ class TestShardMetadata(ShardedTensorTestBase):
 
 
 class TestShardedTensorSubGroupInit(TestCase):
+    hw_classification = HardwareClassification.GENERIC
     @spawn_threads_and_init_comms(world_size=4)
     def test_sub_process_group_sharded_tensor_init(self):
         world_pg = dist.GroupMember.WORLD
@@ -3566,6 +3610,7 @@ class TestShardedTensorSubGroupInit(TestCase):
 
 
 class TestCreateTensorNoProcessGroupMode(TestCase):
+    hw_classification = HardwareClassification.GENERIC
     def test_init_from_local_shards_and_global_metadata(self):
         st_metadata: ShardedTensorMetadata = ShardedTensorMetadata(
             shards_metadata=[
@@ -3626,6 +3671,20 @@ class TestCreateTensorNoProcessGroupMode(TestCase):
             local_shards=st_local_shards,
             sharded_tensor_metadata=st_metadata,
         )
+
+
+instantiate_device_type_tests(TestCreateTensorFromParams, globals())
+instantiate_device_type_tests(TestShardParameter, globals())
+instantiate_device_type_tests(TestShardTensor, globals())
+instantiate_device_type_tests(TestModuleHookApi, globals())
+instantiate_device_type_tests(TestLocalTensor, globals())
+instantiate_device_type_tests(TestShardedTensorChunked, globals())
+instantiate_device_type_tests(TestShardedTensorEnumerable, globals())
+instantiate_device_type_tests(TestShardedTensorFromLocalTensor, globals())
+instantiate_device_type_tests(TestShardedTensorFromLocalShards, globals())
+instantiate_device_type_tests(TestShardedTensorCustomOps, globals())
+instantiate_device_type_tests(TestShardMetadata, globals())
+instantiate_device_type_tests(TestShardedTensorFromLocalShardsPinMemory, globals(), only_for="cpu")
 
 
 if __name__ == "__main__":
