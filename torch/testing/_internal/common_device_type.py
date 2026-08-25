@@ -945,6 +945,7 @@ class CUDATestBase(DeviceTypeTestBase):
 
     @classmethod
     def _capabilities(cls):
+        import torch.distributed as dist
         from torch.testing._internal.common_cuda import (
             PLATFORM_SUPPORTS_FLASH_ATTENTION,
             PLATFORM_SUPPORTS_FP8,
