@@ -11,6 +11,8 @@ Covers:
   integer type before the final bitcast, preventing size mismatch errors.
 """
 
+import unittest
+
 import torch
 from torch._inductor.runtime.triton_helpers import (
     exclusive_scan_decoupled_lookback_64,
@@ -26,10 +28,15 @@ from torch._inductor.runtime.triton_helpers import (
 )
 from torch._inductor.test_case import run_tests, TestCase
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, requires_gpu
+from torch.testing._internal.common_utils import HardwareClassification
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_TRITON, requires_triton
 
 
-if HAS_GPU:
+HAS_GPU_DEVICE = GPU_TYPE != "mps" and getattr(torch, GPU_TYPE).is_available()
+HAS_ACCELERATOR = HAS_GPU_DEVICE or torch.mps.is_available()
+
+
+if HAS_TRITON:
     import triton  # @manual
     from triton import language as tl
 
@@ -156,7 +163,10 @@ if HAS_GPU:
 class ExclusiveScanDecoupledLookback64Test(TestCase):
     """Test cases for exclusive_scan_decoupled_lookback_64 dtype fix."""
 
-    @requires_gpu()
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_flag_2_branch_with_int64_index(self) -> None:
         """Test `if flag == 2` branch with int64 index."""
         device = torch.device(GPU_TYPE)
@@ -180,7 +190,8 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
         expected = torch.tensor([10.0], dtype=torch.float64, device=device)
         torch.testing.assert_close(result, expected)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_flag_2_branch_with_int32_index(self) -> None:
         """Test `if flag == 2` branch with int32 index."""
         device = torch.device(GPU_TYPE)
@@ -214,6 +225,8 @@ class SelectOneTest(TestCase):
     bitcast from int32 to a 16-bit dtype fails with a size mismatch error.
     """
 
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def _run_select_one(self, dtype: torch.dtype) -> None:
         device = torch.device(GPU_TYPE)
         BLOCK_SIZE = 4
@@ -228,22 +241,26 @@ class SelectOneTest(TestCase):
         expected = torch.tensor([3.0], dtype=dtype, device=device)
         torch.testing.assert_close(result, expected)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_select_one_bfloat16(self) -> None:
         """Test select_one with bfloat16 (16-bit) — triggers the bitcast fix."""
         self._run_select_one(torch.bfloat16)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_select_one_float16(self) -> None:
         """Test select_one with float16 (16-bit) — triggers the bitcast fix."""
         self._run_select_one(torch.float16)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_select_one_float32(self) -> None:
         """Test select_one with float32 (32-bit) — baseline that always worked."""
         self._run_select_one(torch.float32)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_select_one_float64(self) -> None:
         """Test select_one with float64 (64-bit) — baseline that always worked."""
         self._run_select_one(torch.float64)
@@ -251,6 +268,8 @@ class SelectOneTest(TestCase):
 
 class Random4xTest(TestCase):
     """Test cases for rand4x/randn4x helper packing order."""
+
+    hw_classification = HardwareClassification.ACCELERATOR
 
     def _run_random_4x_order(self, normal: bool, block_size: int) -> None:
         device = torch.device(GPU_TYPE)
@@ -267,27 +286,33 @@ class Random4xTest(TestCase):
 
         torch.testing.assert_close(helper_result, expected_result, atol=0, rtol=0)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_rand4x_order(self) -> None:
         self._run_random_4x_order(normal=False, block_size=16)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_randn4x_order(self) -> None:
         self._run_random_4x_order(normal=True, block_size=16)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_rand4x_order_quarter_block_size_2(self) -> None:
         self._run_random_4x_order(normal=False, block_size=8)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_randn4x_order_quarter_block_size_2(self) -> None:
         self._run_random_4x_order(normal=True, block_size=8)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_rand4x_fallback_block_size_2(self) -> None:
         self._run_random_4x_order(normal=False, block_size=2)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_randn4x_fallback_block_size_2(self) -> None:
         self._run_random_4x_order(normal=True, block_size=2)
 
@@ -316,15 +341,18 @@ class Random4xTest(TestCase):
 
         torch.testing.assert_close(small_block_result, large_block_result)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_rand4x_block_size_stability(self) -> None:
         self._run_random_4x_block_size_stability(normal=False)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_randn4x_block_size_stability(self) -> None:
         self._run_random_4x_block_size_stability(normal=True)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_rand4x_distribution(self) -> None:
         device = torch.device(GPU_TYPE)
         block_size = 1024
@@ -348,7 +376,8 @@ class Random4xTest(TestCase):
         max_bucket_error = (bins - sample_count / 10).abs().max().item()
         self.assertLess(max_bucket_error / (sample_count / 10), 0.08)
 
-    @requires_gpu()
+    @unittest.skipIf(not HAS_ACCELERATOR, "requires gpu")
+    @requires_triton()
     def test_randn4x_distribution(self) -> None:
         device = torch.device(GPU_TYPE)
         block_size = 1024
@@ -374,6 +403,8 @@ class Random4xTest(TestCase):
 
 
 class MinimumMaximumTest(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def test_elementwise_nan_and_signed_zero(self, device: str) -> None:
         a = torch.tensor(
             [
@@ -492,10 +523,12 @@ class MinimumMaximumTest(TestCase):
         self.assertEqual(actual_max_bits, torch.zeros_like(actual_max_bits))
 
 
-if HAS_GPU:
-    instantiate_device_type_tests(MinimumMaximumTest, globals(), only_for=GPU_TYPE)
+if HAS_GPU_DEVICE:
+    if HAS_TRITON:
+        instantiate_device_type_tests(MinimumMaximumTest, globals(), only_for=GPU_TYPE)
 
 
 if __name__ == "__main__":
-    if HAS_GPU:
-        run_tests()
+    if HAS_GPU_DEVICE:
+        if HAS_TRITON:
+            run_tests()
