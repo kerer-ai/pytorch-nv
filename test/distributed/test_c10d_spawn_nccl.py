@@ -1,7 +1,7 @@
 # Owner(s): ["oncall: distributed"]
 
 
-from test_c10d_spawn import _torch_dist_nn_available, TestDistributedNNFunctions
+from test_c10d_spawn import TestDistributedNNFunctions
 
 import torch
 import torch.distributed as c10d
@@ -10,14 +10,8 @@ from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     run_tests,
-    skip_but_pass_in_sandcastle_if,
     TEST_WITH_DEV_DBG_ASAN,
 )
-
-
-NO_NCCL = not hasattr(c10d, "ProcessGroupNCCL")
-
-# Fails on Python-3.9, see https://github.com/pytorch/pytorch/issues/51619
 
 
 # Skip dev-asan as torch + multiprocessing spawn have known issues
@@ -75,7 +69,6 @@ if not TEST_WITH_DEV_DBG_ASAN:
         def test_all_to_all_single(self, device):
             self._test_all_to_all_single("nccl")
 
-        # Test Ops only supported in NCCL.
         @requires_nccl()
         @skip_if_lt_x_gpu(2)
         @skip_but_pass_in_sandcastle_if(
@@ -129,7 +122,6 @@ if not TEST_WITH_DEV_DBG_ASAN:
 
                 @staticmethod
                 def backward(ctx, grad_output):
-                    # Make grad non-contiguous
                     return grad_output.clone().transpose(0, 1)
 
             x0 = torch.rand(5, 5, device=device, requires_grad=True)
@@ -160,7 +152,6 @@ if not TEST_WITH_DEV_DBG_ASAN:
 
                 @staticmethod
                 def backward(ctx, grad_output):
-                    # Make grad non-contiguous
                     return grad_output.clone().transpose(0, 1)
 
             x = torch.rand(5, 5, device=device, requires_grad=True)

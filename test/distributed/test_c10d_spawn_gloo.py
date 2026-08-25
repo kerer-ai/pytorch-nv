@@ -4,13 +4,18 @@ import copy
 import os
 import tempfile
 
-from test_c10d_spawn import _torch_dist_nn_available, TestDistributedNNFunctions
+from test_c10d_spawn import TestDistributedNNFunctions
 
 import torch
 import torch.distributed as c10d
 import torch.nn as nn
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import requires_gloo, skip_if_lt_x_gpu
+from torch.testing._internal.common_cuda import TEST_CUDA
+from torch.testing._internal.common_distributed import (
+    requires_gloo,
+    skip_if_lt_x_gpu,
+)
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     run_tests,
@@ -223,7 +228,6 @@ if not TEST_WITH_DEV_DBG_ASAN:
             z = y.sin().sum()
             z.backward()
 
-            # Test gradient
             x_s = 3 * torch.ones(5, 5, device=device)
             self.assertEqual(x.grad, x_s.cos())
 
@@ -253,7 +257,6 @@ if not TEST_WITH_DEV_DBG_ASAN:
             z = y.sin().sum()
             z.backward()
 
-            # Test gradient
             if self.rank == 1:
                 x0_s = torch.ones(5, 5, device=device).cos()
                 x1_s = (2 * torch.ones(5, 5, device=device)).cos()
