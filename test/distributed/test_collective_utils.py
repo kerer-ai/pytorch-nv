@@ -13,20 +13,74 @@ from torch.distributed.collective_utils import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.testing import FileCheck
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
-    instantiate_parametrized_tests,
-    parametrize,
+    HardwareClassification,
     run_tests,
     TestCase,
 )
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
-class TestCollectiveUtils(MultiProcessTestCase):
+class TestCollectiveUtils(TestCase):
+    """Single-process collective_utils API behavior without a process group."""
+
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_broadcast_result_no_pg(self) -> None:
+        """
+        Ensure broadcast has no dependency on torch.distributed when run in single process.
+        """
+        func = mock.MagicMock()
+        broadcast(data_or_fn=func, rank=0)
+        func.assert_called_once()
+
+    def test_broadcast_result_raises_exceptions_from_func(
+        self,
+    ) -> None:
+        """
+        Ensure broadcast exception is propagated properly.
+        """
+        # no process group
+        func = mock.MagicMock()
+        exc = Exception("test exception")
+        func.side_effect = exc
+        expected_exception = "test exception"
+        with self.assertRaisesRegex(Exception, expected_exception):
+            broadcast(data_or_fn=func, rank=0)
+
+    def test_all_gather_result_no_pg(self) -> None:
+        """
+        Ensure all_gather has no dependency on torch.distributed when run in single process.
+        """
+        func = mock.MagicMock()
+        all_gather(data_or_fn=func)
+        func.assert_called_once()
+
+    def test_all_gather_result_raises_exceptions_from_func(
+        self,
+    ) -> None:
+        """
+        Ensure all_gather exception is propagated properly.
+        """
+        # no process group
+        func = mock.MagicMock()
+        exc = Exception("test exception")
+        func.side_effect = exc
+        expected_exception = "test exception"
+        with self.assertRaisesRegex(Exception, expected_exception):
+            all_gather(data_or_fn=func)
+
+
+class TestCollectiveUtilsCPU(MultiProcessTestCase):
+    """Multi-process broadcast/all_gather over a gloo process group."""
+
+    hw_classification = HardwareClassification.CPU
+
     def setUp(self):
         super().setUp()
         self._spawn_processes()
@@ -40,7 +94,7 @@ class TestCollectiveUtils(MultiProcessTestCase):
         opts._threads = threads
         return opts
 
-    def test_broadcast_result(self) -> None:
+    def test_broadcast_result(self, device) -> None:
         """
         Basic unit test for broadcast using a process group of default world size.
         """
@@ -73,29 +127,7 @@ class TestCollectiveUtils(MultiProcessTestCase):
         else:
             func.assert_not_called()
 
-    def test_broadcast_result_no_pg(self) -> None:
-        """
-        Ensure broadcast has no dependency on torch.distributed when run in single process.
-        """
-        func = mock.MagicMock()
-        broadcast(data_or_fn=func, rank=0)
-        func.assert_called_once()
-
-    def test_broadcast_result_raises_exceptions_from_func(
-        self,
-    ) -> None:
-        """
-        Ensure broadcast exception is propagated properly.
-        """
-        # no process group
-        func = mock.MagicMock()
-        exc = Exception("test exception")
-        func.side_effect = exc
-        expected_exception = "test exception"
-        with self.assertRaisesRegex(Exception, expected_exception):
-            broadcast(data_or_fn=func, rank=0)
-
-    def test_all_gather_result(self) -> None:
+    def test_all_gather_result(self, device) -> None:
         """
         Basic unit test for all_gather using a process group of default world size.
         """
@@ -115,42 +147,27 @@ class TestCollectiveUtils(MultiProcessTestCase):
                 f"Expect res to be list of 0 through {self.world_size} (got {res})"
             )
 
-    def test_all_gather_result_no_pg(self) -> None:
-        """
-        Ensure all_gather has no dependency on torch.distributed when run in single process.
-        """
-        func = mock.MagicMock()
-        all_gather(data_or_fn=func)
-        func.assert_called_once()
 
-    def test_all_gather_result_raises_exceptions_from_func(
-        self,
-    ) -> None:
-        """
-        Ensure all_gather exception is propagated properly.
-        """
-        # no process group
-        func = mock.MagicMock()
-        exc = Exception("test exception")
-        func.side_effect = exc
-        expected_exception = "test exception"
-        with self.assertRaisesRegex(Exception, expected_exception):
-            all_gather(data_or_fn=func)
+class TestCollectiveUtilsDevice(MultiProcessTestCase):
+    """RNG sync checks over a gloo group, with the generator on the device under test."""
 
-    @parametrize("device", ["cpu", "cuda"])
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    def setUp(self):
+        super().setUp()
+        self._spawn_processes()
+
+    def tearDown(self) -> None:
+        super().tearDown()
+
     @skip_if_lt_x_gpu(4)
-    def test_check_rng_sync(
-        self,
-        device,
-    ) -> None:
-        if device == "cuda" and not torch.cuda.is_available():
-            self.skipTest("Cuda is not available")
+    def test_check_rng_sync(self, device) -> None:
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
         )
         group = torch.distributed.distributed_c10d._get_default_group()
-        generator = torch.Generator(device=device)
+        generator = torch.Generator(device=torch.device(device).type)
         generator.manual_seed(123)
         value_ranks, _ = _check_rng_sync_internal(generator, group)
         self.assertEqual(len(value_ranks), 1, value_ranks)
@@ -158,7 +175,7 @@ class TestCollectiveUtils(MultiProcessTestCase):
             self.assertEqual(actual, expected, actual)
 
         if torch.distributed.get_rank() == 1:
-            torch.randn((10,), device=device, generator=generator)
+            torch.randn((10,), device=torch.device(device).type, generator=generator)
         value_ranks, _ = _check_rng_sync_internal(generator, group)
         self.assertEqual(len(value_ranks), 2, value_ranks)
         for actual, expected in zip(value_ranks.values(), [{0, 2, 3}, {1}]):
@@ -178,6 +195,8 @@ class TestCollectiveUtils(MultiProcessTestCase):
 
 
 class TestUtils(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
         super().setUp()
 
@@ -217,7 +236,9 @@ class TestUtils(TestCase):
         )
 
 
-instantiate_parametrized_tests(TestCollectiveUtils)
+instantiate_device_type_tests(TestCollectiveUtilsCPU, globals(), only_for=("cpu",))
+instantiate_device_type_tests(TestCollectiveUtilsDevice, globals())
+
 
 if __name__ == "__main__":
     run_tests()
