@@ -45,6 +45,11 @@ from torch.fx.experimental.symbolic_shapes import (
     statically_known_true,
     SYMPY_INTERP,
 )
+from torch.testing._internal.common_device_type import (
+    Capability,
+    instantiate_device_type_tests,
+    requires_capabilities,
+)
 from torch.testing._internal.common_dtype import all_types_and
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -5425,9 +5430,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         def f(x, start, end):
             return torch.narrow(x, 0, start, end)
 
-        x = torch.tensor(
-            [False], device="cuda:0" if torch.cuda.is_available() else "cpu"
-        )
+        x = torch.tensor([False])
         start = torch.tensor(0)
         res = f(x, start, 0)
         self.assertEqual(res.shape, torch.Size([0]))
@@ -7262,6 +7265,14 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             4,
             lambda msg: f"{msg}\nExpected at least 4 unbacked dims but found {unbacked_count}",
         )
+
+
+instantiate_device_type_tests(
+    TestTransferSymbolsFromForeignShapeEnvDevice,
+    globals(),
+    except_for="cpu",
+    allow_xpu=True,
+)
 
 
 if __name__ == "__main__":
