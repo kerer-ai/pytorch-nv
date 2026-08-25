@@ -15,6 +15,7 @@ if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
     sys.exit(0)
 
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import DistributedTestBase, TEST_SKIPS
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
@@ -46,11 +47,14 @@ def with_comms(func=None):
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
+        device_type = self.device_type
         if torch.get_device_module(device_type).device_count() < self.world_size:
             sys.exit(TEST_SKIPS[f"multi-device-{self.world_size}"].exit_code)
         self.create_pg(device_type)
-        func(self)
-        self.destroy_comms()
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            self.destroy_comms()
 
     return wrapper
 
@@ -69,7 +73,7 @@ class C10dErrorLoggerTest(DistributedTestBase):
 
     @property
     def world_size(self):
-        return WORLD_SIZE
+        return min(4, max(2, torch.get_device_module(self.device_type).device_count()))
 
     @property
     def process_group(self):
@@ -94,7 +98,7 @@ class C10dErrorLoggerTest(DistributedTestBase):
             pass
 
     @with_comms
-    def test_exception_logger(self) -> None:
+    def test_exception_logger(self, device) -> None:
         with self.assertRaises(Exception):
             self._failed_broadcast_raise_exception()
 
@@ -104,8 +108,9 @@ class C10dErrorLoggerTest(DistributedTestBase):
                 re.search("({.+})", captured.output[0]).group(0).replace("'", '"')
             )
 
-            # NCCL adds additional nccl_version data to the error_msg_dict
-            if self.backend(device_type) == dist.Backend.NCCL:
+            # NCCL adds an nccl_version entry; other backends do not, so the
+            # expected key count depends on the active backend.
+            if self.backend(device) == dist.Backend.NCCL:
                 self.assertEqual(len(error_msg_dict), 9)
             else:
                 self.assertEqual(len(error_msg_dict), 8)
@@ -117,9 +122,9 @@ class C10dErrorLoggerTest(DistributedTestBase):
             self.assertEqual("broadcast", error_msg_dict["func_name"])
 
             self.assertIn("backend", error_msg_dict.keys())
-            self.assertEqual(self.backend(device_type), error_msg_dict["backend"])
+            self.assertEqual(self.backend(device), error_msg_dict["backend"])
 
-            if self.backend(device_type) == dist.Backend.NCCL:
+            if self.backend(device) == dist.Backend.NCCL:
                 self.assertIn("nccl_version", error_msg_dict.keys())
                 nccl_ver = torch.cuda.nccl.version()
                 self.assertEqual(
