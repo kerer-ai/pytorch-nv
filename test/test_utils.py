@@ -58,7 +58,11 @@ from torch.utils.data import DataLoader
 # sharding on sandcastle. This line silences flake warnings
 load_tests = load_tests  # noqa: PLW0127
 
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    run_tests,
+    TestCase,
+)
 
 
 # mypy: disable-error-code="name-defined"
@@ -406,6 +410,16 @@ class TestCheckpoint(TestCase):
         self.assertEqual("meta", device_type)
 
 
+class TestCheckpointAccelerator(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @unittest.skipIf(not torch.accelerator.is_available(), "No accelerator")
+    def test_checkpointing_without_reentrant_early_free(self):
+        _acc = torch.accelerator.current_accelerator()
+        if _acc is None:
+            self.skipTest("current_accelerator() not supported")
+
+
 class TestCheckpointDeviceType(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
@@ -474,6 +488,10 @@ class TestCheckpointDeviceType(TestCase):
 
         self.assertEqual(non_retain_stats, checkpoint_non_retain_stats)
         self.assertEqual(non_retain_stats, checkpoint_retain_stats)
+
+
+class TestCheckpointDeviceType(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
 
     @onlyAccelerator
     def test_checkpoint_rng_accelerator(self, device):
@@ -948,6 +966,10 @@ class TestDeviceUtils(TestCase):
         finally:
             torch.set_default_device(None)
 
+
+class TestDeviceModeOps(TestCase):
+    hw_classification = HardwareClassification.CPU
+
     @onlyCPU
     @ops(op_db)
     def test_device_mode_ops(self, device, dtype, op):
@@ -978,7 +1000,8 @@ class TestDeviceUtils(TestCase):
             self.assertTrue(tree_all_only(torch.Tensor, is_meta_device, r))
 
 
-instantiate_device_type_tests(TestDeviceUtils, globals())
+instantiate_device_type_tests(TestDeviceUtilsAccelerator, globals())
+instantiate_device_type_tests(TestDeviceModeOps, globals(), only_for=("cpu",))
 
 
 class TestCppExtensionUtils(TestCase):

@@ -3759,7 +3759,7 @@ class TestCustomPinFn(TestCase):
         self.dataset = TensorDataset(inps, tgts)
 
     @unittest.skipIf(not TEST_PIN_MEMORY, "pin_memory requires accelerator")
-    def test_custom_batch_pin(self):
+    def test_custom_batch_pin(self, device):
         test_cases = [
             (collate_wrapper, self_module.SimpleCustomBatch),
             (collate_into_packed_sequence, torch.nn.utils.rnn.PackedSequence),
@@ -3777,7 +3777,7 @@ class TestCustomPinFn(TestCase):
                 self.assertTrue(sample.is_pinned())
 
     @unittest.skipIf(not TEST_PIN_MEMORY, "pin_memory requires accelerator")
-    def test_custom_batch_pin_worker(self):
+    def test_custom_batch_pin_worker(self, device):
         test_cases = [
             (collate_wrapper, self_module.SimpleCustomBatch),
             (collate_into_packed_sequence, torch.nn.utils.rnn.PackedSequence),
