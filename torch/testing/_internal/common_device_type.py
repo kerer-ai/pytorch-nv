@@ -1252,8 +1252,28 @@ class HPUTestBase(DeviceTypeTestBase):
         return cls.primary_device
 
     @classmethod
+    def get_all_devices(cls):
+        primary_device_idx = int(cls.get_primary_device().split(":")[1])
+        num_devices = cls.device_mod.device_count()
+        prim_device = cls.get_primary_device()
+        device_str = f"{cls.device_type}:{{0}}"
+        non_primary_devices = [
+            device_str.format(idx)
+            for idx in range(num_devices)
+            if idx != primary_device_idx
+        ]
+        return [prim_device] + non_primary_devices
+
+    @classmethod
     def setUpClass(cls):
-        cls.primary_device = "hpu:0"
+        cls.device_type = torch._C._get_privateuse1_backend_name()
+        cls.device_mod = getattr(torch, cls.device_type, None)
+        if cls.device_mod is None:
+            raise AssertionError(
+                f"torch has no module of `{cls.device_type}`, you should register "
+                "a module by `torch._register_device_module`."
+            )
+        cls.primary_device = f"{cls.device_type}:{cls.device_mod.current_device()}"
 
 
 _PRIVATEUSE1_CAPABILITY_PROVIDERS: list[Callable[[], dict]] = []

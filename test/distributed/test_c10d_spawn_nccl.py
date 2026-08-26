@@ -1,7 +1,7 @@
 # Owner(s): ["oncall: distributed"]
 
 
-from test_c10d_spawn import TestDistributedNNFunctions
+from test_c10d_spawn import _torch_dist_nn_available, TestDistributedNNFunctions
 
 import torch
 import torch.distributed as c10d
@@ -10,6 +10,7 @@ from torch.testing._internal.common_distributed import requires_nccl, skip_if_lt
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     run_tests,
+    skip_but_pass_in_sandcastle_if,
     TEST_WITH_DEV_DBG_ASAN,
 )
 

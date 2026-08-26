@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     TEST_XPU,
 )
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 from torch.utils._triton import has_triton
 
 

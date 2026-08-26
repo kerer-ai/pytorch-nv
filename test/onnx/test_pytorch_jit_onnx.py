@@ -215,6 +215,7 @@ def MakeTestCase(opset_version: int, base: type) -> type:
 
 TestJITIRToONNX_opset14 = MakeTestCase(14, _TestJITIRToONNX)
 TestJITIRToONNXCUDA_opset14 = MakeTestCase(14, _TestJITIRToONNXCuda)
+TestJITIRToONNXCUDA_opset14.__name__ = "TestJITIRToONNXCUDA_opset14"
 
 instantiate_device_type_tests(TestJITIRToONNXCUDA_opset14, globals(), only_for=("cuda",))
 

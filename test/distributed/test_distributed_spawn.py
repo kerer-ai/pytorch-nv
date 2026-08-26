@@ -3,6 +3,8 @@
 import os
 import sys
 
+import pytest
+
 
 if os.environ.get("BACKEND") == "nccl":
     os.environ["TORCH_DIST_USE_NCCL2"] = "0"
@@ -53,6 +55,12 @@ if (
     or "WORLD_SIZE" not in os.environ
     or "TEMP_DIR" not in os.environ
 ):
+    if "pytest" in sys.modules:
+        # Collection without the manual-run env vars: nothing to collect here.
+        pytest.skip(
+            "test_distributed_spawn requires BACKEND/WORLD_SIZE/TEMP_DIR env vars",
+            allow_module_level=True,
+        )
     # TODO can we actually have `run_tests.py` emit the complete instructions when it prints a repro command?
     raise RuntimeError(
         "Missing expected env vars for `test_distributed_spawn.py`.  Please ensure to specify the following:\n"

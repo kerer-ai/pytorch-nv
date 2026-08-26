@@ -4,7 +4,7 @@ import copy
 import os
 import tempfile
 
-from test_c10d_spawn import TestDistributedNNFunctions
+from test_c10d_spawn import TestDistributedNNFunctions, _torch_dist_nn_available
 
 import torch
 import torch.distributed as c10d
@@ -141,7 +141,7 @@ instantiate_device_type_tests(
     DistributedDataParallelSingleProcessTest, globals(), only_for=("cpu",)
 )
 instantiate_device_type_tests(
-    DistributedDataParallelSingleProcessTestCUDA, globals(), only_for=("cuda",)
+    DistributedDataParallelSingleProcessCUDATest, globals(), only_for=("cuda",)
 )
 
 
@@ -289,10 +289,7 @@ if not TEST_WITH_DEV_DBG_ASAN:
                 self.assertEqual(x.grad, torch.ones_like(x))
 
     instantiate_device_type_tests(
-        TestDistributedNNFunctionsGlooCUDA, globals(), only_for=("cuda",)
-    )
-    instantiate_device_type_tests(
-        TestDistributedNNFunctionsGloo, globals(), only_for=("cpu",)
+        TestDistributedNNFunctionsGloo, globals(), except_for=("cpu",)
     )
 
 

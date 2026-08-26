@@ -25,6 +25,8 @@ from torch.testing._internal.common_utils import (
     TestCase,
     xfailIfNoAcceleratorTriton,
 )
+from torch.testing._internal.inductor_utils import HAS_GPU
+from torch.testing._internal.triton_utils import requires_cuda_and_triton
 from torch.utils.flop_counter import sdpa_backward_flop_count, sdpa_flop_count
 
 
@@ -817,7 +819,7 @@ class TestFlopCounter(TestCase):
         ]
         self.assertEqual(layer1_conv_flops_standard, layer1_conv_flops_inference)
 
-    @unittest.skipIf(not HAS_CUDA, "CUDA not available")
+    @unittest.skipIf(not HAS_GPU, "GPU not available")
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_FP8,
         "FP8 is only supported on H100+, SM 8.9 and MI300+ devices",

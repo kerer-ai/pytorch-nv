@@ -2,7 +2,7 @@
 
 import inspect
 import io
-from tempfile import TemporaryFileName
+from torch.testing._internal.common_utils import TemporaryFileName
 
 import torch
 import torch.utils.bundled_inputs

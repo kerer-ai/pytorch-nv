@@ -280,7 +280,9 @@ class TestModels(pytorch_test_common.ExportTestCase):
         self.exportTest(r2plus1d_18().to(device), x.to(device), rtol=1e-3, atol=1e-5)
 
 
+_test_models_base_cls = TestModels  # keep for downstream modules (test_models_onnxruntime)
 instantiate_device_type_tests(TestModels, globals())
+TestModels = _test_models_base_cls  # type: ignore[misc]
 
 if __name__ == "__main__":
     common_utils.run_tests()

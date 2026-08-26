@@ -126,7 +126,7 @@ class DistQuantizationTests(MultiProcessTestCase):
 
     @requires_capabilities(Capability.distributed.backend)
     @onlyAccelerator
-    @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
+    @skip_if_lt_x_gpu(int(os.environ.get("WORLD_SIZE", "1")))
     @skip_if_rocm_multiprocess
     def test_all_to_all_fp16(self, device):
         self.device_type = torch.device(device).type
@@ -150,7 +150,7 @@ class DistQuantizationTests(MultiProcessTestCase):
 
     @requires_capabilities(Capability.distributed.backend)
     @onlyAccelerator
-    @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
+    @skip_if_lt_x_gpu(int(os.environ.get("WORLD_SIZE", "1")))
     @skip_if_rocm_multiprocess
     def test_all_to_all_bfp16(self, device):
         self.device_type = torch.device(device).type
@@ -174,7 +174,7 @@ class DistQuantizationTests(MultiProcessTestCase):
 
     @requires_capabilities(Capability.distributed.backend)
     @onlyAccelerator
-    @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
+    @skip_if_lt_x_gpu(int(os.environ.get("WORLD_SIZE", "1")))
     def test_all_to_all_single_fp16(self, device):
         self.device_type = torch.device(device).type
         backend = dist.Backend.default_device_backend_map[self.device_type]
@@ -197,7 +197,7 @@ class DistQuantizationTests(MultiProcessTestCase):
 
     @requires_capabilities(Capability.distributed.backend)
     @onlyAccelerator
-    @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
+    @skip_if_lt_x_gpu(int(os.environ.get("WORLD_SIZE", "1")))
     def test_all_to_all_single_bfp16(self, device):
         self.device_type = torch.device(device).type
         backend = dist.Backend.default_device_backend_map[self.device_type]

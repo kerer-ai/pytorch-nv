@@ -14,6 +14,8 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     build_fake_device_mesh,
+    DeviceMesh,
+    DTensorContinuousTestBase,
 )
 from torch.testing._internal.distributed.fake_pg import FakeStore
 

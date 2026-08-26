@@ -13,7 +13,7 @@ import torch.cuda
 import torch.multiprocessing as mp
 import torch.utils.hooks
 from torch.nn import Parameter
-from torch.testing._internal.common_cuda import IS_JETSON
+from torch.testing._internal.common_cuda import IS_JETSON, skipIfRocmVersionAtLeast
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,

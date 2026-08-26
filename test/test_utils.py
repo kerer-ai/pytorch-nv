@@ -1000,7 +1000,7 @@ class TestDeviceModeOps(TestCase):
             self.assertTrue(tree_all_only(torch.Tensor, is_meta_device, r))
 
 
-instantiate_device_type_tests(TestDeviceUtilsAccelerator, globals())
+instantiate_device_type_tests(TestDeviceUtils, globals())
 instantiate_device_type_tests(TestDeviceModeOps, globals(), only_for=("cpu",))
 
 

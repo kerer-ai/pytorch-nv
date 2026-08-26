@@ -3348,7 +3348,7 @@ class TestExperimentalUtilsCUDA(TestCase):
 
 
 instantiate_device_type_tests(
-    TestExperimentalUtilsDevice, globals(), except_for=("cpu",)
+    TestExperimentalUtilsCUDA, globals(), except_for=("cpu",)
 )
 
 
@@ -4492,7 +4492,7 @@ For a model PR to follow, see: https://github.com/pytorch/pytorch/pull/180100
 
 
 instantiate_device_type_tests(
-    TestProfilerEventsParityCudaOnly, globals(), only_for=("cuda",)
+    TestProfilerEventsParityCUDA, globals(), only_for=("cuda",)
 )
 
 

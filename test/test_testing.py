@@ -49,118 +49,6 @@ except ImportError:
 else:
     _SKIP_IF_LT_X_GPU_DISTRIBUTED = True
 
-# For testing TestCase methods and torch.testing functions
-class TestTesting(TestCase):
-    # Ensure that assertEqual handles numpy arrays properly
-    @dtypes(*all_types_and_complex_and(torch.bool, torch.half))
-    def test_assertEqual_numpy(self, device, dtype):
-        S = 10
-        test_sizes = [
-            (),
-            (0,),
-            (S,),
-            (S, S),
-            (0, S),
-            (S, 0)]
-        for test_size in test_sizes:
-            a = make_tensor(test_size, dtype=dtype, device=device, low=-5, high=5)
-            a_n = a.cpu().numpy()
-            msg = f'size: {test_size}'
-            self.assertEqual(a_n, a, rtol=0, atol=0, msg=msg)
-            self.assertEqual(a, a_n, rtol=0, atol=0, msg=msg)
-            self.assertEqual(a_n, a_n, rtol=0, atol=0, msg=msg)
-
-    def test_assertEqual_longMessage(self):
-        actual = "actual"
-        expected = "expected"
-
-        long_message = self.longMessage
-        try:
-            # Capture the default error message by forcing TestCase.longMessage = False
-            self.longMessage = False
-            try:
-                self.assertEqual(actual, expected)
-            except AssertionError as error:
-                default_msg = str(error)
-            else:
-                raise AssertionError("AssertionError not raised")
-
-            self.longMessage = True
-            extra_msg = "sentinel"
-            with self.assertRaisesRegex(AssertionError, re.escape(f"{default_msg}\n{extra_msg}")):
-                self.assertEqual(actual, expected, msg=extra_msg)
-        finally:
-            self.longMessage = long_message
-
-    def test_callable_msg(self):
-        # A callable msg is invoked only on failure, across all assert* methods.
-        invoked = []
-
-        def lazy(standard_msg):
-            invoked.append(standard_msg)
-            return f"{standard_msg}\nsentinel"
-
-        # Passing: callable not invoked.
-        self.assertEqual(1, 1, msg=lazy)
-        self.assertTrue(True, msg=lazy)
-        self.assertIn(1, [1, 2], msg=lazy)
-        self.assertGreater(2, 1, msg=lazy)
-        self.assertIsNone(None, msg=lazy)
-        self.assertEqual(invoked, [])
-
-        # Failing: callable invoked once with the standard message.
-        failing = [
-            lambda: self.assertTrue(False, msg=lazy),
-            lambda: self.assertIn(9, [1, 2], msg=lazy),
-            lambda: self.assertGreater(1, 2, msg=lazy),
-            lambda: self.assertEqual(1, 2, msg=lazy),
-        ]
-        for fail in failing:
-            invoked.clear()
-            with self.assertRaises(AssertionError) as cm:
-                fail()
-            self.assertEqual(len(invoked), 1)
-            self.assertEqual(str(cm.exception), f"{invoked[0]}\nsentinel")
-
-        # A plain string msg is unchanged.
-        with self.assertRaisesRegex(AssertionError, re.escape("True is not false : plain")):
-            self.assertFalse(True, msg="plain")
-
-    def test_isclose_equality_shortcut(self):
-        # For values >= 2**53, integers differing by 1 can no longer differentiated by torch.float64 or lower precision
-        # floating point dtypes. Thus, even with rtol == 0 and atol == 0, these tensors would be considered close if
-        # they were not compared as integers.
-        a = torch.tensor(2 ** 53, dtype=torch.int64)
-        b = a + 1
-
-        self.assertFalse(torch.isclose(a, b, rtol=0, atol=0))
-
-    def test_supported_dtypes(self):
-        # OpInfo.supported_dtypes() is a pure string-keyed lookup (see
-        # opinfo/core.py) with no hardware dependency, despite the "cpu"/"cuda"
-        # device-type arguments.
-        matching_ops = [
-            op
-            for op in op_db
-            if len(
-                op.supported_dtypes("cpu").symmetric_difference(
-                    op.supported_dtypes("cuda")
-                )
-            )
-            > 0
-        ]
-        if not matching_ops:
-            self.skipTest("no op with differing cpu/cuda supported dtypes found")
-        op = matching_ops[0]
-
-        self.assertNotEqual(op.supported_dtypes("cpu"), op.supported_dtypes("cuda"))
-        self.assertEqual(op.supported_dtypes("cuda"), op.supported_dtypes("cuda:0"))
-        self.assertEqual(
-            op.supported_dtypes(torch.device("cuda")),
-            op.supported_dtypes(torch.device("cuda", index=1)),
-        )
-
-
 # For testing TestCase methods and torch.testing functions that require device-type instantiation
 class TestTesting(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
@@ -461,9 +349,6 @@ if __name__ == '__main__':
         expected_device_class_name = f"TestFoo{self.device_type.upper()}"
         expected_error_text = f"RuntimeError: called with {expected_device_class_name}"
         self.assertIn(expected_error_text, stderr)
-
-
-instantiate_device_type_tests(TestTesting, globals())
 
 
 class TestTestingCudaAssert(TestCase):

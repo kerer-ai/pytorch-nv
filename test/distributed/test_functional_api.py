@@ -37,6 +37,7 @@ from torch.testing._internal.common_utils import (
     TEST_WITH_ROCM,
     TestCase,
 )
+from torch.testing._internal.inductor_utils import HAS_GPU
 
 
 # DEVICE = the accelerator used by comms-requiring tests (falls back to "cpu"

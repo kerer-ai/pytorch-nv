@@ -1,7 +1,14 @@
 # Owner(s): ["oncall: mobile"]
 
 import torch
-from test.jit.fixtures_srcs.generate_models import ALL_MODULES
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    from generate_models import ALL_MODULES
+finally:
+    sys.path.pop(0)
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 

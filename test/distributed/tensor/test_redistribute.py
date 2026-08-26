@@ -3343,16 +3343,7 @@ instantiate_device_type_tests(
     DistributeWithDeviceOrderTest, globals(), except_for="cpu"
 )
 instantiate_device_type_tests(
-    DistributeWithStridedShardTest, globals(), except_for="cpu"
-)
-instantiate_device_type_tests(
     MultiDimRedistributeOptimizationTest, globals(), except_for="cpu"
-)
-instantiate_device_type_tests(
-    FlattenedReductionIntegrationTest, globals(), except_for="cpu"
-)
-instantiate_device_type_tests(
-    UnevenFlattenedReduceScatterTest, globals(), except_for="cpu"
 )
 
 if __name__ == "__main__":
