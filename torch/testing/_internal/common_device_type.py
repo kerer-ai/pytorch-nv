@@ -379,6 +379,12 @@ class Capability:
 
         generic = "stream.generic"
 
+    class collective:
+        """Collective communication capabilities (reconfigure, etc.)."""
+
+        reconfigure = "collective.reconfigure"
+        work_result = "collective.work_result"
+
 
 def _check_capabilities(test_case, required_capabilities) -> None:
     device_caps = type(test_case).get_capabilities()
@@ -456,6 +462,18 @@ class DeviceTypeTestBase(TestCase):
     # Keys are OpInfo.full_name (e.g. "add", "mul", "linalg.norm").
     # If None (default), all ops in the @ops decorator's op_list generate variants.
     op_allowlist = None  # type: Optional[Collection[str]]
+
+    # Decorators and skips to apply to tests that are parametrized by modules.
+    # Keys are ModuleInfo.name (e.g. "nn.Linear", "nn.Conv2d"). Unlike OpInfo,
+    # ModuleInfo has no variant concept, so there is no "full_name" distinction.
+    module_overrides = None  # type: Optional[dict[str, list[DecorateInfo]]]
+
+    # An optional mechanism to limit which modules generate test variants.
+    # When set, only modules whose name is in this collection will generate tests.
+    # Keys are ModuleInfo.name (e.g. "nn.Linear", "nn.Conv2d").
+    # If None (default), all modules in the @modules decorator's module_info_list
+    # generate variants.
+    module_allowlist = None  # type: Optional[Collection[str]]
 
     # An optional skip mechanism built upon instantiate_device_type_tests(),
     # designed to filter generated tests at different granularities.
@@ -672,6 +690,37 @@ class DeviceTypeTestBase(TestCase):
 
         supported_set = set(cls.op_allowlist)
         ops.op_list = [op for op in ops.op_list if op.full_name in supported_set]
+
+    @classmethod
+    def _apply_module_overrides(cls, module_info_list):
+        """Applies module_overrides decorators to the matching ModuleInfo entries."""
+        class_overrides = cls.module_overrides or {}
+        if not class_overrides:
+            return module_info_list
+        module_dict = {m.name: m for m in module_info_list}
+        for name, decorators in class_overrides.items():
+            for decorator in decorators:
+                decorator.device_type = cls.device_type
+                if name in module_dict:
+                    module_dict[name].decorators += (decorator,)
+        return module_info_list
+
+    @classmethod
+    def _apply_module_allowlist(cls, module_info_list):
+        """Filters module_info_list to only include modules in module_allowlist.
+
+        If module_allowlist is None (default), no filtering is applied.
+        If module_allowlist is set, only modules whose name is in the collection
+        will generate test variants.
+
+        Args:
+            module_info_list: The list of ModuleInfo entries to filter.
+        """
+        if cls.module_allowlist is None:
+            return module_info_list
+
+        supported_set = set(cls.module_allowlist)
+        return [m for m in module_info_list if m.name in supported_set]
 
     @classmethod
     def _init_and_get_primary_device(cls):
@@ -1207,6 +1256,19 @@ class HPUTestBase(DeviceTypeTestBase):
         cls.primary_device = "hpu:0"
 
 
+_PRIVATEUSE1_CAPABILITY_PROVIDERS: list[Callable[[], dict]] = []
+
+
+def register_privateuse1_capabilities(provider: Callable[[], dict]) -> None:
+    """Register a capability provider for the privateuse1 backend.
+
+    Out-of-tree backends (e.g. torch_npu) call this at import time to declare
+    which capabilities their device supports, instead of subclassing
+    PrivateUse1TestBase.
+    """
+    _PRIVATEUSE1_CAPABILITY_PROVIDERS.append(provider)
+
+
 class PrivateUse1TestBase(DeviceTypeTestBase):
     primary_device: ClassVar[str]
     device_mod = None
@@ -1216,6 +1278,8 @@ class PrivateUse1TestBase(DeviceTypeTestBase):
     @classmethod
     def _capabilities(cls):
         capabilities = super()._capabilities()
+        for provider in _PRIVATEUSE1_CAPABILITY_PROVIDERS:
+            capabilities.update(provider())
         device_type = torch._C._get_privateuse1_backend_name()
         capabilities.update(
             {

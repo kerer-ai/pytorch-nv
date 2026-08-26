@@ -14,6 +14,7 @@ import re
 import tempfile
 import threading
 from abc import ABC, abstractmethod
+from enum import auto, Enum
 from itertools import chain
 from typing import Any, cast, ClassVar, Generic, NamedTuple, TYPE_CHECKING
 from typing_extensions import Self, TypeVar
