@@ -150,12 +150,9 @@ class TimeoutTest(test_c10d_common.AbstractTimeoutTest, TestCase):
         self._test_default_store_timeout("ucc")
 
 
-class ProcessGroupUCCTest(MultiProcessTestCase):
-    hw_classification = HardwareClassification.GENERIC
-
-    def _create_process_group_ucc(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        return c10d.ProcessGroupUCC(store, self.rank, self.world_size)
+class ProcessGroupUCCTest(MultiProcContinuousTest):
+    hw_classification = HardwareClassification.CPU
+    world_size = DEFAULT_WORLD_SIZE
 
     @classmethod
     def backend_str(cls) -> str:
@@ -362,12 +359,12 @@ class ProcessGroupUCCTest(MultiProcessTestCase):
         self._test_reduce_scatter_base_basics(lambda t: t.clone())
 
 
-class _DistributedDataParallelTestBase(MultiProcessTestCase):
-    """Shared setup and helpers for UCC DDP test classes."""
-
-    def setUp(self):
-        super().setUp()
-        self._spawn_processes()
+class _DistributedDataParallelTestBase(
+    test_c10d_common.CommonDistributedDataParallelTest, MultiProcContinuousTest
+):
+    @classmethod
+    def backend_str(cls) -> str:
+        return "ucc"
 
     def _get_process_group(self):
         store = c10d.FileStore(self.rdvz_file, self.world_size)
@@ -493,7 +490,6 @@ class _DistributedDataParallelTestBase(MultiProcessTestCase):
         self, process_group, hook=None, gradient_as_bucket_view=False, state=None
     ):
         device_id = gpus_for_rank(self.world_size)[self.rank][0]
-        dev = torch.device(self.device_type, device_id)
         gpu_model = DistributedDataParallel(
             ModuleForDdpCommHook().to(device_id),
             device_ids=[device_id],
@@ -640,6 +636,55 @@ class DistributedDataParallelTest(
         # without the comm_hook, result would be 0.25 * torch.ones(2, 2).
         self._run_and_verify_hook(cpu_model, 8, 2 * torch.ones(2, 2))
 
+
+    @skip_but_pass_in_sandcastle("backward pass: input tensor has to be dense")
+    @requires_ucc()
+    def test_ddp_comm_hook_sparse_gradients(self):
+        """
+        Runs "test_sparse_gradients" unit test with DDP communication hook. We define a
+        simple hook that does allreduce and works with ucc backend for this test.
+        """
+        process_group = self._get_process_group()
+
+        # Ensure initialized weights and inputs are identical across processes
+        torch.manual_seed(1337)
+
+        vanilla_model = SparseGradientModule()
+        ddp_model = DistributedDataParallel(
+            copy.deepcopy(vanilla_model),
+            process_group=process_group,
+        )
+
+        def allreduce_hook_ucc(
+            state: object, bucket: dist.GradBucket
+        ) -> torch.futures.Future[torch.Tensor]:
+            def div_by_world_size(fut):
+                # Divide the result by 2 * world_size.
+                return fut.wait()[0] / self.world_size
+
+            # Prepare allreduced grad bucket tensors by running an async work.
+            fut = process_group.allreduce([bucket.buffer()]).get_future()
+            return fut.then(div_by_world_size)
+
+        ddp_model.register_comm_hook(None, allreduce_hook_ucc)
+
+
+class DistributedDataParallelUccCommHookValidationTest(MultiProcContinuousTest):
+    hw_classification = HardwareClassification.CPU
+    world_size = DEFAULT_WORLD_SIZE
+
+    @classmethod
+    def backend_str(cls) -> str:
+        return "ucc"
+
+    def _get_process_group(self):
+        store = c10d.FileStore(self.rdvz_file, self.world_size)
+        c10d.init_process_group(
+            "ucc", store=store, rank=self.rank, world_size=self.world_size
+        )
+        return c10d.distributed_c10d._get_default_group()
+
+
     @requires_ucc()
     def test_ddp_invalid_comm_hook_init(self):
         """
@@ -711,6 +756,7 @@ class DistributedDataParallelTest(
             # Run backward
             output.mean().backward()
 
+
     @requires_ucc()
     def test_ddp_comm_hook_register_just_once(self):
         """
@@ -738,37 +784,6 @@ class DistributedDataParallelTest(
 
     # TODO: backward pass: input tensor must be dense
 
-    @skip_but_pass_in_sandcastle("backward pass: input tensor has to be dense")
-    @requires_ucc()
-    def test_ddp_comm_hook_sparse_gradients(self):
-        """
-        Runs "test_sparse_gradients" unit test with DDP communication hook. We define a
-        simple hook that does allreduce and works with ucc backend for this test.
-        """
-        process_group = self._get_process_group()
-
-        # Ensure initialized weights and inputs are identical across processes
-        torch.manual_seed(1337)
-
-        vanilla_model = SparseGradientModule()
-        ddp_model = DistributedDataParallel(
-            copy.deepcopy(vanilla_model),
-            process_group=process_group,
-        )
-
-        def allreduce_hook_ucc(
-            state: object, bucket: dist.GradBucket
-        ) -> torch.futures.Future[torch.Tensor]:
-            def div_by_world_size(fut):
-                # Divide the result by 2 * world_size.
-                return fut.wait()[0] / self.world_size
-
-            # Prepare allreduced grad bucket tensors by running an async work.
-            fut = process_group.allreduce([bucket.buffer()]).get_future()
-            return fut.then(div_by_world_size)
-
-        ddp_model.register_comm_hook(None, allreduce_hook_ucc)
-
 class CommTest(test_c10d_common.AbstractCommTest, MultiProcContinuousTest):
     hw_classification = HardwareClassification.ACCELERATOR
 
@@ -776,7 +791,83 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcContinuousTest):
     def backend_str(cls) -> str:
         return "ucc"
 
-class DistributedDataParallelCudaTest(_DistributedDataParallelTestBase):
+    @skip_but_pass_in_sandcastle("Fails on M60")
+    @requires_ucc()
+    def test_ucc_barrier_device_ids(self):
+        store = c10d.FileStore(self.file_name, self.world_size)
+        c10d.init_process_group(
+            backend="ucc", rank=self.rank, world_size=self.world_size, store=store
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "device_ids not supported"):
+            c10d.barrier(device_ids=[self.rank])
+
+    @requires_ucc()
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    def test_sequence_num_set_default_pg_ucc(self, device):
+        self._test_sequence_num_set_default_pg(backend="ucc")
+
+    @requires_ucc()
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    def test_sequence_num_set_ucc_new_group(self, device):
+        self._test_sequence_num_set_new_group(backend="ucc")
+
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    @requires_ucc()
+    def test_sequence_num_incremented_ucc_default(self, device):
+        self._test_sequence_num_incremented_default_group("ucc")
+
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 4,
+        "test requires 4+ accelerators",
+    )
+    @requires_ucc()
+    def test_sequence_num_incremented_ucc_subgroup(self, device):
+        if self.world_size < 4:
+            return skip_but_pass_in_sandcastle("Test requires world_size of at least 4")
+        self._test_sequence_num_incremented_subgroup("ucc")
+
+    @skip_but_pass_in_sandcastle("Fails on M60")
+    @skip_if_lt_x_gpu(2)
+    @requires_ucc()
+    def test_ucc_warn_not_in_group(self, device):
+        self._test_warn_not_in_group(backend="ucc")
+
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    @requires_ucc()
+    def test_ucc_rank_membership(self, device):
+        self._test_rank_membership(backend="ucc")
+
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    @requires_ucc()
+    def test_tensor_dtype_mismatch(self, device):
+        self._test_tensor_dtype_mismatch(backend="ucc")
+
+    @skip_but_pass_in_sandcastle_if(
+        torch.accelerator.device_count() < 2,
+        "test requires 2+ accelerators",
+    )
+    @requires_ucc()
+    def test_tensor_dtype_complex(self, device):
+        self._test_tensor_dtype_complex(backend="ucc")
+
+
+class DistributedDataParallelCUDATest(_DistributedDataParallelTestBase):
     hw_classification = HardwareClassification.CUDA
 
     @requires_ucc()
@@ -1012,108 +1103,6 @@ class DistributedDataParallelCudaTest(_DistributedDataParallelTestBase):
         # check whether the grads are equal to what simple_hook's then callback returns.
         # without the comm_hook, result would be 0.25 * torch.ones(2, 2).
         self._run_and_verify_hook(gpu_model, 8, 2 * torch.ones(2, 2))
-
-
-class _CommTestBase(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
-    """Shared setup and helpers for UCC Comm test classes."""
-
-    @property
-    def device(self) -> str:
-        return "cpu"
-
-    def setUp(self):
-        super().setUp()
-        self._spawn_processes()
-
-    def tearDown(self):
-        super().tearDown()
-        try:
-            os.remove(self.file_name)
-        except OSError:
-            pass
-
-
-class CommTest(_CommTestBase):
-    hw_classification = HardwareClassification.GENERIC
-
-    @skip_but_pass_in_sandcastle("Fails on M60")
-    @requires_ucc()
-    def test_ucc_barrier_device_ids(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        c10d.init_process_group(
-            backend="ucc", rank=self.rank, world_size=self.world_size, store=store
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "device_ids not supported"):
-            c10d.barrier(device_ids=[self.rank])
-
-
-class CommCudaTest(_CommTestBase):
-    hw_classification = HardwareClassification.CUDA
-
-    @requires_ucc()
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    def test_sequence_num_set_default_pg_ucc(self, device):
-        self._test_sequence_num_set_default_pg(backend="ucc")
-
-    @requires_ucc()
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    def test_sequence_num_set_ucc_new_group(self, device):
-        self._test_sequence_num_set_new_group(backend="ucc")
-
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    @requires_ucc()
-    def test_sequence_num_incremented_ucc_default(self, device):
-        self._test_sequence_num_incremented_default_group("ucc")
-
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 4,
-        "test requires 4+ accelerators",
-    )
-    @requires_ucc()
-    def test_sequence_num_incremented_ucc_subgroup(self, device):
-        if self.world_size < 4:
-            return skip_but_pass_in_sandcastle("Test requires world_size of at least 4")
-        self._test_sequence_num_incremented_subgroup("ucc")
-
-    @skip_but_pass_in_sandcastle("Fails on M60")
-    @skip_if_lt_x_gpu(2)
-    @requires_ucc()
-    def test_ucc_warn_not_in_group(self, device):
-        self._test_warn_not_in_group(backend="ucc")
-
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    @requires_ucc()
-    def test_ucc_rank_membership(self, device):
-        self._test_rank_membership(backend="ucc")
-
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    @requires_ucc()
-    def test_tensor_dtype_mismatch(self, device):
-        self._test_tensor_dtype_mismatch(backend="ucc")
-
-    @skip_but_pass_in_sandcastle_if(
-        torch.accelerator.device_count() < 2,
-        "test requires 2+ accelerators",
-    )
-    @requires_ucc()
-    def test_tensor_dtype_complex(self, device):
-        self._test_tensor_dtype_complex(backend="ucc")
 
 
 class UccProcessGroupWithDispatchedCollectivesTests(

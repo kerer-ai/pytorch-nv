@@ -403,21 +403,10 @@ class TestCheckpoint(TestCase):
         ):
             out = checkpoint(run_fn2, input_var, input_var2, use_reentrant=True)
             out.sum().backward()
-
     def test_infer_device_state_recursive_meta(self):
         inp = {"foo": torch.rand(10, device="meta")}
         device_type = _infer_device_type(inp)
         self.assertEqual("meta", device_type)
-
-
-class TestCheckpointAccelerator(TestCase):
-    hw_classification = HardwareClassification.ACCELERATOR
-
-    @unittest.skipIf(not torch.accelerator.is_available(), "No accelerator")
-    def test_checkpointing_without_reentrant_early_free(self):
-        _acc = torch.accelerator.current_accelerator()
-        if _acc is None:
-            self.skipTest("current_accelerator() not supported")
 
 
 class TestCheckpointDeviceType(TestCase):
@@ -488,10 +477,6 @@ class TestCheckpointDeviceType(TestCase):
 
         self.assertEqual(non_retain_stats, checkpoint_non_retain_stats)
         self.assertEqual(non_retain_stats, checkpoint_retain_stats)
-
-
-class TestCheckpointDeviceType(TestCase):
-    hw_classification = HardwareClassification.ACCELERATOR
 
     @onlyAccelerator
     def test_checkpoint_rng_accelerator(self, device):
@@ -1127,7 +1112,7 @@ class TestTryImport(TestCase):
 
 
 class TestUtilsInternal(TestCase):
-    hw_classification = HardwareClassification.GENERIC
+    hw_classification = HardwareClassification.CUDA
 
     def test_max_clock_rate_falls_back_to_pynvml_when_nvidia_smi_missing(self):
         def nvsmi(_query):

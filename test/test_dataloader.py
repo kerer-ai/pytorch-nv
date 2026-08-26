@@ -4050,6 +4050,7 @@ class TestOutOfOrderDataLoader(TestCase):
 
 
 instantiate_device_type_tests(TestDataLoaderDevice, globals(), allow_xpu=True)
+instantiate_device_type_tests(TestCustomPinFn, globals(), except_for=["cpu"])
 
 
 if __name__ == "__main__":

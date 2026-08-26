@@ -2036,31 +2036,6 @@ class ProcessGroupGlooTest(_ProcessGroupGlooBase):
         self._test_alltoall_multidim(lambda t: t.clone())
 
 
-class ProcessGroupGlooCudaTest(_ProcessGroupGlooBase):
-    hw_classification = HardwareClassification.CUDA
-
-    @skip_if_lt_x_gpu(2)
-    @requires_gloo()
-    def test_broadcast_basics_cuda(self):
-        self._test_broadcast_basics(lambda t: t.clone().cuda())
-
-    @requires_gloo()
-    def test_alltoall_stress(self):
-        inputs = [
-            [torch.tensor([i * self.world_size + j]) for j in range(self.world_size)]
-            for i in range(1000)
-        ]
-        self._test_alltoall_stress(inputs, lambda t: t.clone())
-
-    @requires_gloo()
-    def test_alltoall_data_routing(self):
-        self._test_alltoall_data_routing(lambda t: t.clone())
-
-    @requires_gloo()
-    def test_alltoall_multidim(self):
-        self._test_alltoall_multidim(lambda t: t.clone())
-
-
 class ProcessGroupGlooTestCUDA(_ProcessGroupGlooBase):
     hw_classification = HardwareClassification.CUDA
 
@@ -3748,30 +3723,6 @@ class CommTestCUDA(CommTestBase):
         self.assertEqual(options.group_name, child.group_name)
         self.assertEqual(options.global_ranks_in_group, ranks)
         c10d.destroy_process_group()
-
-
-class CommCudaTest(_ProcessGroupGlooBase):
-    hw_classification = HardwareClassification.CUDA
-
-    @requires_gloo()
-    @skip_if_lt_x_gpu(2)
-    def test_broadcast_coalesced_gloo_cuda(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        c10d.init_process_group(
-            backend="gloo", store=store, rank=self.rank, world_size=self.world_size
-        )
-        process_group = c10d.distributed_c10d._get_default_group()
-        device = torch.device(f"cuda:{self.rank:d}")
-        backend = process_group._get_backend(device)
-        backend.create_device(interface=LOOPBACK)
-        ranks = list(range(self.world_size))
-        for root_rank in ranks:
-            self._test_broadcast_coalesced(process_group, device, root_rank)
-
-    @skip_if_lt_x_gpu(2)
-    @requires_gloo()
-    def test_gloo_warn_not_in_group(self):
-        self._test_warn_not_in_group(backend="gloo")
 
 
 class GlooProcessGroupWithDispatchedCollectivesTests(
