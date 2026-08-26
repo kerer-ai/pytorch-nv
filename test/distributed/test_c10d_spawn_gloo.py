@@ -148,7 +148,7 @@ instantiate_device_type_tests(
 # Skip dev-asan as torch + multiprocessing spawn have known issues
 if not TEST_WITH_DEV_DBG_ASAN:
 
-    class TestDistributedNNFunctionsGloo(TestDistributedNNFunctions):
+    class TestDistributedNNFunctionsGlooCUDA(TestDistributedNNFunctions):
         hw_classification = HardwareClassification.CUDA
 
         # Test Common Ops First.
@@ -289,7 +289,10 @@ if not TEST_WITH_DEV_DBG_ASAN:
                 self.assertEqual(x.grad, torch.ones_like(x))
 
     instantiate_device_type_tests(
-        TestDistributedNNFunctionsGloo, globals(), except_for=("cpu",)
+        TestDistributedNNFunctionsGlooCUDA, globals(), only_for=("cuda",)
+    )
+    instantiate_device_type_tests(
+        TestDistributedNNFunctionsGloo, globals(), only_for=("cpu",)
     )
 
 
