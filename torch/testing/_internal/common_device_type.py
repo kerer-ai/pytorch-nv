@@ -552,6 +552,33 @@ class DeviceTypeTestBase(TestCase):
 
         super().setUp()
 
+    # An optional mechanism to set per-dtype precision overrides (atol only) for
+    # tests parametrized by @dtypes. Mirrors the @precisionOverride decorator but
+    # settable by out-of-tree backends via set_test_configs().
+    #
+    # Format:
+    #   precision_overrides = {
+    #       "TestClassName": {
+    #           "test_method": {torch.float32: 1e-2},
+    #           "*": {torch.float16: 1e-1},
+    #       },
+    #   }
+    precision_overrides = None  # type: Optional[dict[str, dict[str, dict[torch.dtype, float]]]]
+
+    # An optional mechanism to set per-dtype tolerance overrides (atol + rtol) for
+    # tests parametrized by @dtypes. Mirrors the @toleranceOverride decorator but
+    # settable by out-of-tree backends via set_test_configs().
+    #
+    # Takes precedence over precision_overrides when both match the same test+dtype.
+    #
+    # Format:
+    #   tolerance_overrides = {
+    #       "TestClassName": {
+    #           "test_method": {torch.float32: tol(atol=1e-2, rtol=1e-3)},
+    #       },
+    #   }
+    tolerance_overrides = None  # type: Optional[dict[str, dict[str, dict[torch.dtype, tol]]]]
+
     # Flag to disable test suite early due to unrecoverable error such as CUDA error.
     _stop_test_suite = False
 
@@ -803,6 +830,43 @@ class DeviceTypeTestBase(TestCase):
             self.precision, self.rel_tol = self._get_tolerance_override(test, dtype)
 
     @classmethod
+    def _bake_class_level_overrides(cls, test, generic_cls, param_kwargs):
+        """Bake class-level tolerance/precision overrides into test function attrs."""
+
+        if generic_cls is None:
+            return
+
+        dtype = param_kwargs.get("dtypes", param_kwargs.get("dtype"))
+        if not dtype or isinstance(dtype, (list, tuple)):
+            return
+
+        def _resolve_class_override(key):
+            class_overrides = getattr(cls, key)
+            if class_overrides is None:
+                return None
+            test_overrides = class_overrides.get(generic_cls.__name__)
+            if test_overrides is None:
+                return None
+            for override_key in (test.__name__, "*"):
+                dtype_overrides = test_overrides.get(override_key)
+                if dtype_overrides is not None:
+                    override = dtype_overrides.get(dtype)
+                    if override is not None:
+                        return override
+            return None
+
+        for key in ("tolerance_overrides", "precision_overrides"):
+            test_overrides = getattr(test, key, None)
+            # class-level overrides should not overwrite test-level overrides
+            if test_overrides is not None and test_overrides.get(dtype) is not None:
+                continue
+            override = _resolve_class_override(key)
+            if override is not None:
+                if test_overrides is None:
+                    setattr(test, key, {})
+                getattr(test, key)[dtype] = override
+
+    @classmethod
     def set_test_configs(
         cls,
         *,
@@ -811,6 +875,8 @@ class DeviceTypeTestBase(TestCase):
         module_overrides=None,
         module_allowlist=None,
         test_exclusions=None,
+        tolerance_overrides=None,
+        precision_overrides=None,
     ):
         """
         Sets or resets the test configuration fields.
@@ -825,12 +891,20 @@ class DeviceTypeTestBase(TestCase):
         cls.module_overrides = module_overrides
         cls.module_allowlist = module_allowlist
         cls.test_exclusions = test_exclusions
+        cls.tolerance_overrides = tolerance_overrides
+        cls.precision_overrides = precision_overrides
 
     # Creates device-specific tests.
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
         def instantiate_test_helper(
-            cls, name, *, test, param_kwargs=None, decorator_fn=lambda _: []
+            cls,
+            name,
+            *,
+            test,
+            param_kwargs=None,
+            decorator_fn=lambda _: [],
+            generic_cls=None,
         ):
             # Add the device param kwarg if the test needs device or devices.
             param_kwargs = {} if param_kwargs is None else param_kwargs
@@ -844,6 +918,10 @@ class DeviceTypeTestBase(TestCase):
             # Apply decorators based on param kwargs.
             for decorator in decorator_fn(param_kwargs):
                 test = decorator(test)
+
+            # Bake class-level tolerance/precision overrides (set via
+            # set_test_configs) into the test function
+            cls._bake_class_level_overrides(test, generic_cls, param_kwargs)
 
             # Constructs the test
             @wraps(test)
@@ -955,6 +1033,7 @@ class DeviceTypeTestBase(TestCase):
                 test=test,
                 param_kwargs=param_kwargs,
                 decorator_fn=decorator_fn,
+                generic_cls=generic_cls,
             )
 
     def run(self, result=None):
