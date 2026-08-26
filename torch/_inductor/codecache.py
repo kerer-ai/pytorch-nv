@@ -214,7 +214,7 @@ log = logging.getLogger(__name__)
 AOTAUTOGRAD_CACHE_PREFIX = "a"
 
 
-def _device_constructor_sort_key(target: Any) -> str:
+def _device_constructor_sort_key(target: object) -> str:
     return ".".join(
         x
         for x in (
@@ -769,7 +769,7 @@ class FxGraphCachePickler(pickle.Pickler):
         self.fast = True
 
     # pyrefly: ignore [bad-override]
-    def reducer_override(self, obj: Any) -> Any:
+    def reducer_override(self, obj: object) -> Any:
         """Fallback reducer for objects not registered in dispatch_table.
 
         This handles extension types (e.g. pybind11 enums) that don't support
@@ -805,7 +805,9 @@ class FxGraphCachePickler(pickle.Pickler):
         return result
 
     @staticmethod
-    def _reduce_unpicklable(obj: Any) -> Any:
+    def _reduce_unpicklable(
+        obj: object,
+    ) -> tuple[Callable[[str], NoReturn], tuple[str]]:
         key = _get_stable_obj_key(obj)
         if key is None:
             raise BypassFxGraphCache(
@@ -882,7 +884,7 @@ class FxGraphCachePickler(pickle.Pickler):
         # hashing.  Guards ensure correctness on cache reload.
         return (_ident, (str(s),))
 
-    def _reduce_unsupported(self, s: Any) -> NoReturn:
+    def _reduce_unsupported(self, s: object) -> NoReturn:
         """
         Custom reducer to handle any objects that we don't support and therefore
         raise to bypass caching.
@@ -929,7 +931,7 @@ class FxGraphCachePickler(pickle.Pickler):
                 self.fast = False
         return (_ident, (t.wrapped_obj, t.script_class_name, t.real_obj))
 
-    def dumps(self, obj: Any) -> bytes:
+    def dumps(self, obj: object) -> bytes:
         """
         Pickle an object and return a byte string.
         """
@@ -949,14 +951,14 @@ class FxGraphCachePickler(pickle.Pickler):
             self._stream.seek(0)
             self._stream.truncate(0)
 
-    def get_hash(self, obj: Any) -> str:
+    def get_hash(self, obj: object) -> str:
         """
         Serialize an object and return a hash of the bytes.
         """
         serialized_data = self.dumps(obj)
         return COMPACT_CACHE_KEY_STRATEGY.key(serialized_data)
 
-    def get_key(self, obj: Any) -> str:
+    def get_key(self, obj: object) -> str:
         """
         Serialize an object and return an FX graph cache key.
         """
@@ -970,7 +972,7 @@ class FxGraphCachePickler(pickle.Pickler):
         to a different value than another.
         """
 
-        def get_str(obj: Any) -> str:
+        def get_str(obj: object) -> str:
             if isinstance(obj, torch.Tensor):
                 return str(extract_tensor_metadata_for_cache_key(obj))
             elif isinstance(obj, bytes):
@@ -1235,7 +1237,7 @@ class CacheabilityValidator:
 
     def _check_cache_key_object(
         self,
-        obj: Any,
+        obj: object,
         seen: set[int] | None = None,  # noqa: set_linter
     ) -> None:
         if seen is None:
@@ -1263,11 +1265,11 @@ class CacheabilityValidator:
 _warned_pre_grad_pass_missing_uuid: OrderedSet[str] = OrderedSet()
 
 
-def _custom_pass_has_uuid(custom_pass: Any) -> bool:
+def _custom_pass_has_uuid(custom_pass: object) -> bool:
     return isinstance(custom_pass, CustomGraphPass) and custom_pass.uuid() is not None
 
 
-def _custom_pass_name(custom_pass: Any) -> str:
+def _custom_pass_name(custom_pass: object) -> str:
     return getattr(custom_pass, "__qualname__", None) or type(custom_pass).__qualname__
 
 
@@ -1408,7 +1410,7 @@ class FxGraphHashDetails:
     )
 
     @classmethod
-    def _contains_tensor(cls, value: Any) -> bool:
+    def _contains_tensor(cls, value: object) -> bool:
         if isinstance(value, torch.Tensor):
             return True
         if isinstance(value, (list, tuple, OrderedSet, frozenset)):
@@ -1421,7 +1423,7 @@ class FxGraphHashDetails:
         return False
 
     @classmethod
-    def _contains_cpu_tensor(cls, value: Any) -> bool:
+    def _contains_cpu_tensor(cls, value: object) -> bool:
         if isinstance(value, torch.Tensor):
             return value.device.type == "cpu"
         if isinstance(value, (list, tuple, OrderedSet, frozenset)):
@@ -1434,7 +1436,7 @@ class FxGraphHashDetails:
         return False
 
     @staticmethod
-    def _device_type(value: Any) -> str | None:
+    def _device_type(value: object) -> str | None:
         if isinstance(value, torch.device):
             return value.type
         if isinstance(value, str):
@@ -1446,7 +1448,7 @@ class FxGraphHashDetails:
 
     @classmethod
     def _is_factory_target(
-        cls, target: Any, targets: tuple[Any, ...], packets: tuple[Any, ...]
+        cls, target: object, targets: tuple[object, ...], packets: tuple[object, ...]
     ) -> bool:
         if target in targets or target in packets:
             return True

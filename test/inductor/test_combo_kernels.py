@@ -33,7 +33,11 @@ from torch.testing._internal.common_utils import (
     skipIfXpu,
     TestCase,
 )
-from torch.testing._internal.inductor_utils import requires_triton
+from torch.testing._internal.inductor_utils import GPU_TYPE, requires_triton
+from torch.testing._internal.triton_utils import (
+    requires_cuda_and_triton,
+    requires_gpu_and_triton,
+)
 from torch.utils._ordered_set import OrderedSet
 
 
@@ -354,6 +358,71 @@ class ComboKernelTests(TestCase):
         out_compiled = torch.compile(test_activations)(*inps)
 
         self.assertEqual(out_eager, out_compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_cuda_and_triton
+    @parametrize("bias_kind", ("causal", "alibi"))
+    def test_source_independent_masks_stay_local(self, bias_kind):
+        def make_bias(q):
+            size = q.shape[-2]
+            index = torch.arange(size, device=GPU_TYPE)
+            if bias_kind == "alibi":
+                num_heads = q.shape[-3]
+                head = torch.arange(num_heads, device=GPU_TYPE)
+                slopes = torch.exp2(-((head + 1) * 8.0 / num_heads))
+                relative_position = index[None, :] - index[:, None]
+                return (slopes[:, None, None] * relative_position[None, :, :]).to(
+                    q.dtype
+                )
+            causal = index[:, None] >= index[None, :]
+            return torch.where(causal, 0.0, float("-inf")).to(q.dtype)
+
+        def fn(q1, k1, v1, q2, k2, v2):
+            first = torch.nn.functional.scaled_dot_product_attention(
+                q1, k1, v1, attn_mask=make_bias(q1)
+            )
+            second = torch.nn.functional.scaled_dot_product_attention(
+                q2, k2, v2, attn_mask=make_bias(q2)
+            )
+            return first, second
+
+        inps = []
+        for num_heads, size in ((4, 96), (8, 128)):
+            inps.extend(
+                torch.rand(1, num_heads, size, 32, device=GPU_TYPE, dtype=torch.float16)
+                for _ in range(3)
+            )
+        with fresh_cache():
+            _, code = run_and_get_code(torch.compile(fn), *inps)
+
+        source = "\n".join(code)
+        aoti_sdpa = "AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_cuda__scaled_dot_product_"
+        events = []
+        for line in source.splitlines():
+            line = line.lstrip()
+            if " = torch.ops.aten._scaled_dot_product_" in line or line.startswith(
+                aoti_sdpa
+            ):
+                events.append("attention")
+            elif ".run(" in line or line.startswith("call_triton_"):
+                events.append("kernel")
+        self.assertEqual(events[:4], ["kernel", "attention", "kernel", "attention"])
+        self.assertNotIn("'num_kernels': 2", source)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 2)
+
+    @requires_gpu_and_triton
+    @torch._functorch.config.patch("cse", False)
+    def test_source_independent_wheres_without_sdpa_remain_combinable(self):
+        def make_mask(size):
+            index = torch.arange(size, device=GPU_TYPE)
+            return torch.where(index[:, None] >= index[None, :], 0.0, float("-inf"))
+
+        def fn():
+            return make_mask(64), make_mask(128)
+
+        _, code = run_and_get_code(torch.compile(fn))
+
+        self.assertIn("'num_kernels': 2", "\n".join(code))
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     @requires_gpu_and_triton
@@ -2262,7 +2331,8 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
         )
 
     @requires_gpu_and_triton
-    def test_disabled_autotune_keeps_indirect_indexing(self):
+    @parametrize("mode", ["autotune_disabled", "deterministic"])
+    def test_no_benchmark_keeps_indirect_indexing(self, mode):
         def fn(a, b, c, idx):
             return a[idx + 1024], b * 2.0, c + 1.0
 
@@ -2272,7 +2342,12 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
             torch.randn(256, device=device),
             torch.full((256,), -1024, device=device, dtype=torch.int64),
         ]
-        with fresh_cache(), torch._inductor.config.patch({"combo_kernels_autotune": 0}):
+        config = (
+            {"combo_kernels_autotune": 0}
+            if mode == "autotune_disabled"
+            else {"deterministic": True}
+        )
+        with fresh_cache(), torch._inductor.config.patch(config):
             out, code = run_and_get_code(torch.compile(fn), *inps)
         self.assertEqual(out, fn(*inps))
         FileCheck().check("'num_kernels': 3").run(code[0])
@@ -2773,7 +2848,10 @@ class ComboKernelTestsMaxAutotune(TestCase):
             self.assertIn("'max_persistent_rblock': 1024", joined)
 
     @requires_gpu_and_triton
-    def test_combo_kernel_coordesc_tunes_largest_subkernel_first(self):
+    @parametrize("compile_time_autotune", [False, True])
+    def test_combo_kernel_coordesc_tunes_largest_subkernel_first(
+        self, compile_time_autotune
+    ):
         def fn(a, b, c):
             return (
                 torch.nn.functional.relu(a),
@@ -2796,12 +2874,23 @@ class ComboKernelTestsMaxAutotune(TestCase):
             }
 
         logger = logging.getLogger("torch._inductor.runtime.coordinate_descent_tuner")
-        with torch._inductor.config.patch(coordinate_descent_tuning=True):
+        with (
+            fresh_cache(),
+            torch._inductor.config.patch(
+                {
+                    "coordinate_descent_tuning": True,
+                    "combo_kernel_compile_time_autotune": compile_time_autotune,
+                }
+            ),
+        ):
             with self.assertLogs(logger, level=logging.DEBUG) as cm:
                 out_compiled = torch.compile(fn)(*inps)
 
         self.assertEqual(out_eager, out_compiled)
 
+        # Compile-time autotune passes per-subkernel blocks as args, so runtime
+        # coordinate descent still refines the suffixed XBLOCK_i fields (same as
+        # the runtime per-subkernel path).
         baseline_log = next(
             msg for msg in cm.output if "Baseline Config" in msg and "XBLOCK_" in msg
         )

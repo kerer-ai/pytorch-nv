@@ -961,6 +961,36 @@ class TestGroupBatchFusionCpu(_FusionCompareBase):
 
 
 class _TestBMMFusionModule(torch.nn.Module):
+
+
+    def test_xpu_batch_linear_lhs(self):
+        # batch_linear_lhs is disabled by default; enabling it for XPU via mock
+        # config must make the fusion fire on XPU tensors.
+        default_options = config.pre_grad_fusion_options
+        self.assertIn("batch_linear_lhs", default_options)
+        self.assertEqual(default_options["batch_linear_lhs"]["devices"], ("xpu",))
+        z = 10
+        for has_bias in [True, False]:
+            orig_fusion_options = dict(config.pre_grad_fusion_options)
+            counters.clear()
+            module = MyModule4(z, "xpu", has_bias)
+            input = [torch.randn(20, z, device="xpu")]
+            traced = torch.compile(module)
+            ref = module(*input)
+            res = traced(*input)
+            self.compare_pred(module, traced, input)
+            self.assertGreater(counters["inductor"]["batch_linear_lhs"], 0)
+            self.assertEqual(ref, res)
+            ref.sum().backward()
+            res.sum().backward()
+            self.compare_parameters(module, traced, rtol=1e-8, atol=1e-8)
+            self.compare_gradients(module, traced, rtol=1e-8, atol=1e-8)
+            self.assertEqual(
+                orig_fusion_options,
+                dict(config.pre_grad_fusion_options),
+                "config.pre_grad_fusion_options should not be mutated",
+            )
+            counters.clear()
     def __init__(self) -> None:
         super().__init__()
         self.my_modules = torch.nn.ModuleList()

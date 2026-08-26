@@ -14,7 +14,11 @@ from torch.testing._internal.common_device_type import (
 )
 
 from torch.testing._internal.common_utils import (
-    HardwareClassification, IS_CI, IS_WINDOWS, run_tests, TestCase
+    HardwareClassification,
+    IS_CI,
+    IS_WINDOWS,
+    run_tests,
+    TestCase,
 )
 
 if IS_WINDOWS and IS_CI:
@@ -371,12 +375,11 @@ class TestFunctionalizationRngOps(TestCase):
         self.assertEqual(x.grad, x_clone.grad)
 
 
-only_for = ("cuda",)
-instantiate_device_type_tests(TestFunctionalizationRngOps, globals(), only_for=only_for)
+instantiate_device_type_tests(TestFunctionalizationRngOps, globals(), only_for="cuda")
 
 
 class NegativeTest(TestCase):
-    hw_classification = HardwareClassification.GENERIC
+    hw_classification = HardwareClassification.CPU
 
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
@@ -393,8 +396,7 @@ class NegativeTest(TestCase):
             aot_fn(x)
 
 
-only_for = ("cpu",)
-instantiate_device_type_tests(NegativeTest, globals(), only_for=only_for)
+instantiate_device_type_tests(NegativeTest, globals(), only_for="cpu")
 
 if __name__ == "__main__":
     run_tests()

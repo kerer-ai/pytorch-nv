@@ -55,6 +55,7 @@ from fx.test_fx_const_fold import TestConstFold  # noqa: F401
 from fx.test_fx_param_shape_control_flow import (  # noqa: F401
     TestConstParamShapeInControlFlow,
 )
+from fx.test_fx_traceback import TestFXNodeSource  # noqa: F401
 
 from fx.test_gradual_type import (  # noqa: F401  # noqa: F401
     AnnotationsTest,

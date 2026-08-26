@@ -2786,7 +2786,14 @@ class TestFlexFlashDynamicShapes(InductorTestCase):
         compiled_fn = torch.compile(flex_attention, dynamic=True)
         q, k, v = create_test_tensors(seq_len=256, device=device, dtype=torch.float16)
 
-        with self.assertRaisesRegex(RuntimeError, r"captures a 0-dim CPU tensor"):
+        # The unspecialized float reaches the HOP either as a 0-dim CPU scalar
+        # tensor, rejected by the FLASH lowering, or as a SymFloat, rejected by
+        # the flex_attention operand check, depending on which tracer owns its
+        # `.item()` proxy. Both are valid rejections.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"captures a 0-dim CPU tensor|can only be of.*but got.*SymFloat",
+        ):
             compiled_fn(
                 q, k, v, score_mod=score_mod, kernel_options={"BACKEND": "FLASH"}
             )

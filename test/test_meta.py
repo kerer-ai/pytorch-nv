@@ -30,6 +30,7 @@ from torch.testing._internal.common_utils import (
     parametrize,
     TestCase,
     unMarkDynamoStrictTest,
+    instantiate_parametrized_tests,
     xfailIfTorchDynamo,
 )
 from torch.testing._internal.common_device_type import (
@@ -48,8 +49,10 @@ from torch.testing._internal.common_dtype import (
     integral_types,
 )
 from torch.testing._internal.common_methods_invocations import (
-    binary_ufuncs, op_db, foreach_unary_op_db, foreach_binary_op_db,
-    foreach_pointwise_op_db, foreach_reduce_op_db, foreach_other_op_db)
+    binary_ufuncs,
+    foreach_op_db,
+    op_db,
+)
 from torch.testing._internal.opinfo.core import S, SampleInput
 from torchgen.yaml_utils import YamlLoader
 from torchgen.model import OperatorName
@@ -82,15 +85,6 @@ u8 = torch.uint8
 u16 = torch.uint16
 u32 = torch.uint32
 u64 = torch.uint64
-
-foreach_op_db = (
-    foreach_unary_op_db +
-    foreach_binary_op_db +
-    foreach_pointwise_op_db +
-    foreach_reduce_op_db +
-    foreach_other_op_db
-)
-
 
 class TestMetaConverter(TestCase):
     hw_classification = HardwareClassification.GENERIC
@@ -2298,6 +2292,7 @@ class TestMetaKernelConv(TestCase):
 
 
 
+@instantiate_parametrized_tests
 class TestMetaKernelRegistrations(TestCase):
     hw_classification = HardwareClassification.GENERIC
     

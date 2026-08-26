@@ -1380,7 +1380,7 @@ class TestZeroRedundancyOptimizerDistributedDevice(TestZeroRedundancyOptimizerDi
         device_type = torch.device(device).type
         if self.rank >= 2:
             return
-        self.create_pg(device_type, world_size=2)
+        self.create_pg(device_type, world_size=2, backend="nccl-legacy")
         self._test_zero_model_parallel(parameters_as_bucket_view, device_type)
 
     # NOTE: The test is skipped if using Windows since functional optimizers

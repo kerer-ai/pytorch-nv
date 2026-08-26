@@ -61,18 +61,6 @@ def requires_nvls():
     )
 
 
-def skip_if_cuda_13_2():
-    """Skip dispatch-combine tests that hang/fail on CUDA 13.2 (B200/sm100).
-
-    See https://github.com/pytorch/pytorch/issues/191201
-    """
-    return skip_but_pass_in_sandcastle_if(
-        _get_torch_cuda_version() == (13, 2),
-        "Dispatch-combine hangs/fails on CUDA 13.2, "
-        "see https://github.com/pytorch/pytorch/issues/191201",
-    )
-
-
 # So that tests are written in device-agnostic way
 device_type = "cuda"
 device_module = torch.get_device_module(device_type)
@@ -984,7 +972,6 @@ class DispatchCombineTest(MultiProcContinuousTest):
     def device(self) -> torch.device:
         return self._dev
 
-    @skip_if_cuda_13_2()
     @parametrize("align", [1, 8, 16])  # `major_align` of output
     def test_dispatch_combine(self, device, align: int) -> None:
         """
@@ -1010,7 +997,6 @@ class DispatchCombineInSubgroups(MultiProcContinuousTest):
     def device(self) -> torch.device:
         return self._dev
 
-    @skip_if_cuda_13_2()
     @skip_if_lt_x_gpu(4)
     def test_dispatch_combine_subgroup(self) -> None:
         """
