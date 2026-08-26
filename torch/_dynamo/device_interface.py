@@ -91,6 +91,13 @@ class DeviceInterface:
     # types should override this with a frozenset containing them.
     tensor_types: frozenset[type] = frozenset()
 
+    # Autocast classes this device provides, e.g. ``torch.foo.amp.autocast``.
+    # Dynamo uses these to route an out-of-tree autocast class to the
+    # device_type it was registered under; see
+    # ``device_type_for_autocast_class``.  Entries must be strict subclasses of
+    # ``torch.amp.autocast_mode.autocast``.
+    autocast_classes: frozenset[type] = frozenset()
+
     class device:
         def __new__(cls, device: torch.types.Device) -> Any:
             raise NotImplementedError
