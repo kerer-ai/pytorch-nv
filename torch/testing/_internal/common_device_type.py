@@ -577,32 +577,42 @@ class DeviceTypeTestBase(TestCase):
         self._tls.rel_tol = prec
 
     @classmethod
-    def _apply_op_overrides(cls, ops, test=None):
-        class_overrides = cls.op_overrides or {}
-        test_overrides = {} if test is None else getattr(test, "_op_overrides", {})
-
-        if not class_overrides and not test_overrides:
-            return
-
-        op_dict = {op.full_name: op for op in copy.deepcopy(ops.op_list)}
-
-        for op_name, decorators in class_overrides.items():
+    def _apply_class_overrides(cls, info_dict, class_overrides):
+        """Stamps each class_overrides decorator's device_type to this test
+        base's device type and appends it to the matching entry of info_dict
+        (keyed by OpInfo.full_name or ModuleInfo.name).
+        """
+        for name, decorators in class_overrides.items():
             for decorator in decorators:
                 if cls.device_type == "privateuse1":
                     decorator.device_type = torch._C._get_privateuse1_backend_name()
                 else:
                     decorator.device_type = cls.device_type
-                # op_name may not be in op_dict if @ops() has restricted the
-                # OpInfo list to a smaller set than op_overrides covers.
-                if op_name in op_dict:
-                    op_dict[op_name].decorators += (decorator,)
+                # name may not be in info_dict if @ops()/@modules() has
+                # restricted the list to a smaller set than overrides covers.
+                if name in info_dict:
+                    info_dict[name].decorators += (decorator,)
+
+    @classmethod
+    def _apply_op_overrides(cls, op_list, test=None):
+        class_overrides = cls.op_overrides or {}
+        test_overrides = {} if test is None else getattr(test, "_op_overrides", {})
+
+        if not class_overrides and not test_overrides:
+            return op_list
+
+        op_dict = {op.full_name: op for op in copy.deepcopy(op_list)}
+        if len(op_dict) != len(op_list):
+            raise AssertionError("Duplicate op full_names in @ops op_list")
+
+        cls._apply_class_overrides(op_dict, class_overrides)
 
         for op_name, decorators in test_overrides.items():
             for decorator in decorators:
                 if op_name in op_dict:
                     op_dict[op_name].decorators += (decorator,)
 
-        ops.op_list = list(op_dict.values())
+        return list(op_dict.values())
 
     # Returns a string representing the device that single device tests should use.
     # Note: single device tests use this device exclusively.
@@ -688,35 +698,36 @@ class DeviceTypeTestBase(TestCase):
         return _check_dtype()
 
     @classmethod
-    def _apply_op_allowlist(cls, ops):
-        """Filters ops.op_list to only include ops declared in op_allowlist.
+    def _apply_op_allowlist(cls, op_list):
+        """Filters op_list to only include ops declared in op_allowlist.
 
         If op_allowlist is None (default), no filtering is applied.
         If op_allowlist is set, only ops whose full_name is in the collection
         will generate test variants.
 
         Args:
-            ops: The ops decorator instance whose op_list will be filtered.
+            op_list: The list of OpInfo entries to filter.
         """
         if cls.op_allowlist is None:
-            return
+            return op_list
 
         supported_set = set(cls.op_allowlist)
-        ops.op_list = [op for op in ops.op_list if op.full_name in supported_set]
+        return [op for op in op_list if op.full_name in supported_set]
 
     @classmethod
     def _apply_module_overrides(cls, module_info_list):
-        """Applies module_overrides decorators to the matching ModuleInfo entries."""
         class_overrides = cls.module_overrides or {}
+
         if not class_overrides:
             return module_info_list
-        module_dict = {m.name: m for m in module_info_list}
-        for name, decorators in class_overrides.items():
-            for decorator in decorators:
-                decorator.device_type = cls.device_type
-                if name in module_dict:
-                    module_dict[name].decorators += (decorator,)
-        return module_info_list
+
+        module_dict = {m.name: m for m in copy.deepcopy(module_info_list)}
+        if len(module_dict) != len(module_info_list):
+            raise AssertionError("Duplicate module names in @modules module_info_list")
+
+        cls._apply_class_overrides(module_dict, class_overrides)
+
+        return list(module_dict.values())
 
     @classmethod
     def _apply_module_allowlist(cls, module_info_list):
@@ -797,6 +808,8 @@ class DeviceTypeTestBase(TestCase):
         *,
         op_overrides=None,
         op_allowlist=None,
+        module_overrides=None,
+        module_allowlist=None,
         test_exclusions=None,
     ):
         """
@@ -809,6 +822,8 @@ class DeviceTypeTestBase(TestCase):
         """
         cls.op_overrides = op_overrides
         cls.op_allowlist = op_allowlist
+        cls.module_overrides = module_overrides
+        cls.module_allowlist = module_allowlist
         cls.test_exclusions = test_exclusions
 
     # Creates device-specific tests.
@@ -1936,10 +1951,10 @@ class ops(_TestParametrizer):
 
         # Order matters: op_allowlist filters first, then op_overrides adds decorators
         # This ensures op_overrides only applies to ops that passed the op_allowlist filter
-        device_cls._apply_op_allowlist(self)
-        device_cls._apply_op_overrides(self, test)
+        op_list = device_cls._apply_op_allowlist(self.op_list)
+        op_list = device_cls._apply_op_overrides(op_list, test)
         op = check_exhausted_iterator = object()
-        for op in self.op_list:
+        for op in op_list:
             # Determine the set of dtypes to use.
             dtypes: set[torch.dtype] | set[None]
             if isinstance(self.opinfo_dtypes, Sequence):
