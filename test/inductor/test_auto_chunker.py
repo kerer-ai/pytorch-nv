@@ -11,7 +11,7 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_CUDA_AND_TRITON
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU_AND_TRITON
 
 
 USE_LARGE_INPUT = os.environ.get("USE_LARGE_INPUT", "1") == "1"
@@ -72,7 +72,7 @@ class AutoChunkerTest(TestCase):
         weight.grad = None
         bias.grad = None
 
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
         opt_f = torch.compile(f, dynamic=dynamic_shape)
         actual = (
             opt_f(_input, weight, bias),
@@ -80,11 +80,13 @@ class AutoChunkerTest(TestCase):
             weight.grad,
             bias.grad if use_bias else None,
         )
-        peak_memory = torch.cuda.max_memory_allocated()
+        peak_memory = torch.accelerator.max_memory_allocated()
 
         print(f"Peak memory {peak_memory / 10**9:.6f} GB")
 
-        self.assertTrue(same(expect, actual, tol=1e-3), f"{expect=}\n{actual=}")
+        self.assertTrue(
+            same(expect, actual, tol=1e-3), lambda msg: f"{msg}\n{expect=}\n{actual=}"
+        )
 
         # When the model is too trivial without softmax, no chunking happens because chunking
         # metadata propagation can not reach the backward.
@@ -98,7 +100,7 @@ class AutoChunkerTest(TestCase):
             expected_bound = M * N * dtype.itemsize
             self.assertTrue(
                 peak_memory < expected_bound,
-                f"Actual peak_memory {peak_memory}, expected bound {expected_bound}",
+                lambda msg: f"{msg}\nActual peak_memory {peak_memory}, expected bound {expected_bound}",
             )
 
     def test_matmul_trivial(self):
@@ -122,7 +124,7 @@ class AutoChunkerTest(TestCase):
         self.common_matmul_test(has_softmax=True, use_bias=True)
 
     @config.patch("auto_chunker.num_chunk", config.auto_chunker.num_chunk or 16)
-    @largeTensorTest("6GB", device=GPU_TYPE, inductor=True)
+    @largeTensorTest("10GB", device=GPU_TYPE, inductor=True)
     def test_fused_linear_cel(self):
         B = 32
         T = 1024
@@ -131,7 +133,7 @@ class AutoChunkerTest(TestCase):
 
         dtype = torch.bfloat16
 
-        mod = LinearAndCEL(C, V).cuda().to(dtype)
+        mod = LinearAndCEL(C, V).to(GPU_TYPE).to(dtype)
 
         def f(x, y):
             x.grad = None
@@ -145,16 +147,18 @@ class AutoChunkerTest(TestCase):
 
         opt_f = torch.compile(f)
 
-        x = torch.randn(B, T, C, dtype=dtype, requires_grad=True, device="cuda")
-        y = torch.randint(0, V, (B, T)).cuda()
+        x = torch.randn(B, T, C, dtype=dtype, requires_grad=True, device=GPU_TYPE)
+        y = torch.randint(0, V, (B, T)).to(GPU_TYPE)
 
         expect = (f(x, y), x.grad, mod.linear.weight.grad, mod.linear.bias.grad)
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
         actual = (opt_f(x, y), x.grad, mod.linear.weight.grad, mod.linear.bias.grad)
-        peak_memory = torch.cuda.max_memory_allocated()
+        peak_memory = torch.accelerator.max_memory_allocated()
         print(f"Peak memory {peak_memory / 10**9:.6f} GB")
 
-        self.assertTrue(same(expect, actual, tol=1e-3), f"{expect=}\n{actual=}")
+        self.assertTrue(
+            same(expect, actual, tol=1e-3), lambda msg: f"{msg}\n{expect=}\n{actual=}"
+        )
 
         if DO_PERF_TEST:
             from triton.testing import do_bench
@@ -177,7 +181,7 @@ class AutoChunkerTest(TestCase):
         expected_bound = B * T * V * x.dtype.itemsize
         self.assertTrue(
             peak_memory < expected_bound,
-            f"Actual peak_memory {peak_memory}, expected bound {expected_bound}",
+            lambda msg: f"{msg}\nActual peak_memory {peak_memory}, expected bound {expected_bound}",
         )
 
     @config.patch("auto_chunker.num_chunk", config.auto_chunker.num_chunk or 16)
@@ -191,7 +195,7 @@ class AutoChunkerTest(TestCase):
 
         dtype = torch.bfloat16
 
-        mod = LinearAndCEL(C, V).cuda().to(dtype)
+        mod = LinearAndCEL(C, V).to(GPU_TYPE).to(dtype)
 
         def f(x, y):
             x.grad = None
@@ -214,11 +218,11 @@ class AutoChunkerTest(TestCase):
         opt_f = torch.compile(f)
 
         xs = [
-            torch.randn(B, T, C, dtype=dtype, requires_grad=True, device="cuda")
+            torch.randn(B, T, C, dtype=dtype, requires_grad=True, device=GPU_TYPE)
             for _ in range(gradient_accumulation_steps)
         ]
         ys = [
-            torch.randint(0, V, (B, T)).cuda()
+            torch.randint(0, V, (B, T)).to(GPU_TYPE)
             for _ in range(gradient_accumulation_steps)
         ]
 
@@ -228,23 +232,25 @@ class AutoChunkerTest(TestCase):
             mod.linear.weight.grad,
             mod.linear.bias.grad,
         )
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
         actual = (
             step(opt_f, xs, ys),
             *[x.grad for x in xs],
             mod.linear.weight.grad,
             mod.linear.bias.grad,
         )
-        peak_memory = torch.cuda.max_memory_allocated()
+        peak_memory = torch.accelerator.max_memory_allocated()
         print(f"Peak memory {peak_memory / 10**9:.6f} GB")
 
-        self.assertTrue(same(expect, actual, tol=1e-3), f"{expect=}\n{actual=}")
+        self.assertTrue(
+            same(expect, actual, tol=1e-3), lambda msg: f"{msg}\n{expect=}\n{actual=}"
+        )
 
         self.assertEqual(metrics.num_auto_chunking, 1)
         expected_bound = B * T * V * xs[0].dtype.itemsize
         self.assertTrue(
             peak_memory < expected_bound,
-            f"Actual peak_memory {peak_memory}, expected bound {expected_bound}",
+            lambda msg: f"{msg}\nActual peak_memory {peak_memory}, expected bound {expected_bound}",
         )
 
     @config.patch("auto_chunker.output_size_threshold", 1024)
@@ -271,6 +277,110 @@ class AutoChunkerTest(TestCase):
         self.assertTrue(same(expect, actual, tol=1e-3))
         self.assertEqual(metrics.num_auto_chunking, 1)
 
+    @config.patch("auto_chunker.output_size_threshold", 1024)
+    @config.patch("auto_chunker.num_chunk", 2)
+    def test_propagate_amax_unsqueeze(self):
+        M, K, N = 256, 4, 256
+        x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
+        w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
+
+        def f(x, w):
+            out = (x * 2) @ w
+            max_val = out.amax(dim=-1)
+            out = out - max_val.unsqueeze(-1)
+            out = torch.exp(out)
+            loss = out.sum()
+            loss.backward()
+            return loss
+
+        expect = (f(x, w), x.grad, w.grad)
+        x.grad = None
+        w.grad = None
+        opt_f = torch.compile(f)
+        actual = (opt_f(x, w), x.grad, w.grad)
+
+        self.assertTrue(same(expect, actual, tol=1e-3))
+        self.assertEqual(metrics.num_auto_chunking, 1)
+
+    @config.patch("auto_chunker.output_size_threshold", 1024)
+    @config.patch("auto_chunker.num_chunk", 2)
+    def test_propagate_gather(self):
+        M, K, N = 256, 4, 256
+        x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
+        w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
+        targets = torch.randint(0, N, (M,), device=GPU_TYPE)
+
+        def f(x, w, targets):
+            out = (x * 2) @ w
+            out = out.softmax(dim=-1)
+            selected = out.gather(1, targets.unsqueeze(1))
+            loss = selected.squeeze(1).sum()
+            loss.backward()
+            return loss
+
+        expect = (f(x, w, targets), x.grad, w.grad)
+        x.grad = None
+        w.grad = None
+        opt_f = torch.compile(f)
+        actual = (opt_f(x, w, targets), x.grad, w.grad)
+
+        self.assertTrue(same(expect, actual, tol=1e-3))
+        self.assertEqual(metrics.num_auto_chunking, 1)
+
+    @config.patch("auto_chunker.output_size_threshold", 1024)
+    @config.patch("auto_chunker.num_chunk", 2)
+    def test_propagate_scatter(self):
+        M, K, N = 256, 4, 256
+        x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
+        w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
+        targets = torch.randint(0, N, (M,), device=GPU_TYPE)
+
+        def f(x, w, targets):
+            out = (x * 2) @ w
+            out = out.softmax(dim=-1)
+            out = out.scatter(1, targets.unsqueeze(1), 0.0)
+            loss = out.sum()
+            loss.backward()
+            return loss
+
+        expect = (f(x, w, targets), x.grad, w.grad)
+        x.grad = None
+        w.grad = None
+        opt_f = torch.compile(f)
+        actual = (opt_f(x, w, targets), x.grad, w.grad)
+
+        self.assertTrue(same(expect, actual, tol=1e-3))
+        self.assertEqual(metrics.num_auto_chunking, 1)
+
+    @config.patch("auto_chunker.output_size_threshold", 1024)
+    @config.patch("auto_chunker.num_chunk", 2)
+    def test_propagate_manual_cross_entropy(self):
+        M, K, N = 256, 4, 256
+        x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
+        w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
+        targets = torch.randint(0, N, (M,), device=GPU_TYPE)
+
+        def f(x, w, targets):
+            logits = (x * 2) @ w
+            max_logits = logits.amax(dim=-1)
+            shifted = logits - max_logits.unsqueeze(-1)
+            exp_shifted = shifted.exp()
+            sum_exp = exp_shifted.sum(dim=-1)
+            log_probs = shifted - sum_exp.log().unsqueeze(-1)
+            target_log_probs = log_probs.gather(1, targets.unsqueeze(1))
+            loss = -target_log_probs.squeeze(1).sum() / M
+            loss.backward()
+            return loss
+
+        expect = (f(x, w, targets), x.grad, w.grad)
+        x.grad = None
+        w.grad = None
+        opt_f = torch.compile(f)
+        actual = (opt_f(x, w, targets), x.grad, w.grad)
+
+        self.assertTrue(same(expect, actual, tol=1e-3))
+        self.assertEqual(metrics.num_auto_chunking, 1)
+
     def test_set_num_chunk_with_compile_options(self):
         B = 32
         T = 1024
@@ -284,9 +394,9 @@ class AutoChunkerTest(TestCase):
             "auto_chunker.num_chunk": 16,
             "auto_chunker.amplify_ratio_threshold": 10,
         }
-        mod = torch.compile(LinearAndCEL(C, V).cuda().to(dtype), options=options)
-        x = torch.randn(B, T, C, dtype=dtype, requires_grad=True, device="cuda")
-        y = torch.randint(0, V, (B, T)).cuda()
+        mod = torch.compile(LinearAndCEL(C, V).to(GPU_TYPE).to(dtype), options=options)
+        x = torch.randn(B, T, C, dtype=dtype, requires_grad=True, device=GPU_TYPE)
+        y = torch.randint(0, V, (B, T)).to(GPU_TYPE)
         mod(x, y).backward()
         self.assertEqual(metrics.num_auto_chunking, 1)
 
@@ -294,5 +404,5 @@ class AutoChunkerTest(TestCase):
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
-    if HAS_CUDA_AND_TRITON:
+    if HAS_GPU_AND_TRITON:
         run_tests()

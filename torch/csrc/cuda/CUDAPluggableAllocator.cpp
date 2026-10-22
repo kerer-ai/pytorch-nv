@@ -175,7 +175,7 @@ CUDAPluggableAllocator::getExpandableSegmentSizes(c10::DeviceIndex device) {
 void CUDAPluggableAllocator::emptyCache(
     /*unused*/ c10::cuda::MempoolId_t mempool_id) {
   if (reset_fn_) {
-    return reset_fn_();
+    reset_fn_();
   }
 }
 
@@ -297,6 +297,14 @@ void CUDAPluggableAllocator::attachOutOfMemoryObserver(
       "If you need it, please file an issue describing your use case.");
 }
 
+void CUDAPluggableAllocator::attachOomRejectionObserver(
+    c10::cuda::CUDACachingAllocator::OomRejectionObserver observer) {
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false,
+      "CUDAPluggableAllocator does not yet support attachOomRejectionObserver. "
+      "If you need it, please file an issue describing your use case.");
+}
+
 void CUDAPluggableAllocator::attachAllocatorTraceTracker(
     c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) {
   TORCH_CHECK(
@@ -357,8 +365,12 @@ void CUDAPluggableAllocator::copy_data(
     void* dest,
     const void* src,
     std::size_t count) const {
-  C10_CUDA_CHECK(
-      cudaMemcpy(dest, src, count, cudaMemcpyKind::cudaMemcpyDeviceToDevice));
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      dest,
+      src,
+      count,
+      cudaMemcpyDeviceToDevice,
+      c10::cuda::getCurrentCUDAStream()));
 }
 
 std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>

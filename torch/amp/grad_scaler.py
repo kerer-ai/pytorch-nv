@@ -306,7 +306,7 @@ class GradScaler:
         :meth:`unscale_` is optional, serving cases where you need to
         :ref:`modify or inspect gradients<working-with-unscaled-gradients>`
         between the backward pass(es) and :meth:`step`.
-        If :meth:`unscale_` is not called explicitly,  gradients will be unscaled  automatically during :meth:`step`.
+        If :meth:`unscale_` is not called explicitly, gradients will be unscaled automatically during :meth:`step`.
 
         Simple example, using :meth:`unscale_` to enable clipping of unscaled gradients::
 
@@ -449,7 +449,7 @@ class GradScaler:
                 found_inf = cast(
                     torch.Tensor,
                     sum(
-                        [  # noqa: C419
+                        [
                             t.to(scaler.device, non_blocking=True)
                             for t in optimizer_state["found_inf_per_device"].values()
                         ]

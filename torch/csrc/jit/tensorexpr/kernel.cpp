@@ -330,8 +330,9 @@ bool mkldnnPrepackedConvIsSupportedJit(const torch::jit::Node* node) {
       _pair_int(*pad),
       _pair_int(*dilation),
       groups->toInt());
-#endif
+#else
   return false;
+#endif
 }
 
 bool isConv2d(const Node* node) {
@@ -412,13 +413,11 @@ ExprHandle TensorExprKernel::constant(const torch::jit::Value* v) {
       // the operator-specific lowering code.
       return IntImm::make(0);
     } else {
-      throw unsupported_dtype();
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE");
     }
   }
 
-  if (!scalars_.count(v)) {
-    throw malformed_input("no scalar in Constant");
-  }
+  TORCH_CHECK(scalars_.contains(v), "MALFORMED INPUT: no scalar in Constant");
 
   return scalars_.at(v);
 }
@@ -444,7 +443,7 @@ ArgValue TensorExprKernel::toArg(const torch::jit::Value* v) const {
     } else if (std::get_if<int64_t>(&vec[0])) {
       return convertVecArgValue<int64_t>(vec);
     }
-    throw unsupported_dtype();
+    TORCH_CHECK(false, "UNSUPPORTED DTYPE");
   }
   if (v->node()->kind() == prim::Constant) {
     auto val = toIValue(v).value();
@@ -466,13 +465,11 @@ ArgValue TensorExprKernel::toArg(const torch::jit::Value* v) const {
     } else if (val.isString()) {
       return val.toStringRef();
     } else {
-      throw unsupported_dtype(val.type()->str());
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE: ", val.type()->str());
     }
   }
 
-  if (!scalars_.count(v)) {
-    throw malformed_input("no scalar in Constant");
-  }
+  TORCH_CHECK(scalars_.contains(v), "MALFORMED INPUT: no scalar in Constant");
   return scalars_.at(v);
 }
 
@@ -508,7 +505,7 @@ std::vector<ExprHandle> TensorExprKernel::sizesFromSymbolicShape(
 
 std::vector<ExprHandle> TensorExprKernel::sizesForValue(
     const torch::jit::Value* v) {
-  if (known_sizes_.count(v)) {
+  if (known_sizes_.contains(v)) {
     return known_sizes_.at(v);
   }
 
@@ -531,7 +528,7 @@ std::vector<ExprHandle> TensorExprKernel::sizesForValue(
   GRAPH_DEBUG("Full fusion group graph:\n", *v->node()->owningGraph());
   std::string msg = std::string("Unhandled node kind (in sizesForValue): ") +
       v->node()->kind().toQualString();
-  throw malformed_input(msg);
+  TORCH_CHECK(false, "MALFORMED INPUT: ", msg);
 }
 
 static std::optional<ScalarType> findDtypeForValue(const torch::jit::Value* v) {
@@ -568,7 +565,7 @@ static bool constZeroDimTensorAsScalarArg(
       std::stringstream ss;
       ss << "Unsupported tensor dtype:" << dtype
          << " for converting constant 0-dim Tensor to scalar" << '\n';
-      throw unsupported_dtype(ss.str());
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE: ", std::move(ss).str());
   }
 }
 
@@ -649,7 +646,7 @@ Tensor TensorExprKernel::computeValue(const torch::jit::Value* v) {
   if (v->node()->maybeSchema()) {
     msg += std::string("\nSchema: ") + c10::toString(v->node()->schema());
   }
-  throw malformed_input(msg);
+  TORCH_CHECK(false, "MALFORMED INPUT: ", msg);
 }
 
 // True if all the loops in this vector have equal bounds.
@@ -887,8 +884,7 @@ StmtPtr TensorExprKernel::transformLoops(BackendType backendType, StmtPtr st) {
         inner->set_gpu_block_index(0);
         inner1->set_gpu_thread_index(0);
       } else {
-        throw std::runtime_error(
-            "Invalid loop-level: " + std::to_string(loopLevels));
+        TORCH_CHECK(false, "Invalid loop-level: " + std::to_string(loopLevels));
       }
     }
   }
@@ -954,9 +950,10 @@ std::string TensorExprKernel::getCodeGenName(BackendType backendType) {
     case kBlockCodeGen:
       return "block_codegen";
     default:
-      throw std::runtime_error(
+      TORCH_CHECK(
+          false,
           "invalid backend type: " +
-          std::to_string(static_cast<int>(backendType)));
+              std::to_string(static_cast<int>(backendType)));
   }
 }
 
@@ -978,11 +975,11 @@ TensorExprKernel::BackendType TensorExprKernel::inferBackendTypeFromDevice(
 #else
     backendType = kSimpleIREval;
 #endif
-    if (getTEMustUseLLVMOnCPU() && backendType == kSimpleIREval) {
-      throw std::runtime_error("LLVM Backend not found");
-    }
+    TORCH_CHECK(
+        !getTEMustUseLLVMOnCPU() || backendType != kSimpleIREval,
+        "LLVM Backend not found");
   } else {
-    throw std::runtime_error("Invalid device type");
+    TORCH_CHECK(false, "Invalid device type");
   }
   return backendType;
 }
@@ -996,7 +993,7 @@ void TensorExprKernel::genInputDebugNames() {
     std::string sanitized_name = sanitizeName(input->debugName());
     // we could get fancier here, but name conflict is extremely unlikely
     while (name_set.count(sanitized_name)) {
-      sanitized_name.append("_");
+      sanitized_name.push_back('_');
     }
     value_to_name[input] = sanitized_name;
     name_set.insert(sanitized_name);
@@ -1063,8 +1060,9 @@ std::vector<ExprHandle> TensorExprKernel::getInputStrides(
     auto strides = stride_input[0] == StrideInput::TENSOR_CONT
         ? make_contiguous_strides(inputTensorDims)
         : make_channels_last_strides(inputTensorDims);
-    return fmap(
-        strides, [&](ExprPtr stride) { return ExprHandle(std::move(stride)); });
+    return fmap(std::move(strides), [&](ExprPtr stride) {
+      return ExprHandle(std::move(stride));
+    });
   }
 
   inputTensorStrides.resize(rank);
@@ -1226,7 +1224,7 @@ Tensor TensorExprKernel::bindInput(const torch::jit::Value* input) {
       break;
     }
     default: {
-      throw unsupported_dtype(t->repr_str());
+      TORCH_CHECK(false, "UNSUPPORTED DTYPE: ", t->repr_str());
       break;
     }
   }
@@ -1235,7 +1233,7 @@ Tensor TensorExprKernel::bindInput(const torch::jit::Value* input) {
 
 NNCLoweringFunction TensorExprKernel::getCustomLoweringFor(
     c10::Symbol op) const {
-  if (custom_lowerings_.count(op))
+  if (custom_lowerings_.contains(op))
     return custom_lowerings_.at(op);
   return nullptr;
 }
@@ -1271,11 +1269,11 @@ Tensor TensorExprKernel::convertSymbolicOutputToCorrectStrides(
   // [0] [3] [1] [4] [2] [5]
   // When we are doing the re-ordering of values into the output tensor,
   // we are iterating per-element of the input, and we are fixed
-  // in indexing in to the output tensor at [i, j] = val
+  // in indexing into the output tensor at [i, j] = val
   // `val` we want here is equal to the indices for the output
   // tensor that would have given the same position as the output
   // The position is equal to the sum of stride[i] * index[i],
-  // and we can can calculate the equivalent indices in the
+  // and we can calculate the equivalent indices in the
   // output tensor strides by iteratively computing the index of
   // the biggest stride:
   // absolute = ...
@@ -1358,7 +1356,7 @@ Tensor TensorExprKernel::convertStaticShapeOutputToCorrectStrides(
   if (!tt->sizes().concrete_sizes()) {
     std::string msg =
         std::string("Shapes for output '%") + v->debugName() + "' are unknown";
-    throw malformed_input(msg);
+    TORCH_CHECK(false, "MALFORMED INPUT: ", msg);
   }
 
   TORCH_INTERNAL_ASSERT(
@@ -1519,10 +1517,9 @@ BlockPtr TensorExprKernel::bindAllInputs() {
          i < static_cast<size_t>(nInputs_);
          ++i) {
       auto input = graph_->inputs()[i];
-      if (input->type()->kind() != TypeKind::IntType) {
-        throw std::runtime_error(
-            "Expected integer type input to graph for symbolic dims.");
-      }
+      TORCH_CHECK(
+          input->type()->kind() == TypeKind::IntType,
+          "Expected integer type input to graph for symbolic dims.");
       VarHandle v("v" + input_name_map_[input], kLong);
       symbolic_shape_args.emplace_back(v);
       scalars_.emplace(input, v);
@@ -1761,18 +1758,16 @@ void TensorExprKernel::compile() {
         }
       }
     }
-    if (hasRandom_ && hasBroadcast_) {
-      throw std::runtime_error(
-          "Cannot support broadcast and random within one kernel");
-    }
+    TORCH_CHECK(
+        !hasRandom_ || !hasBroadcast_,
+        "Cannot support broadcast and random within one kernel");
   }
 
   // Move output operands from `bufs_` to `bufOutputs_`
   for (auto i : c10::irange(graph_->outputs().size())) {
     auto& output = graph_->outputs().at(i);
-    if (!bufs_.count(output)) {
-      throw malformed_input("cannot find output Tensor");
-    }
+    TORCH_CHECK(
+        bufs_.count(output), "MALFORMED INPUT: cannot find output Tensor");
     if (!output->type()->cast<TensorType>()) {
       // Scalar outputs are represented as 0-dim buffers.
       bufOutputs_.insert(bufs_.at(output));

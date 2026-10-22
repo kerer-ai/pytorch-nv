@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.testing._internal.common_nn import _create_basic_net, NNTestCase
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     IS_WINDOWS,
     parametrize as parametrize_test,
@@ -186,6 +187,8 @@ class DummyContextManager:
 
 
 class TestModuleHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @parametrize_test("named_tuple", (True, False))
     def test_forward_hooks(self, named_tuple):
         fired_hooks: list[int] = []
@@ -549,6 +552,8 @@ def _hook_to_pickle(*args, **kwargs):
 
 
 class TestStateDictHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @swap([True, False])
     def test_load_state_dict_pre_hook(self):
         m = nn.Linear(10, 10)
@@ -943,6 +948,8 @@ class TestStateDictHooks(TestCase):
 
 
 class TestModuleGlobalHooks(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def tearDown(self):
         nn.modules.module._global_backward_hooks = OrderedDict()
         nn.modules.module._global_forward_hooks = OrderedDict()
@@ -1254,6 +1261,7 @@ class TestModuleGlobalHooks(TestCase):
 
 
 class TestModuleHookNN(NNTestCase):
+    hw_classification = HardwareClassification.GENERIC
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
@@ -1482,6 +1490,17 @@ class TestModuleHookNN(NNTestCase):
         with self.assertRaisesRegex(RuntimeError, "where no input requires gradient"):
             mod(inp).sum().backward()
 
+    @skipIfTorchDynamo("TorchDynamo does not work well with hooks")
+    def test_pre_hook_no_requires_grad_no_warning(self):
+        # A full backward pre-hook only receives grad_output, so firing from the
+        # output side when no input requires grad is expected and must not emit
+        # the full-backward-hook warning. See
+        # https://github.com/pytorch/pytorch/issues/189093
+        mod = nn.Linear(2, 3)
+        inp = torch.rand(1, 2)
+        mod.register_full_backward_pre_hook(lambda mod, gO: None)
+        self.assertNotWarn(lambda: mod(inp).sum().backward())
+
     def test_hook_last_arg_requires_grad(self):
         mod = nn.L1Loss()
         inp = torch.rand(1, requires_grad=True)
@@ -1542,7 +1561,7 @@ class TestModuleHookNN(NNTestCase):
                 # Input inplace error should throw an error
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "Output 0 of BackwardHookFunctionBackward is "
+                    "Output 0 of BackwardHookFunction is "
                     "a view and is being modified inplace.",
                 ):
                     mod(inp.clone(), True)
@@ -1554,7 +1573,7 @@ class TestModuleHookNN(NNTestCase):
                 local_inp[0] *= 1
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "Output 0 of BackwardHookFunctionBackward is "
+                    "Output 0 of BackwardHookFunction is "
                     "a view and its base or another view",
                 ):
                     # Any operation involving the view will fail here
@@ -1564,8 +1583,7 @@ class TestModuleHookNN(NNTestCase):
                 out = mod(inp, False)
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "BackwardHookFunctionBackward is a view "
-                    "and is being modified inplace.",
+                    "BackwardHookFunction is a view and is being modified inplace.",
                 ):
                     out += 1
 

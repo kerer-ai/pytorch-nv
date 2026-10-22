@@ -1,5 +1,8 @@
 # Owner(s): ["module: dynamo"]
 
+import ast
+import itertools
+import math
 import os
 from unittest.mock import patch
 
@@ -7,10 +10,16 @@ import torch
 import torch._dynamo
 import torch._dynamo.config
 from torch._dynamo import debug_utils
-from torch._dynamo.debug_utils import aot_graph_input_parser, generate_env_vars_string
+from torch._dynamo.debug_utils import (
+    _serialize_sym_expr,
+    aot_graph_input_parser,
+    generate_env_vars_string,
+    NNModuleToString,
+)
 from torch._dynamo.test_case import TestCase
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import HardwareClassification
 
 
 f32 = torch.float32
@@ -19,6 +28,113 @@ i32 = torch.int32
 
 
 class TestDebugUtils(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_serialize_symbolic_storage_nbytes(self):
+        from sympy import floor
+
+        from torch._dynamo.source import ConstantSource
+        from torch.fx.experimental.sym_node import SymNode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch.utils._sympy.functions import Max
+
+        shape_env = ShapeEnv()
+        symbol = shape_env.create_symbol(4, ConstantSource("storage_size"))
+        expr = 4 * symbol + 18428 * Max(1, symbol)
+        nbytes = torch.SymInt(SymNode(expr, shape_env, int, hint=73728))
+        source = _serialize_sym_expr(nbytes)
+
+        self.assertNotIn("Max", source)
+        for value in (0, 1, 4):
+            self.assertEqual(
+                eval(source, {"max": max}, {str(symbol): value}),
+                int(expr.subs(symbol, value)),
+            )
+
+        floor_expr = floor(symbol / 2)
+        floor_nbytes = torch.SymInt(SymNode(floor_expr, shape_env, int, hint=2))
+        floor_source = _serialize_sym_expr(floor_nbytes)
+        self.assertIn("math.floor", floor_source)
+        self.assertEqual(
+            eval(floor_source, {"math": math}, {str(symbol): 4}),
+            2,
+        )
+
+    def test_input_writer_symbolic_tensor_metadata_is_python(self):
+        from torch._dynamo.debug_utils import InputWriter
+        from torch._dynamo.source import ConstantSource
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.sym_node import SymNode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch.utils._sympy.functions import CeilToInt, IntTrueDiv
+
+        shape_env = ShapeEnv()
+        symbol = shape_env.create_symbol(64, ConstantSource("s33"))
+        # 32*ceil(s33/32) reprs as 32*CeilToInt(IntTrueDiv(s33, 32)) under sympy
+        expr = 32 * CeilToInt(IntTrueDiv(symbol, 32))
+        dim = torch.SymInt(SymNode(expr, shape_env, int, hint=64))
+
+        writer = InputWriter(None)
+        with FakeTensorMode(shape_env=shape_env):
+            base = torch.empty(4, dim, device="cpu")
+            writer.tensor("shape_arg", base)
+            writer.tensor("stride_arg", base.transpose(0, 1))
+            writer.tensor("offset_arg", base[1])
+
+        source = "\n".join(writer.lines())
+        self.assertIn("math.ceil", source)
+        self.assertNotIn("CeilToInt", source)
+        self.assertNotIn("IntTrueDiv", source)
+
+        class Reader:
+            def __init__(self):
+                self.tensors = []
+
+            def storage(self, storage_hash, nbytes, **kwargs):
+                return nbytes
+
+            def tensor(self, buf, shape, stride=None, *, storage_offset=0, **kwargs):
+                self.tensors.append((shape, stride, storage_offset))
+
+        # The repro preamble imports math and torch (sym_max shows up in
+        # contiguous strides); the symbol is bound by the caller.
+        namespace = {"math": math, "torch": torch, str(symbol): 64}
+        exec(source, namespace)
+        reader = Reader()
+        namespace["load_args"](reader)
+        self.assertEqual(
+            reader.tensors,
+            [((4, 64), None, 0), ((64, 4), (1, 64), 0), ((64,), None, 64)],
+        )
+
+    def test_repro_templates_import_symexpr_dependencies(self):
+        from torch._dynamo.repro.after_aot import generate_compiler_repro_string
+        from torch._dynamo.repro.after_dynamo import generate_dynamo_fx_repro_string
+
+        gm = torch.fx.symbolic_trace(lambda x: x + 1)
+        args = [torch.ones(1)]
+
+        repros = {
+            "after_aot": generate_compiler_repro_string(gm, args),
+            "after_dynamo": generate_dynamo_fx_repro_string(
+                gm, args, compiler_name="eager"
+            ),
+        }
+        for name, source in repros.items():
+            with self.subTest(name=name):
+                tree = ast.parse(source)
+                imports = ast.Module(
+                    body=[
+                        node
+                        for node in tree.body
+                        if isinstance(node, (ast.Import, ast.ImportFrom))
+                    ],
+                    type_ignores=[],
+                )
+                namespace = {}
+                exec(compile(imports, f"<{name}>", "exec"), namespace)
+                self.assertEqual(eval("math.floor(3 / 2)", namespace), 1)
+
     def test_cast_model_to_fp64_dtype_args(self):
         # Test that dtype arguments are converted to fp64
 
@@ -43,7 +159,7 @@ def forward(self, x_1):
     full = torch.ops.aten.full.default([32], 2, dtype = torch.float32, device = device(type='cpu'), pin_memory = False)
     empty = torch.ops.aten.empty.memory_format([32], dtype = torch.float32, layout = torch.strided, device = device(type='cpu'), pin_memory = False)
     return (convert_element_type, _to_copy, full, empty)
-    """,  # NOQA: B950
+    """,
         )
 
         _, fp64_examples = debug_utils.cast_to_fp64(fx, (x,))
@@ -58,8 +174,46 @@ def forward(self, x_1):
     full = torch.ops.aten.full.default([32], 2, dtype = torch.float64, device = device(type='cpu'), pin_memory = False)
     empty = torch.ops.aten.empty.memory_format([32], dtype = torch.float64, layout = torch.strided, device = device(type='cpu'), pin_memory = False)
     return (convert_element_type, _to_copy, full, empty)
-    """,  # NOQA: B950
+    """,
         )
+
+    def test_cast_model_to_fp64_disables_half_to_float(self):
+        for op_name, overload, use_kwargs in itertools.product(
+            ("_softmax", "_log_softmax"),
+            ("default", "out"),
+            (False, True),
+        ):
+            with self.subTest(
+                op_name=op_name, overload=overload, use_kwargs=use_kwargs
+            ):
+                graph = torch.fx.Graph()
+                x = graph.placeholder("x")
+                op = getattr(getattr(torch.ops.aten, op_name), overload)
+                kwargs = {}
+                inputs = [torch.randn(2, 4, dtype=torch.float16)]
+                if overload == "out":
+                    kwargs["out"] = graph.placeholder("out")
+                    inputs.append(torch.empty(2, 4, dtype=torch.float16))
+                if use_kwargs:
+                    kwargs["half_to_float"] = True
+                    output = graph.call_function(op, args=(x, 1), kwargs=kwargs)
+                else:
+                    output = graph.call_function(op, args=(x, 1, True), kwargs=kwargs)
+                graph.output(output)
+                model = torch.fx.GraphModule({}, graph)
+
+                fp64_model, fp64_inputs = debug_utils.cast_to_fp64(model, inputs)
+                softmax = next(
+                    node
+                    for node in fp64_model.graph.nodes
+                    if node.op == "call_function"
+                )
+                half_to_float = (
+                    softmax.kwargs["half_to_float"] if use_kwargs else softmax.args[2]
+                )
+
+                self.assertFalse(half_to_float)
+                self.assertEqual(fp64_model(*fp64_inputs).dtype, torch.float64)
 
     @patch.dict(
         os.environ,
@@ -68,6 +222,8 @@ def forward(self, x_1):
             "TEST_ENV": "1",
             "TORCHINDUCTOR_ENV_SINGLE_QUOTES": "inductor_'env'",
             "TORCHINDUCTOR_ENV_DOUBLE_QUOTES": 'inductor_"env"',
+            "TORCHDYNAMO_REPRO_AFTER": "aot",
+            "TORCHDYNAMO_REPRO_LEVEL": "4",
         },
     )
     def test_generate_env_vars_string(self):
@@ -97,9 +253,40 @@ def forward(self, x_1):
 """,
             env_strings,
         )
+        self.assertNotIn("os.environ['TORCHDYNAMO_REPRO_AFTER']", env_strings)
+        self.assertNotIn("os.environ['TORCHDYNAMO_REPRO_LEVEL']", env_strings)
+        self.assertIn("os.environ.pop('TORCHDYNAMO_REPRO_AFTER', None)", env_strings)
+        self.assertIn("os.environ.pop('TORCHDYNAMO_REPRO_LEVEL', None)", env_strings)
+
+    def test_cuda_system_info_comment_nvcc_os_errors(self):
+        self.addCleanup(debug_utils._cuda_system_info_comment.cache_clear)
+        errors = (
+            PermissionError(13, "Permission denied", "nvcc"),
+            OSError(5, "Input/output error", "nvcc"),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                debug_utils._cuda_system_info_comment.cache_clear()
+                with (
+                    patch.object(torch.cuda, "is_available", return_value=True),
+                    patch.object(torch.version, "hip", None),
+                    patch.object(
+                        debug_utils.subprocess,
+                        "check_output",
+                        side_effect=error,
+                    ),
+                    patch.object(torch.cuda, "device_count", return_value=0),
+                ):
+                    result = debug_utils._cuda_system_info_comment()
+
+                self.assertIn("# nvcc not found\n", result)
+                self.assertIn("# GPU Hardware Info: \n", result)
 
 
 class TestDebugUtilsDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def test_aot_graph_parser(self, device):
         def forward(
             self,
@@ -190,7 +377,7 @@ class TestDebugUtilsDevice(TestCase):
     def test_sym_aot_graph_parser(self, device):
         def forward(
             self,
-            primals_1: "f32[1001, 6]",  # noqa: F821
+            primals_1: "f32[1001, 6]",
             primals_2: "f32[s0]",  # noqa: F821
             primals_3: "Sym(s0)",  # noqa: F821,
             primals_4: "f32[s1]",  # noqa: F821,
@@ -209,13 +396,50 @@ class TestDebugUtilsDevice(TestCase):
         self.assertEqual(kwargs["primals_5"], 5)
 
 
-instantiate_device_type_tests(TestDebugUtils, globals())
+class TestNNModuleToStringBufferDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
 
-devices = ["cuda", "hpu"]
-instantiate_device_type_tests(TestDebugUtilsDevice, globals(), only_for=devices)
+    def test_nn_module_to_string_buffer_device(self, device):
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+        gm.register_buffer("test_buf", torch.empty(5, device=device))
+
+        result = NNModuleToString.convert(gm)
+
+        if torch.device(device).type == "cpu":
+            self.assertNotIn(".to(", result)
+        else:
+            expected_device = str(torch.empty(1, device=device).device)
+            self.assertIn(f'.to("{expected_device}")', result)
+            self.assertNotIn(f".{self.device_type}()", result)
+
+    def test_nn_module_to_string_param_device(self, device):
+        gm = torch.fx.symbolic_trace(torch.nn.Identity())
+        gm.register_parameter(
+            "test_param", torch.nn.Parameter(torch.empty(5, device=device))
+        )
+
+        result = NNModuleToString.convert(gm)
+
+        if torch.device(device).type == "cpu":
+            self.assertNotIn("device=", result)
+        else:
+            expected_device = str(torch.empty(1, device=device).device)
+            self.assertIn(f'device="{expected_device}"', result)
+            self.assertNotIn(f', device="{self.device_type}")', result)
+
+
+instantiate_device_type_tests(
+    TestNNModuleToStringBufferDevice, globals(), allow_xpu=True
+)
+
+instantiate_device_type_tests(
+    TestDebugUtilsDevice, globals(), except_for="mps", allow_xpu=True
+)
 
 
 class TestBackendOverrideIntegration(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()
@@ -325,9 +549,12 @@ class TestBackendOverrideIntegration(TestCase):
         result = self._run_with_override(device, "0:aot_eager;1:inductor;3:eager")
         self.assertEqual(result, ["aot_eager", "inductor", "eager"])
 
-    def test_first_rule_wins(self, device):
-        result = self._run_with_override(device, ">=0:aot_eager;>=1:inductor")
-        self.assertEqual(result, ["aot_eager", "aot_eager", "aot_eager", "aot_eager"])
+    def test_conflicting_rules_raise(self, device):
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.InternalTorchDynamoError,
+            "Conflicting backend override",
+        ):
+            self._run_with_override(device, ">=0:aot_eager;>=1:inductor")
 
     def test_complex_config(self, device):
         result = self._run_with_override(device, "0:aot_eager;>=2:inductor")
@@ -373,11 +600,13 @@ class TestBackendOverrideIntegration(TestCase):
 
 
 instantiate_device_type_tests(
-    TestBackendOverrideIntegration, globals(), only_for=["cpu", "cuda"]
+    TestBackendOverrideIntegration, globals(), except_for="mps"
 )
 
 
 class TestInductorConfigOverrideIntegration(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()
@@ -467,6 +696,18 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(router.get_value_for_graph(0), {"a": 1, "c": 3})
         self.assertEqual(router.get_value_for_graph(1), {"b": 2, "c": 3})
         self.assertEqual(router.get_value_for_graph(2), {"c": 3})
+
+    def test_backend_router_conflict_raises(self, device):
+        from torch._dynamo.graph_id_filter import GraphBackendRouter
+
+        with self.assertRaisesRegex(ValueError, "Conflicting backend override"):
+            GraphBackendRouter("0-5:eager;3-10:inductor")
+
+    def test_backend_router_same_backend_no_conflict(self, device):
+        from torch._dynamo.graph_id_filter import GraphBackendRouter
+
+        router = GraphBackendRouter("0:eager;>=0:eager")
+        self.assertIsNotNone(router.get_value_for_graph(0))
 
     def test_get_inductor_config_override_empty(self, device):
         from torch._dynamo.graph_id_filter import (
@@ -736,7 +977,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
             patch.object(compile_fx_mod, "compile_fx", tracking_compile_fx),
             patch.object(torch._functorch.config, "enable_autograd_cache", False),
         ):
-            compiled_fn = torch.compile(fn)
+            compiled_fn = torch.compile(fn)  # noqa: UNSPECIFIED_BACKEND
             x = torch.randn(10, device=device, requires_grad=True)
             result = compiled_fn(x)
             result.backward()
@@ -744,26 +985,89 @@ class TestInductorConfigOverrideIntegration(TestCase):
         # Verify each graph has fwd+bwd, correct overrides, no cross-graph
         # leak, and identical configs for forward and backward.
         for gid in range(3):
-            self.assertIn((gid, False), configs_at_compile, f"graph {gid} fwd missing")
-            self.assertIn((gid, True), configs_at_compile, f"graph {gid} bwd missing")
+            self.assertIn(
+                (gid, False),
+                configs_at_compile,
+                lambda msg: f"{msg}\ngraph {gid} fwd missing",
+            )
+            self.assertIn(
+                (gid, True),
+                configs_at_compile,
+                lambda msg: f"{msg}\ngraph {gid} bwd missing",
+            )
             expected = {**baseline, **expected_overrides[gid]}
             for is_bw in [False, True]:
                 phase = "backward" if is_bw else "forward"
                 self.assertEqual(
                     configs_at_compile[(gid, is_bw)],
                     expected,
-                    f"graph {gid} {phase}: config mismatch",
+                    lambda msg: f"{msg}\ngraph {gid} {phase}: config mismatch",
                 )
 
         self.assertIsNotNone(x.grad)
 
 
 instantiate_device_type_tests(
-    TestInductorConfigOverrideIntegration, globals(), only_for=["cpu", "cuda"]
+    TestInductorConfigOverrideIntegration,
+    globals(),
+    allow_xpu=True,
 )
 
 
+class TestConfigOverrideValidation(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def setUp(self):
+        super().setUp()
+        from torch._dynamo.graph_id_filter import (
+            _validate_backend_names,
+            _validate_dynamo_config_keys,
+            _validate_inductor_config_keys,
+        )
+
+        _validate_backend_names.cache_clear()
+        _validate_dynamo_config_keys.cache_clear()
+        _validate_inductor_config_keys.cache_clear()
+        torch._dynamo.reset()
+
+    def tearDown(self):
+        torch._dynamo.reset()
+        super().tearDown()
+
+    @torch._dynamo.config.patch(
+        debug_backend_override="0:not_a_real_backend",
+    )
+    def test_invalid_backend_raises_on_compile(self):
+        def fn(x):
+            return x + 1
+
+        with self.assertRaisesRegex(ValueError, "not_a_real_backend"):
+            torch.compile(fn, backend="eager")(torch.randn(4))
+
+    @torch._dynamo.config.patch(
+        debug_dynamo_config_override="0:nonexistent_dynamo_option=True",
+    )
+    def test_invalid_dynamo_config_raises_on_compile(self):
+        def fn(x):
+            return x + 1
+
+        with self.assertRaisesRegex(ValueError, "nonexistent_dynamo_option"):
+            torch.compile(fn, backend="eager")(torch.randn(4))
+
+    @torch._dynamo.config.patch(
+        debug_inductor_config_override="0:nonexistent_inductor_option=True",
+    )
+    def test_invalid_inductor_config_raises_on_compile(self):
+        def fn(x):
+            return x + 1
+
+        with self.assertRaisesRegex(ValueError, "nonexistent_inductor_option"):
+            torch.compile(fn, backend="eager")(torch.randn(4))
+
+
 class TestDynamoConfigOverrideIntegration(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()

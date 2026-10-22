@@ -9,7 +9,7 @@ from torch._export.serde.union import _Union, _union_dataclass
 
 
 # NOTE: Please update this value if any modifications are made to the schema
-SCHEMA_VERSION = (8, 18)
+SCHEMA_VERSION = (8, 20)
 TREESPEC_VERSION = 1
 
 
@@ -41,6 +41,8 @@ class ScalarType(IntEnum):
     FLOAT8E4M3FNUZ = 31
     FLOAT8E5M2FNUZ = 32
     FLOAT8E8M0FNU = 33
+    UINT32 = 34
+    UINT64 = 35
 
 
 class Layout(IntEnum):
@@ -82,6 +84,8 @@ SCALAR_TYPE_TO_C10: dict[int, str] = {
     ScalarType.FLOAT8E4M3FNUZ: "Float8_e4m3fnuz",
     ScalarType.FLOAT8E5M2FNUZ: "Float8_e5m2fnuz",
     ScalarType.FLOAT8E8M0FNU: "Float8_e8m0fnu",
+    ScalarType.UINT32: "UInt32",
+    ScalarType.UINT64: "UInt64",
 }
 
 LAYOUT_TO_C10: dict[int, str] = {
@@ -182,7 +186,7 @@ class SymFloatArgument(_Union):
 # SymBools.
 # The "as_bool" field is used in the case where we have a list containing a mix
 # of SymBool and bools (ex. [True, i0, ...]). We will serialize this type of list to
-# be List[SymboolArgument] and map the SymBools to the "as_name" field, and bools
+# be List[SymBoolArgument] and map the SymBools to the "as_name" field, and bools
 # to the "as_bool" field.
 @_union_dataclass
 class SymBoolArgument(_Union):
@@ -261,6 +265,7 @@ class Argument(_Union):
     as_nested_tensors: Annotated[list[list[TensorArgument]], 270]
     as_int_lists: Annotated[list[list[int]], 280]
     as_string_to_argument: Annotated[dict[str, "Argument"], 290]
+    as_float_lists: Annotated[list[list[float]], 300]
 
 
 class ArgumentKind(IntEnum):

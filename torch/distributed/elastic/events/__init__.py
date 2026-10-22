@@ -18,7 +18,7 @@ Example of usage:
   event = events.Event(
       name="test_event", source=events.EventSource.WORKER, metadata={...}
   )
-  events.get_logging_handler(destination="console").info(event)
+  events.record(event, destination="console")
 
 """
 
@@ -31,13 +31,7 @@ from typing import Optional
 
 from torch.distributed.elastic.events.handlers import get_logging_handler
 
-from .api import (  # noqa: F401
-    Event,
-    EventMetadataValue,
-    EventSource,
-    NodeState,
-    RdzvEvent,
-)
+from .api import Event, EventMetadataValue, EventSource, NodeState, RdzvEvent
 
 
 _events_loggers: dict[str, logging.Logger] = {}

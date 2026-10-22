@@ -2,7 +2,6 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <algorithm>
 #include <cerrno>
 #include <memory>
 #include <set>
@@ -46,12 +45,7 @@ static void register_fd(int fd) {
 }
 
 static void unregister_fd(int fd) {
-  pollfds.erase(
-      std::remove_if(
-          pollfds.begin(),
-          pollfds.end(),
-          [fd](const struct pollfd& pfd) { return pfd.fd == fd; }),
-      pollfds.end());
+  std::erase_if(pollfds, [fd](const struct pollfd& pfd) { return pfd.fd == fd; });
   client_sessions.erase(fd);
 }
 
@@ -90,7 +84,7 @@ static void free_used_object(const std::string& name) {
 }
 
 // NOLINTNEXTLINE(bugprone-exception-escape)
-int main(int argc, char* argv[]) {
+int main(int  /*argc*/, char*  /*argv*/[]) {
   setsid(); // Daemonize the process
 
   std::unique_ptr<ManagerServerSocket> srv_socket;

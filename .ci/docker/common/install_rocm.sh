@@ -2,309 +2,90 @@
 
 set -ex
 
-# for pip_install function
-source "$(dirname "${BASH_SOURCE[0]}")/common_utils.sh"
-
-ROCM_COMPOSABLE_KERNEL_VERSION="$(cat $(dirname $0)/../ci_commit_pins/rocm-composable-kernel.txt)"
-
-ver() {
-    printf "%3d%03d%03d%03d" $(echo "$1" | tr '.' ' ');
-}
-
 install_ubuntu() {
     apt-get update
-    # gpg-agent is not available by default
-    apt-get install -y --no-install-recommends gpg-agent
-    if [[ $(ver $UBUNTU_VERSION) -ge $(ver 22.04) ]]; then
-        echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
-            | sudo tee /etc/apt/preferences.d/rocm-pin-600
-    fi
-    apt-get install -y kmod
-    apt-get install -y wget
+    # kmod is used by GPU diagnostics; libc++ lets torch._C load at runtime.
+    apt-get install -y --no-install-recommends kmod libc++1 libc++abi1
+    # FIXME: Needed for rocSHMEM in ROCm7.14 since it had a dependency on libnuma.so
+    apt-get install -y libnuma-dev
+    # AOTriton configure calls pkg_search_module(liblzma); liblzma-dev provides the .pc file.
+    apt-get install -y --no-install-recommends liblzma-dev
 
-    # Need the libc++1 and libc++abi1 libraries to allow torch._C to load at runtime
-    apt-get install -y libc++1
-    apt-get install -y libc++abi1
+    install_rocm
 
-    # When ROCM_VERSION=nightly, install ROCm from TheRock nightly wheels
-    if [[ "${ROCM_VERSION}" == "nightly" ]]; then
-      echo "install_rocm.sh: installing ROCm from TheRock nightly wheels"
-
-      # Clean any previous ROCm installation in the base CI image.
-      if [[ -d /opt/rocm ]]; then
-        echo "Removing existing /opt/rocm from base image"
-        rm -rf /opt/rocm
-      fi
-
-      # Determine theRock nightly URL based on GPU architecture
-      # Check BUILD_ENVIRONMENT or PYTORCH_ROCM_ARCH for the target GPU
-      if [[ -z "${THEROCK_NIGHTLY_INDEX_URL:-}" ]]; then
-        if [[ "${BUILD_ENVIRONMENT}" == *"gfx950"* ]] || [[ "${PYTORCH_ROCM_ARCH}" == *"gfx950"* ]]; then
-          # MI350 (gfx950)
-          THEROCK_NIGHTLY_INDEX_URL="https://rocm.nightlies.amd.com/v2/gfx950-dcgpu/"
-          echo "Detected gfx950 architecture - using MI350 theRock nightly repository"
-        else
-          # Default to MI300 (gfx942/gfx94X)
-          THEROCK_NIGHTLY_INDEX_URL="https://rocm.nightlies.amd.com/v2/gfx94X-dcgpu/"
-          echo "Using gfx94X (MI300) theRock nightly repository"
+    # Standalone CMake projects such as rocm-origami call find_package(hip)
+    # directly instead of using PyTorch's ROCM_PATH-aware LoadHIP.cmake.
+    {
+        printf 'export CMAKE_PREFIX_PATH=%q:${CMAKE_PREFIX_PATH:-}\n' "${ROCM_HOME}"
+        printf 'export LD_LIBRARY_PATH=%q:${LD_LIBRARY_PATH:-}\n' "${ROCM_HOME}/lib"
+        if [[ -n "${USE_MSLK:-}" ]]; then
+            printf 'export USE_MSLK=%q\n' "${USE_MSLK}"
         fi
-      fi
+    } >> /etc/rocm_env.sh
 
-      export THEROCK_NIGHTLY_INDEX_URL
-      echo "TheRock Index URL: ${THEROCK_NIGHTLY_INDEX_URL}"
-
-      python3 -m pip install \
-        --index-url "${THEROCK_NIGHTLY_INDEX_URL}" \
-        "rocm[libraries,devel]"
-
-      # Use the rocm-sdk CLI helper to populate environment defaults
-      ROCM_HOME="$(rocm-sdk path --root)"
-      ROCM_BIN="$(rocm-sdk path --bin)"
-      ROCM_CMAKE_PREFIX="$(rocm-sdk path --cmake)"
-
-      echo "ROCM_HOME=${ROCM_HOME}"
-      echo "ROCM_BIN=${ROCM_BIN}"
-      echo "ROCM_CMAKE_PREFIX=${ROCM_CMAKE_PREFIX}"
-
-      export ROCM_HOME
-      export ROCM_PATH="${ROCM_HOME}"
-      export PATH="${ROCM_BIN}:${PATH}"
-      export CMAKE_PREFIX_PATH="${ROCM_CMAKE_PREFIX}:${CMAKE_PREFIX_PATH:-}"
-
-      # theRock bundles system dependencies like libdrm, liblzma in rocm_sysdeps
-      ROCM_SYSDEPS="${ROCM_HOME}/lib/rocm_sysdeps"
-      ROCM_SYSDEPS_INCLUDE="${ROCM_SYSDEPS}/include"
-      ROCM_SYSDEPS_PKGCONFIG="${ROCM_SYSDEPS}/lib/pkgconfig"
-
-      # Write environment to file that can be sourced by CI scripts and users
-      cat > /etc/rocm_env.sh << ROCM_ENV
-# ROCm paths
-export ROCM_PATH="${ROCM_HOME}"
-export ROCM_HOME="${ROCM_HOME}"
-export ROCM_SOURCE_DIR="${ROCM_HOME}"
-export ROCM_BIN="${ROCM_BIN}"
-export ROCM_CMAKE="${ROCM_CMAKE_PREFIX}"
-export PATH="${ROCM_BIN}:\${PATH}"
-export CMAKE_PREFIX_PATH="${ROCM_CMAKE_PREFIX}:\${CMAKE_PREFIX_PATH:-}"
-# Device library paths
-export HIP_DEVICE_LIB_PATH="${ROCM_HOME}/lib/llvm/amdgcn/bitcode"
-export ROCM_DEVICE_LIB_PATH="${ROCM_HOME}/lib/llvm/amdgcn/bitcode"
-# theRock system dependencies
-export ROCM_SYSDEPS_INCLUDE="${ROCM_SYSDEPS_INCLUDE}"
-export CPLUS_INCLUDE_PATH="${ROCM_SYSDEPS_INCLUDE}:\${CPLUS_INCLUDE_PATH:-}"
-export C_INCLUDE_PATH="${ROCM_SYSDEPS_INCLUDE}:\${C_INCLUDE_PATH:-}"
-export PKG_CONFIG_PATH="${ROCM_SYSDEPS_PKGCONFIG}:\${PKG_CONFIG_PATH:-}"
-export LD_LIBRARY_PATH="${ROCM_SYSDEPS}/lib:\${LD_LIBRARY_PATH:-}"
-export LIBRARY_PATH="${ROCM_SYSDEPS}/lib:\${LIBRARY_PATH:-}"
-export MAGMA_HOME="${ROCM_HOME}/magma"
-# Disable MSLK for theRock nightly (not yet supported)
-export USE_MSLK=0
-ROCM_ENV
-
-      # Append to bash.bashrc so interactive shells get the env vars
-      echo "source /etc/rocm_env.sh" >> /etc/bash.bashrc
-
-      echo "install_rocm.sh: TheRock nightly ROCm install complete"
-      exit 0
+    if [[ -e /etc/bash.bashrc ]]; then
+        echo "source /etc/rocm_env.sh" >> /etc/bash.bashrc
+    fi
+    if [[ -e /etc/bashrc ]]; then
+        echo "source /etc/rocm_env.sh" >> /etc/bashrc
     fi
 
-    # Make sure rocm packages from repo.radeon.com have highest priority
-    cat << EOF > /etc/apt/preferences.d/rocm-pin-600
-Package: *
-Pin: release o=repo.radeon.com
-Pin-Priority: 600
-EOF
-
-    # we want the patch version of 6.4 instead
-    if [[ $(ver $ROCM_VERSION) -eq $(ver 6.4) ]]; then
-        ROCM_VERSION="${ROCM_VERSION}.2"
-    fi
-
-    # Default url values
-    rocm_baseurl="http://repo.radeon.com/rocm/apt/${ROCM_VERSION}"
-    UBUNTU_VERSION_NAME=`cat /etc/os-release | grep UBUNTU_CODENAME | awk -F= '{print $2}'`
-
-    # Add rocm repository
-    wget -qO - http://repo.radeon.com/rocm/rocm.gpg.key | apt-key add -
-    echo "deb [arch=amd64] ${rocm_baseurl} ${UBUNTU_VERSION_NAME} main" > /etc/apt/sources.list.d/rocm.list
-    apt-get update --allow-insecure-repositories
-
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated \
-                   rocm-dev \
-                   rocm-utils \
-                   rocm-libs \
-                   rccl \
-                   rocprofiler-dev \
-                   roctracer-dev \
-                   amd-smi-lib
-
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 6.1) ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated rocm-llvm-dev
-    fi
-
-    if [[ $(ver $ROCM_VERSION) -lt $(ver 7.1) ]]; then
-      # precompiled miopen kernels added in ROCm 3.5, renamed in ROCm 5.5, removed in ROCm 7.1
-      # search for all unversioned packages
-      # if search fails it will abort this script; use true to avoid case where search fails
-      MIOPENHIPGFX=$(apt-cache search --names-only miopen-hip-gfx | awk '{print $1}' | grep -F -v . || true)
-      if [[ "x${MIOPENHIPGFX}" = x ]]; then
-        echo "miopen-hip-gfx package not available" && exit 1
-      else
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated ${MIOPENHIPGFX}
-      fi
-    fi
-
-    # ROCm 7.2 needs a fix from procprof sdk that isn't available until 7.2.1
-    if [[ $(ver $ROCM_VERSION) -eq $(ver 7.2) ]]; then
-        git clone --no-checkout --filter=blob:none https://github.com/ROCm/rocm-systems.git
-        pushd rocm-systems/
-        git sparse-checkout init --cone
-        git sparse-checkout set projects/rocprofiler-sdk shared/rocprofiler-compute
-        git checkout develop
-        git checkout rocm-7.2.0
-        git config --global user.email "you@example.com"
-        git config --global user.name "Your Name"
-        git cherry-pick a71cc3cc88ed68b24c40cefec77d764053044862
-        sudo apt install -y cmake libdw-dev libsqlite3-dev
-        cmake                                         \
-              -B rocprofiler-sdk-build                \
-              -DCMAKE_INSTALL_PREFIX=/opt/rocm        \
-              -DCMAKE_PREFIX_PATH=/opt/rocm           \
-              -DGPU_TARGETS="${PYTORCH_ROCM_ARCH}"    \
-              projects/rocprofiler-sdk
-        cmake --build rocprofiler-sdk-build --target all --parallel $(nproc)
-        cmake --build rocprofiler-sdk-build --target install
-        popd
-    fi
-
-    # ROCm 6.0 had a regression where journal_mode was enabled on the kdb files resulting in permission errors at runtime
-    for kdb in /opt/rocm/share/miopen/db/*.kdb
-    do
-        sqlite3 $kdb "PRAGMA journal_mode=off; PRAGMA VACUUM;"
-    done
-
-    # ROCm 6.3 had a regression where initializing static code objects had significant overhead
-    # CI no longer builds for ROCm 6.3, but
-    # ROCm 6.4 did not yet fix the regression, also HIP branch names are different
-    if [[ $(ver $ROCM_VERSION) -ge $(ver 6.4) ]] && [[ $(ver $ROCM_VERSION) -lt $(ver 7.0) ]]; then
-        if [[ $(ver $ROCM_VERSION) -eq $(ver 6.4.2) ]]; then
-            HIP_TAG=rocm-6.4.2
-            CLR_HASH=74d78ba3ac4bac235d02bcb48511c30b5cfdd457  # branch release/rocm-rel-6.4.2-statco-hotfix
-        elif [[ $(ver $ROCM_VERSION) -eq $(ver 6.4.1) ]]; then
-            HIP_TAG=rocm-6.4.1
-            CLR_HASH=efe6c35790b9206923bfeed1209902feff37f386  # branch release/rocm-rel-6.4.1-statco-hotfix
-        elif [[ $(ver $ROCM_VERSION) -eq $(ver 6.4) ]]; then
-            HIP_TAG=rocm-6.4.0
-            CLR_HASH=600f5b0d2baed94d5121e2174a9de0851b040b0c  # branch release/rocm-rel-6.4-statco-hotfix
-        fi
-        # clr build needs CppHeaderParser but can only find it using conda's python
-        python -m pip install CppHeaderParser
-        git clone https://github.com/ROCm/HIP -b $HIP_TAG
-        HIP_COMMON_DIR=$(readlink -f HIP)
-        git clone https://github.com/jeffdaily/clr
-        pushd clr
-        git checkout $CLR_HASH
-        popd
-        mkdir -p clr/build
-        pushd clr/build
-        # Need to point CMake to the correct python installation to find CppHeaderParser
-        cmake .. -DPython3_EXECUTABLE=/opt/conda/envs/py_${ANACONDA_PYTHON_VERSION}/bin/python3 -DCLR_BUILD_HIP=ON -DHIP_COMMON_DIR=$HIP_COMMON_DIR
-        make -j
-        cp hipamd/lib/libamdhip64.so.6.4.* /opt/rocm/lib/libamdhip64.so.6.4.*
-        popd
-        rm -rf HIP clr
-    fi
-
-    pip_install "git+https://github.com/rocm/composable_kernel@$ROCM_COMPOSABLE_KERNEL_VERSION"
-
-    # Write environment to file that can be sourced by CI scripts and users
-    cat > /etc/rocm_env.sh << ROCM_ENV
-# ROCm paths
-export ROCM_PATH=/opt/rocm
-export ROCM_HOME=/opt/rocm
-export ROCM_SOURCE_DIR=/opt/rocm
-export ROCM_BIN=/opt/rocm/bin
-export ROCM_CMAKE=/opt/rocm
-export PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:\${PATH}
-# Device library paths
-export ROCM_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode
-export HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode
-export MAGMA_HOME=/opt/rocm/magma
-ROCM_ENV
-
-    # Append to bash.bashrc so interactive shells get the env vars
-    echo "source /etc/rocm_env.sh" >> /etc/bash.bashrc
-
-    # Cleanup
     apt-get autoclean && apt-get clean
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 }
 
-install_centos() {
+install_rocm() {
+    # ROCm from the multi-arch TheRock wheel index.
+    # The ROCm SDK unpacks under <site-packages>/_rocm_sdk_*; discover the real
+    # install root via `rocm-sdk path` and export it through /etc/rocm_env.sh.
+    : "${THEROCK_INDEX_URL:?THEROCK_INDEX_URL must be set}"
+    : "${ROCM_VERSION:?ROCM_VERSION must be set}"
 
-  yum update -y
-  yum install -y kmod
-  yum install -y wget
-  yum install -y openblas-devel
+    # Major.minor pins (e.g. 7.14) accept later patches via ==7.14.*.
+    # Fully specified preview pins (e.g. 7.15.0a20260712) stay exact; PEP 440
+    # rejects ==7.15.0a20260712.*.
+    rocm_pip_version="${ROCM_VERSION}"
+    if [[ "${ROCM_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        rocm_pip_version="${ROCM_VERSION}.*"
+    fi
 
-  yum install -y epel-release
-  yum install -y dkms kernel-headers-`uname -r` kernel-devel-`uname -r`
+    echo "=============================================="
+    echo "ROCm Multi-Arch Wheel Installation (TheRock)"
+    echo "Index URL:  ${THEROCK_INDEX_URL}"
+    echo "ROCm version: ${ROCM_VERSION}"
+    echo "ROCm spec:  rocm[libraries,devel,device-all]==${rocm_pip_version}"
+    echo "=============================================="
 
-  # Add amdgpu repository
-  local amdgpu_baseurl
-  if [[ $OS_VERSION == 9 ]]; then
-      amdgpu_baseurl="https://repo.radeon.com/amdgpu/${ROCM_VERSION}/rhel/9.0/main/x86_64"
-  else
-      amdgpu_baseurl="https://repo.radeon.com/amdgpu/${ROCM_VERSION}/rhel/7.9/main/x86_64"
-  fi
-  echo "[AMDGPU]" > /etc/yum.repos.d/amdgpu.repo
-  echo "name=AMDGPU" >> /etc/yum.repos.d/amdgpu.repo
-  echo "baseurl=${amdgpu_baseurl}" >> /etc/yum.repos.d/amdgpu.repo
-  echo "enabled=1" >> /etc/yum.repos.d/amdgpu.repo
-  echo "gpgcheck=1" >> /etc/yum.repos.d/amdgpu.repo
-  echo "gpgkey=http://repo.radeon.com/rocm/rocm.gpg.key" >> /etc/yum.repos.d/amdgpu.repo
+    # device-all pulls kernels for every supported gfx target (multi-arch wheel);
+    # libraries+devel provide the runtime libs + headers/hipcc to compile against ROCm.
+    python3 -m pip install --index-url "${THEROCK_INDEX_URL}" "rocm[libraries,devel,device-all]==${rocm_pip_version}"
 
-  local rocm_baseurl="http://repo.radeon.com/rocm/yum/${ROCM_VERSION}"
-  echo "[ROCm]" > /etc/yum.repos.d/rocm.repo
-  echo "name=ROCm" >> /etc/yum.repos.d/rocm.repo
-  echo "baseurl=${rocm_baseurl}" >> /etc/yum.repos.d/rocm.repo
-  echo "enabled=1" >> /etc/yum.repos.d/rocm.repo
-  echo "gpgcheck=1" >> /etc/yum.repos.d/rocm.repo
-  echo "gpgkey=http://repo.radeon.com/rocm/rocm.gpg.key" >> /etc/yum.repos.d/rocm.repo
+    # Discover the real install root/bin via the rocm-sdk CLI (rocm-sdk-core wheel).
+    ROCM_HOME="$(rocm-sdk path --root)"
+    ROCM_BIN="$(rocm-sdk path --bin)"
 
-  yum update -y
+    # Common build-time environment sourced by CI scripts.
+    {
+        echo '# ROCm paths discovered from rocm-sdk.'
+        printf 'export ROCM_PATH=%q\n' "${ROCM_HOME}"
+        printf 'export ROCM_HOME=%q\n' "${ROCM_HOME}"
+        printf 'export PATH=%q:${PATH}\n' "${ROCM_BIN}"
+    } > /etc/rocm_env.sh
 
-  yum install -y \
-                   rocm-dev \
-                   rocm-utils \
-                   rocm-libs \
-                   rccl \
-                   rocprofiler-dev \
-                   roctracer-dev \
-                   amd-smi-lib
+    echo "TheRock ROCm wheel install complete: ROCM_HOME=${ROCM_HOME}"
+}
 
-  # precompiled miopen kernels; search for all unversioned packages
-  # if search fails it will abort this script; use true to avoid case where search fails
-  MIOPENHIPGFX=$(yum -q search miopen-hip-gfx | grep miopen-hip-gfx | awk '{print $1}'| grep -F kdb. || true)
-  if [[ "x${MIOPENHIPGFX}" = x ]]; then
-    echo "miopen-hip-gfx package not available" && exit 1
-  else
-    yum install -y ${MIOPENHIPGFX}
-  fi
+install_almalinux() {
+    # repair_wheel.py copies libnuma.so.1 into torch/lib as libnuma.so so
+    # pre-10.0 rocSHMEM's dlopen("libnuma.so") resolves. The copy fails the
+    # wheel build if numactl-libs is missing.
+    yum install -y numactl-libs
 
-  # ROCm 6.0 had a regression where journal_mode was enabled on the kdb files resulting in permission errors at runtime
-  for kdb in /opt/rocm/share/miopen/db/*.kdb
-  do
-      sqlite3 $kdb "PRAGMA journal_mode=off; PRAGMA VACUUM;"
-  done
-
-  pip_install "git+https://github.com/rocm/composable_kernel@$ROCM_COMPOSABLE_KERNEL_VERSION"
-
-  # Cleanup
-  yum clean all
-  rm -rf /var/cache/yum
-  rm -rf /var/lib/yum/yumdb
-  rm -rf /var/lib/yum/history
+    # The manywheel build intentionally uses only the common ROCm environment.
+    # Its produced wheel resolves ROCm at runtime via RPATH (see repair_wheel.py),
+    # so unlike Ubuntu CI it must not add ROCm to LD_LIBRARY_PATH.
+    install_rocm
+    echo "source /etc/rocm_env.sh" >> /etc/bashrc || true
 }
 
 # Install Python packages depending on the base OS
@@ -313,8 +94,8 @@ case "$ID" in
   ubuntu)
     install_ubuntu
     ;;
-  centos)
-    install_centos
+  almalinux)
+    install_almalinux
     ;;
   *)
     echo "Unable to determine OS..."

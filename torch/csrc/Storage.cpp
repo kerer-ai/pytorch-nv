@@ -6,15 +6,12 @@
 
 #include <ATen/mps/MPSDevice.h>
 #include <c10/core/CPUAllocator.h>
-#include <c10/core/RefcountedDeleter.h>
-#include <libshm.h>
 #include <torch/csrc/CudaIPCTypes.h>
 #include <torch/csrc/Device.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/StorageMethods.h>
 #include <torch/csrc/StorageSharing.h>
 #include <torch/csrc/THP.h>
-#include <torch/csrc/autograd/utils/wrap_outputs.h>
 #include <torch/csrc/copy_utils.h>
 #include <torch/csrc/utils/device_lazy_init.h>
 #include <torch/csrc/utils/pyobject_preservation.h>
@@ -39,11 +36,6 @@ PyTypeObject* THPStorageClass = nullptr;
 static PyObject* THPStorage_New(PyTypeObject* type, c10::Storage _storage) {
   PyObject* obj = type->tp_alloc(type, 0);
   TORCH_CHECK(obj, "Failed to allocate a ", type->tp_name, " object");
-
-  // Ensure that PyUnstable_TryIncref calls don't fail spuriously in
-  // free-threaded Python.
-  PyUnstable_EnableTryIncRef(obj);
-
   auto s = (THPStorage*)obj;
   new (&s->cdata) c10::Storage(std::move(_storage));
   return obj;
@@ -60,35 +52,17 @@ PyObject* THPStorage_NewWithStorage(PyTypeObject* type, c10::Storage _storage) {
 
   c10::StorageImpl* storage_impl = _storage.unsafeGetStorageImpl();
   PyObject* obj = THPStorage_New(type, std::move(_storage));
-  PyObjectPreservation::init_fresh_nonatomic(
-      storage_impl, storage_impl->pyobj_slot(), obj);
+  PyObjectPreservation::init_fresh_nonatomic(*storage_impl, obj);
   return obj;
 }
 
 // Returns a PyObject wrapper for the c10::Storage object. The existing
 // wrapper is returned if it already exists.
 PyObject* THPStorage_Wrap(c10::Storage storage) {
-  if (c10::impl::HermeticPyObjectTLS::get_state()) {
-    return THPStorage_New(THPStorageClass, std::move(storage));
-  }
-
   c10::StorageImpl* storage_impl = storage.unsafeGetStorageImpl();
-  c10::impl::PyObjectSlot* pyobj_slot = storage_impl->pyobj_slot();
-
-  PyObject* obj = pyobj_slot->load_pyobj();
-  if (obj) {
-    return Py_NewRef(obj);
-  }
-
-  obj = THPStorage_New(THPStorageClass, std::move(storage));
-  PyObject* wrapper =
-      PyObjectPreservation::init_once(storage_impl, pyobj_slot, obj);
-  if (wrapper != obj) {
-    // Another thread beat us to it
-    Py_DECREF(obj);
-    return Py_NewRef(wrapper);
-  }
-  return obj;
+  return PyObjectPreservation::get_or_init(*storage_impl, [&]() {
+    return THPStorage_New(THPStorageClass, std::move(storage));
+  });
 }
 
 static void THPStorage_dealloc(PyObject* self) {
@@ -254,7 +228,6 @@ static PyObject* THPStorage_pynew(
           "but one of the items was of type ",
           THPUtils_typename(item.get()),
           " instead of int");
-      return nullptr;
     }
   }
   return self;
@@ -302,7 +275,6 @@ static PyObject* THPStorage_get(THPStorage* self, PyObject* index) {
           step,
           ", but only a step of "
           "1 is supported");
-      return nullptr;
     }
 
     const auto& storage = THPStorage_Unpack(self);
@@ -351,7 +323,6 @@ static int THPStorage_set(THPStorage* self, PyObject* index, PyObject* value) {
         "can only set storage content with a int types, but got ",
         THPUtils_typename(value),
         " instead");
-    return -1;
   }
 
   uint8_t rvalue = THPByteUtils_unpackReal(value);
@@ -374,7 +345,6 @@ static int THPStorage_set(THPStorage* self, PyObject* index, PyObject* value) {
           step,
           ", but only a step of "
           "1 is supported");
-      return 0;
     }
     // TODO: check the bounds only once
     // TODO: fill?
@@ -384,7 +354,6 @@ static int THPStorage_set(THPStorage* self, PyObject* index, PyObject* value) {
   }
   TORCH_CHECK(
       false, "can't index a " THPStorageStr " with ", THPUtils_typename(index));
-  return -1;
   END_HANDLE_TH_ERRORS_RET(-1)
 }
 
@@ -438,14 +407,14 @@ PyTypeObject THPStorageType = {
     THPStorage_pynew, /* tp_new */
 };
 
-static PyObject* THPStorage_device(THPStorage* self, void* unused) {
+static PyObject* THPStorage_device(THPStorage* self, void* /*unused*/) {
   HANDLE_TH_ERRORS
   THPStorage_assertNotNull(self);
   return THPDevice_New(THPStorage_Unpack(self).device());
   END_HANDLE_TH_ERRORS
 }
 
-static PyObject* THPStorage_get_cdata(THPStorage* self, void* unused) {
+static PyObject* THPStorage_get_cdata(THPStorage* self, void* /*unused*/) {
   HANDLE_TH_ERRORS
   return PyLong_FromVoidPtr(THPStorage_Unpack(self).unsafeGetStorageImpl());
   END_HANDLE_TH_ERRORS
@@ -474,19 +443,15 @@ bool THPStorage_init(PyObject* module) {
 
   THPStorageType.tp_methods = methods.data();
   THPStorageType.tp_getset = THPStorage_properties;
-  if (PyType_Ready(&THPStorageType) < 0)
+  if (PyModule_AddType(module, &THPStorageType) < 0)
     return false;
-  Py_INCREF(&THPStorageType);
-  PyModule_AddObject(
-      module, "StorageBase", reinterpret_cast<PyObject*>(&THPStorageType));
   return true;
 }
 
 void THPStorage_postInit(PyObject* module) {
   THPStorageClass = reinterpret_cast<PyTypeObject*>(
       PyObject_GetAttrString(module, "UntypedStorage"));
-  if (!THPStorageClass)
-    throw python_error();
+  TORCH_CHECK_PYTHON(THPStorageClass);
 }
 
 void THPStorage_assertNotNull(THPStorage* storage) {

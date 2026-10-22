@@ -1,4 +1,3 @@
-# mypy: allow-untyped-defs
 import collections
 import heapq
 import operator
@@ -30,7 +29,7 @@ CALLABLE_NODE_OPS = {"call_module", "call_function", "call_method"}
 
 
 @compatibility(is_backward_compatible=False)
-def get_acc_ops_name(k):
+def get_acc_ops_name(k: str | type) -> str:
     if isinstance(k, str):
         return k
     elif k.__module__ and "acc_ops" in k.__module__:
@@ -105,7 +104,7 @@ class FxNetAccFusionsFinder:
     Such groups are called fusion groups.
     """
 
-    def __init__(self, module: torch.fx.GraphModule, acc_nodes: NodeSet):
+    def __init__(self, module: torch.fx.GraphModule, acc_nodes: NodeSet) -> None:
         self.module = module
         self.nodes = list(module.graph.nodes)
         self.acc_nodes = acc_nodes
@@ -125,7 +124,7 @@ class FxNetAccFusionsFinder:
         # Nodes that in the fusion group that haven't been processed yet.
         nodes_need_process: NodeSet
 
-        def add_node(self, node):
+        def add_node(self, node: torch.fx.Node) -> None:
             """
             Add a node to fusion group.
             """
@@ -148,12 +147,19 @@ class FxNetAccFusionsFinder:
         fusion_group: "FxNetAccFusionsFinder.FusionGroup",
         inputs: NodeSet | NodeList,
         visited: NodeSet | None = None,
-    ):
+    ) -> bool:
         """
         Start from inputs and going reverse topological order. If any upstream node
         is in the fusion group, add all the nodes in this path to fusion group.
         """
-        for arg in inputs:
+        # Sets have hash-dependent iteration order. Preserve the semantic order
+        # of node input lists, but canonicalize fusion-frontier sets.
+        ordered_inputs = (
+            sorted(inputs, key=self.node_index.__getitem__)
+            if isinstance(inputs, set)
+            else inputs
+        )
+        for arg in ordered_inputs:
             # skip the node if already seen
             if visited is not None:
                 if arg in visited:
@@ -183,7 +189,9 @@ class FxNetAccFusionsFinder:
 
     def __call__(self) -> dict[torch.fx.Node, NodeSet]:
         result: dict[torch.fx.Node, NodeSet] = {}
-        acc_nodes = list(self.acc_nodes)
+        # Invalid fusion groups mutate self.acc_nodes, so seed order can change
+        # which later groups are visited. Always use the FX graph order.
+        acc_nodes = [node for node in self.nodes if node in self.acc_nodes]
 
         for node in acc_nodes:
             if node in result:
@@ -202,7 +210,11 @@ class FxNetAccFusionsFinder:
                 nodes_need_process={node},
             )
             while fusion_group.nodes_need_process:
-                node = fusion_group.nodes_need_process.pop()
+                node = min(
+                    fusion_group.nodes_need_process,
+                    key=self.node_index.__getitem__,
+                )
+                fusion_group.nodes_need_process.remove(node)
                 self.recursive_add_node(
                     fusion_group,
                     fusion_group.inputs,
@@ -246,7 +258,7 @@ class FxNetAccFusionsFinder:
             if not (set(fusion_group.nodes) <= self.acc_nodes):
                 self.acc_nodes -= fusion_group.nodes
             else:
-                for n in fusion_group.nodes:
+                for n in sorted(fusion_group.nodes, key=self.node_index.__getitem__):
                     result[n] = fusion_group.nodes
 
         return result
@@ -302,7 +314,7 @@ def legalize_graph(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     for node in gm.graph.nodes:
         for user in node.users:
             indeg[user] += 1
-    queue: collections.deque = collections.deque()
+    queue: collections.deque[torch.fx.Node] = collections.deque()
     # Add all nodes with no dependencies to the queue
     for node in gm.graph.nodes:
         if indeg[node] == 0:

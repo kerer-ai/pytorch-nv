@@ -101,6 +101,7 @@ _builtin_ops = [
     (torch.autograd.grad, "aten::grad"),
     (torch.autograd.backward, "aten::backward"),
     (torch._C._infer_size, "aten::_infer_size"),
+    (torch.broadcast_shapes, "aten::broadcast_shapes"),
     (
         torch.nn.functional._no_grad_embedding_renorm_,  # type: ignore[attr-defined]
         "aten::_no_grad_embedding_renorm_",
@@ -111,6 +112,7 @@ _builtin_ops = [
     (torch.nn.init._no_grad_uniform_, "aten::_no_grad_uniform_"),
     (torch.nn.init._no_grad_zero_, "aten::_no_grad_zero_"),
     (torch._C._get_tracing_state, "aten::_get_tracing_state"),
+    (torch._C._is_tracing, "aten::_is_tracing"),
     (torch._C._get_cpu_capability, "aten::_get_cpu_capability"),
     (warnings.warn, "aten::warn"),
     (torch._VF.stft, "aten::stft"),  # type: ignore[attr-defined]

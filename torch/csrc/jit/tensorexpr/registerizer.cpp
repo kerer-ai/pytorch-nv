@@ -104,7 +104,7 @@ bool AccessInfo::dependsOnVar(const VarPtr& v) {
     i->accept(&vf);
   }
 
-  return vf.vars().count(v);
+  return vf.vars().contains(v);
 }
 
 std::shared_ptr<AccessInfo> AccessInfo::cloneWithHiddenInfo(
@@ -161,17 +161,12 @@ AccessHashMap& Scope::getAccessMapByBuf(const BufPtr& b) {
 }
 
 void Scope::filterClosed() {
-  closedAccesses_.erase(
-      std::remove_if(
-          closedAccesses_.begin(),
-          closedAccesses_.end(),
-          [](auto info) {
-            return info->store_cost()->isConstant() &&
-                immediateAs<int>(info->store_cost()) <= 1 &&
-                info->load_cost()->isConstant() &&
-                immediateAs<int>(info->load_cost()) <= 1;
-          }),
-      closedAccesses_.end());
+  std::erase_if(closedAccesses_, [](auto info) {
+    return info->store_cost()->isConstant() &&
+        immediateAs<int>(info->store_cost()) <= 1 &&
+        info->load_cost()->isConstant() &&
+        immediateAs<int>(info->load_cost()) <= 1;
+  });
 }
 
 // RegisterizerAnalysis
@@ -179,7 +174,7 @@ void Scope::filterClosed() {
 void RegisterizerAnalysis::closeAccessIntoScope(
     const std::shared_ptr<AccessInfo>& info,
     const std::shared_ptr<Scope>& scope) {
-  if (exprConditionals_.count(info->conditionId()) != 0) {
+  if (exprConditionals_.contains(info->conditionId())) {
     return;
   }
 
@@ -191,11 +186,10 @@ void RegisterizerAnalysis::closeAccessIntoScope(
 }
 
 void RegisterizerAnalysis::visit(const ForPtr& v) {
-  if (v->loop_options().is_gpu_block_index() ||
-      v->loop_options().is_gpu_thread_index()) {
-    throw malformed_input(
-        "Registerization must occur after parallelism flattening");
-  }
+  TORCH_CHECK(
+      !v->loop_options().is_gpu_block_index() &&
+          !v->loop_options().is_gpu_thread_index(),
+      "MALFORMED INPUT: Registerization must occur after parallelism flattening");
 
   auto parent = currentScope_;
   currentScope_ = std::make_shared<Scope>(v->body(), parent);
@@ -291,13 +285,13 @@ void RegisterizerAnalysis::visit(const CondPtr& v) {
       std::make_shared<Scope>(false_stmt, prev_scope, ++conditionId_);
 
   if (true_stmt) {
-    currentScope_ = true_scope;
+    currentScope_ = std::move(true_scope);
     true_stmt->accept(this);
     mergeHiddenScope(true);
     mergeCurrentScopeIntoParent();
   }
   if (false_stmt) {
-    currentScope_ = false_scope;
+    currentScope_ = std::move(false_scope);
     false_stmt->accept(this);
     mergeHiddenScope(true);
     mergeCurrentScopeIntoParent();
@@ -335,14 +329,14 @@ void RegisterizerAnalysis::visit(const IfThenElsePtr& v) {
   exprConditionals_.insert(false_scope->conditionId());
 
   if (true_value) {
-    currentScope_ = true_scope;
+    currentScope_ = std::move(true_scope);
     true_value->accept(this);
     mergeHiddenScope(false);
     mergeCurrentScopeIntoParent();
   }
 
   if (false_value) {
-    currentScope_ = false_scope;
+    currentScope_ = std::move(false_scope);
     false_value->accept(this);
     mergeHiddenScope(false);
     mergeCurrentScopeIntoParent();
@@ -522,7 +516,7 @@ void RegisterizerAnalysis::mergeHiddenScope(bool allowClosed) {
   }
 }
 
-// Merge currentScope_ into it's parent, and make parent the new currentScope_.
+// Merge currentScope_ into its parent, and make parent the new currentScope_.
 void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
   auto parent = currentScope_->parent();
 
@@ -637,7 +631,7 @@ void RegisterizerAnalysis::mergeCurrentScopeIntoParent() {
     }
   }
 
-  currentScope_ = parent;
+  currentScope_ = std::move(parent);
 }
 
 std::vector<std::shared_ptr<AccessInfo>> RegisterizerAnalysis::getCandidates() {
@@ -664,7 +658,7 @@ ExprPtr RegisterizerReplacer::mutate(const LoadPtr& v) {
 }
 
 StmtPtr RegisterizerReplacer::mutate(const StorePtr& v) {
-  if (eliminatedIntializers_.count(v) != 0) {
+  if (eliminatedIntializers_.contains(v)) {
     // This store is the initializer for a scalar var that is already inserted.
     return nullptr;
   }

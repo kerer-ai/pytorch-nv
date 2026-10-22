@@ -158,7 +158,7 @@ void checkOutputNames(
   }
 
   for (const auto& name : validNames) {
-    if (graphNames.find(name) == graphNames.end()) {
+    if (!graphNames.contains(name)) {
       std::string errorMsg = fmt::format(
           "Error: Value name difference detected between graph signature and graph nodes:\n"
           "Signature value names:\n[{}]\n"
@@ -258,6 +258,8 @@ GraphSignature::GraphSignature(const torch::_export::GraphSignature& storage) {
             userInputArg.tag() ==
                 torch::_export::Argument::Tag::AS_SYM_FLOATS ||
             userInputArg.tag() == torch::_export::Argument::Tag::AS_INT_LISTS ||
+            userInputArg.tag() ==
+                torch::_export::Argument::Tag::AS_FLOAT_LISTS ||
             userInputArg.tag() ==
                 torch::_export::Argument::Tag::AS_SCALAR_TYPE ||
             userInputArg.tag() ==
@@ -401,7 +403,7 @@ GraphSignature::GraphSignature(const torch::_export::GraphSignature& storage) {
                     torch::_export::SymBoolArgument::Tag::AS_NAME) {
                   userOutputs_.emplace_back(symBool.get_as_name());
                 }
-                // Skip AS_BOOL (constant) symbools
+                // Skip AS_BOOL (constant) symbols
               }
               break;
             }

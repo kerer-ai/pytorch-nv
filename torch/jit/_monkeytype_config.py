@@ -63,7 +63,7 @@ def get_type(type):
 def get_optional_of_element_type(types):
     """Extract element type, return as `Optional[element type]` from consolidated types.
 
-    Helper function to extracts the type of the element to be annotated to Optional
+    Helper function to extract the type of the element to be annotated to Optional
     from the list of consolidated types and returns `Optional[element type]`.
     TODO: To remove this check once Union support lands.
     """
@@ -171,7 +171,7 @@ else:
         def __init__(self) -> None:
             pass
 
-    monkeytype_trace = None  # type: ignore[assignment]  # noqa: F811
+    monkeytype_trace = None  # type: ignore[assignment]
 
 
 def jit_code_filter(code: CodeType) -> bool:

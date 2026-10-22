@@ -609,6 +609,23 @@ class TestConvolutionNNDeviceType(NNTestCase):
             _test(t, weight_even, mode)
             _test(t, weight_odd, mode)
 
+    @dtypes(torch.double)
+    def test_conv1d_backward_depthwise(self, device, dtype):
+        batch, channels, width = 2, 4, 2
+        x = make_tensor(
+            (batch, 1, channels), device=device, dtype=dtype, requires_grad=True
+        ).transpose(1, 2)
+        weight = make_tensor(
+            (channels, width), device=device, dtype=dtype, requires_grad=True
+        )
+
+        def conv1d_depthwise(x, weight):
+            return torch.nn.functional.conv1d(
+                x, weight.unsqueeze(1), padding=width - 1, groups=channels
+            )
+
+        gradcheck(conv1d_depthwise, (x, weight))
+
     @unittest.skipIf(not TEST_SCIPY, "Scipy required for the test.")
     @dtypes(torch.float)
     @parametrize_test("mode", ("valid", "same"))
@@ -1356,6 +1373,39 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
         # input NHWC, output NHWC
         assert_size_stride(out, (2, 512, 7, 7), (25088, 1, 3584, 512))
+
+    @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    def test_conv_misaligned_input(self, device, dtype):
+        N, C, OUT_CHANNELS = 2, 3, 4
+
+        def make_misaligned_tensor(tensor, shape):
+            numel = math.prod(shape)
+            base = torch.empty(numel + 1, device=device, dtype=dtype)
+            tensor_device = base[1:].reshape(shape)
+            tensor_device.copy_(tensor.to(device))
+            self.assertTrue(tensor_device.data_ptr() % 64 != 0)
+            return tensor_device
+
+        for conv_fn, spatial in [
+            (F.conv1d, (16,)),
+            (F.conv2d, (8, 8)),
+            (F.conv3d, (4, 4, 4)),
+        ]:
+            kernel = (3,) * len(spatial)
+            input_shape = (N, C) + spatial
+            weight_shape = (OUT_CHANNELS, C) + kernel
+
+            input_cpu = torch.randn(input_shape, dtype=dtype)
+            weight_cpu = torch.randn(weight_shape, dtype=dtype)
+            bias_cpu = torch.randn(OUT_CHANNELS, dtype=dtype)
+
+            input_device = make_misaligned_tensor(input_cpu, input_shape)
+            weight_device = make_misaligned_tensor(weight_cpu, weight_shape)
+            bias_device = make_misaligned_tensor(bias_cpu, (OUT_CHANNELS,))
+
+            output_cpu = conv_fn(input_cpu, weight_cpu, bias_cpu)
+            output_device = conv_fn(input_device, weight_device, bias_device)
+            self.assertEqual(output_device.cpu(), output_cpu)
 
     @onlyXPU
     def test_onednn_allow_tf32_get_set(self):

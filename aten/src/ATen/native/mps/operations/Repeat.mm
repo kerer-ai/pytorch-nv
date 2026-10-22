@@ -10,6 +10,14 @@
 #include <ATen/ops/repeat_native.h>
 #include <fmt/format.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/view_as_complex.h>
+#include <ATen/ops/view_as_real.h>
+#endif
+
 namespace at::native {
 
 Tensor permute_mps(const Tensor& self, IntArrayRef dims) {
@@ -36,7 +44,13 @@ Tensor repeat_mps(const Tensor& self, IntArrayRef repeats) {
 
   TORCH_CHECK(repeats.size() >= (size_t)self.dim(),
               "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor");
-  TORCH_CHECK(!self.is_complex(), "repeat(): Not supported for complex yet!");
+
+  if (self.is_complex()) {
+    std::vector<int64_t> repeats_real = repeats.vec();
+    repeats_real.push_back(1);
+    auto self_real = at::view_as_real(self);
+    return at::view_as_complex(repeat_mps(self_real, repeats_real));
+  }
 
   // Add new leading dimensions to the tensor if the
   // number of target dimensions is larger than the
@@ -104,7 +118,6 @@ Tensor repeat_interleave_mps(const Tensor& repeat, std::optional<int64_t> output
   if (repeat.size(0) == 0) {
     return at::empty_like(repeat, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   }
-  Tensor repeat_ = repeat.contiguous();
   Tensor cumsum = repeat.cumsum(0);
   int64_t total = 0;
   if (output_size.has_value()) {
@@ -117,19 +130,19 @@ Tensor repeat_interleave_mps(const Tensor& repeat, std::optional<int64_t> output
   auto result = at::empty({total}, repeat.options());
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync(mpsStream->queue(), ^() {
+  at::mps::dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       auto computeEncoder = mpsStream->commandEncoder();
       auto pipelineState = lib.getPipelineStateForFunc(fmt::format("repeat_interleave_{}", scalar_type));
 
       // this function call is a no-op if MPS Profiler is not enabled
-      getMPSProfiler().beginProfileKernel(pipelineState, "repeat_interleave:" + scalar_type, false);
+      getMPSProfiler().beginProfileKernel(pipelineState, "repeat_interleave:" + scalar_type, false, mpsStream);
 
       [computeEncoder setComputePipelineState:pipelineState];
-      mps::mtl_setArgs(computeEncoder, repeat_, cumsum, result, repeat.size(0));
+      mps::mtl_setArgs(computeEncoder, repeat, cumsum, result, repeat.stride(0));
       mps::mtl_dispatch1DJob(computeEncoder, pipelineState, repeat.size(0));
 
-      getMPSProfiler().endProfileKernel(pipelineState);
+      getMPSProfiler().endProfileKernel(pipelineState, mpsStream);
     }
   });
   return result;

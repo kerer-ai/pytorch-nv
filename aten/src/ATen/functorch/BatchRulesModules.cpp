@@ -33,7 +33,8 @@ static std::tuple<Tensor, std::optional<int64_t>> embedding_batch_rule(
     const auto weight_ = reshape_dim_into(*weight_bdim, /*embedding_dim*/1, weight);
     auto result = at::embedding_symint(weight_, indices, std::move(padding_idx), scale_grad_by_freq, sparse);
     result = reshape_dim_outof(-1, batch_size, result);
-    return std::make_tuple(result, result.dim() - 2);
+    auto result_bdim = result.dim() - 2;
+    return std::make_tuple(std::move(result), result_bdim);
   }
   TORCH_INTERNAL_ASSERT(weight_bdim && indices_bdim);
   // B*, BED -> B*, (BE)D -> B*D
@@ -132,7 +133,7 @@ static grid_sample_batch_rule(const Tensor& input, std::optional<int64_t> input_
     auto new_input = reshape_dim_into(*input_bdim, 0, input);
     auto new_grid = reshape_dim_into(*grid_bdim, 0, grid);
     auto out = Func(new_input, new_grid, std::forward<ExtraArgs>(extra_args)...);
-    out = reshape_dim_outof(0, input.sizes()[*grid_bdim], out);
+    out = reshape_dim_outof(0, input.sizes()[*input_bdim], out);
     result = std::make_tuple(std::move(out), 0);
   } else {
     result = std::make_tuple(Func(input, grid, std::forward<ExtraArgs>(extra_args)...), std::nullopt);
@@ -168,13 +169,20 @@ static std::tuple<Tensor, std::optional<int64_t>, Tensor, std::optional<int64_t>
 grid_sample_backward_helper_out(
     // NOLINTNEXTLINE(performance-unnecessary-value-param)
     std::tuple<Tensor, Tensor> bw_out,
-    int64_t grad_input_out_bdim,
-    int64_t grad_grid_out_bdim,
+    int64_t grad_input_bdim,
+    int64_t grad_grid_bdim,
     int64_t bdim_size) {
   auto& [grad_input, grad_grid] = bw_out;
-  grad_input = reshape_dim_outof(grad_input_out_bdim, bdim_size, grad_input);
-  grad_grid = reshape_dim_outof(grad_grid_out_bdim, bdim_size, grad_grid);
-  return std::make_tuple(std::move(grad_input), grad_input_out_bdim, std::move(grad_grid), grad_grid_out_bdim);
+  std::optional<int64_t> grad_input_bdim_out, grad_grid_bdim_out;
+  if (grad_input.defined()) {
+    grad_input = reshape_dim_outof(grad_input_bdim, bdim_size, grad_input);
+    grad_input_bdim_out = grad_input_bdim;
+  }
+  if (grad_grid.defined()) {
+    grad_grid = reshape_dim_outof(grad_grid_bdim, bdim_size, grad_grid);
+    grad_grid_bdim_out = grad_grid_bdim;
+  }
+  return std::make_tuple(std::move(grad_input), grad_input_bdim_out, std::move(grad_grid), grad_grid_bdim_out);
 }
 
 

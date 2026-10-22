@@ -111,6 +111,36 @@ from torch.hub import tqdm
 from torch.testing import make_tensor
 
 
+def _get_device_name(device=None) -> str:
+    """Return the device name that keys the Triton tuning tables.
+
+    The key is persisted data: ``dump()`` writes it into this module's source
+    during an offline tuning run and a different process reads it back, so the same
+    device must always produce the same name and producing it must never raise --
+    a lookup miss is a designed outcome of :func:`get_meta`, a failure is not.
+
+    ``device`` names the device the parameters are tuned for or looked up for. When
+    it is not given, the question is which device runs sparse Triton ops for a
+    caller that did not say, which is what ``check_device`` in
+    ``torch/sparse/_triton_ops.py`` answers with a hardcoded ``("cuda", "xpu")``;
+    that has no generic equivalent today, so this is deliberately not routed
+    through the accelerator API. Doing so would also key a CUDA process that has
+    registered a PrivateUse1 backend under the wrong device, since
+    ``at::getAccelerator`` returns PrivateUse1 ahead of CUDA.
+
+    A backend that exposes no ``torch.<device_type>.get_device_name`` is unnamed.
+    """
+    if device is None:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name()
+        if torch.xpu.is_available():
+            return torch.xpu.get_device_name()
+        return ""
+    module = getattr(torch, torch.device(device).type, None)
+    get_device_name = getattr(module, "get_device_name", None)
+    return "" if get_device_name is None else get_device_name(device)
+
+
 def get_meta(op, key, device_name=None, version=(0, torch.float16, 0.5), exact=False):
     """Return triton kernel meta parameters of the specified op and its inputs key.
 
@@ -135,7 +165,7 @@ def get_meta(op, key, device_name=None, version=(0, torch.float16, 0.5), exact=F
       mappings that match with the given `key`.
     """
     if device_name is None:
-        device_name = torch.cuda.get_device_name()
+        device_name = _get_device_name()
 
     op_data = _operation_device_version_data.get((op, device_name, version))
     if op_data is None and not exact:
@@ -144,7 +174,10 @@ def get_meta(op, key, device_name=None, version=(0, torch.float16, 0.5), exact=F
         # meta parameters have been computed. In the following we'll
         # assume that there is a set of GPU models that all have
         # a similar set of optimal meta parameters.
-        if re.match(r"NVIDIA A100[^\d]", device_name) is not None:
+        if (
+            device_name is not None
+            and re.match(r"NVIDIA A100[^\d]", device_name) is not None
+        ):
             device_name = "NVIDIA A100-SXM4-80GB"
         else:
             return
@@ -270,7 +303,7 @@ def minimize(
       ``target_func(parameters: dict) -> float``
     initial_parameters (dict): a set of parameters used as an initial
       value to the minimization process.
-    reference_parameters (dict): a set of parameters used as an
+    reference_parameters (dict): a set of parameters used as a
       reference value with respect to which the speed up is computed.
     step_func (callable): a functional with the signature
       ``step_func(parameter_name:str, parameter_value:int, direction:int, parameters:dict) -> int``
@@ -483,7 +516,7 @@ def optimize_scatter_mm(
     key = (m, k, n, bm, bk)
 
     version = (0, dtype, sparsity)
-    device_name = torch.cuda.get_device_name()
+    device_name = _get_device_name(device)
 
     reference_meta = dict(
         GROUP_SIZE=1,
@@ -576,7 +609,6 @@ def optimize_scatter_mm(
     print(f"{meta=} {speedup=:.1f} % {timing=:.3f} ms")
     if speedup < 0:
         return
-    device_name = torch.cuda.get_device_name()
 
     update(
         "scatter_mm", device_name, version, key, tuple(meta[k] for k in sorted(meta))
@@ -667,13 +699,18 @@ def tune_bsr_dense_addmm(
         version_dtype = (dtype, out_dtype)
     version = (0, version_dtype, sparsity)
     key = (M, K, N, BM, BK, beta == 0, beta == 1, alpha == 1)
+    # Key on the device the inputs live on rather than on the caller-less default,
+    # so the lookup below and the update at the end of this function agree.
+    device_name = _get_device_name(bsr.device)
 
     # For tuning, for an initial state, use parameters from the
     # database if available, otherwise, use the reference parameters.
-    initial_meta = get_meta(opname, key, version=version, exact=True)
+    initial_meta = get_meta(opname, key, device_name, version=version, exact=True)
     if initial_meta is None:
         may_skip_update = False
-        initial_meta = get_meta(opname, key, version=(0, dtype, 0.5), exact=True)
+        initial_meta = get_meta(
+            opname, key, device_name, version=(0, dtype, 0.5), exact=True
+        )
         if initial_meta is None:
             initial_meta = reference_meta
     elif not force:
@@ -738,7 +775,6 @@ def tune_bsr_dense_addmm(
     if store and not (
         may_skip_update and meta == initial_meta and initial_meta is not reference_meta
     ):
-        device_name = torch.cuda.get_device_name()
         update(
             opname,
             device_name,
@@ -937,7 +973,7 @@ def main(op="scatter_mm", force=False, dtype=torch.float16, verbose=True):
                 print(sparsity1, index, key, meta_lst, speeddiff)
 
                 if index > 0:
-                    device_name = torch.cuda.get_device_name()
+                    device_name = _get_device_name()
                     meta = get_meta(
                         op, key, version=(0, dtype, meta_lst[0][1]), exact=True
                     )

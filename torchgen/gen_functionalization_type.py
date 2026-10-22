@@ -37,6 +37,7 @@ from torchgen.model import (
     NativeFunction,
     NativeFunctionsGroup,
     NativeFunctionsViewGroup,
+    OperatorName,
     Return,
     SchemaKind,
     SelfArgument,
@@ -71,10 +72,19 @@ MUTABLE_OPS_NOT_USING_FUNCTIONALIZATION = (
         "resize_as_",
         # This function is used as for testing purposes only.
         "_fill_mem_eff_dropout_mask_",
-        # Inference-only op called behind a custom op graph break.
+        # Inference-only ops called behind a custom op graph break.
         "_flash_attention_forward_no_dropout_inplace",
+        "_cudnn_attention_forward_no_dropout_inplace",
     ]
 )
+
+# Eager cumulative out variants compute in the out dtype when dtype is omitted.
+# Functionalization normally lowers mutable ops through their functional variants,
+# so these need to thread the out dtype explicitly to preserve eager semantics.
+CUMULATIVE_OUT_OPS_PRESERVING_OUT_DTYPE = {
+    OperatorName.parse("cumsum.out"),
+    OperatorName.parse("cumprod.out"),
+}
 
 # This file contains codegen that relates to the functionalization pass.
 # It includes:
@@ -340,7 +350,7 @@ def emit_expr_has_symbolic_values(expr: str, type: CType) -> str:
 
 # Detects whether any of the SymInt arguments are, in fact, symbolic values.
 # This is used in the constructor of ViewMeta.
-def emit_has_symbolic_inputs(sig: DispatcherSignature) -> tuple[str, str]:
+def emit_has_symbolic_inputs(sig: DispatcherSignature) -> str:
     name = "has_symbolic_inputs"
     statements = [
         f"{name} = {name} | ({emit_expr_has_symbolic_values(binding.name, binding.nctype.type)});"
@@ -351,12 +361,9 @@ def emit_has_symbolic_inputs(sig: DispatcherSignature) -> tuple[str, str]:
         )
     ]
     body = "\n      ".join(statements)
-    return (
-        name,
-        f"""
+    return f"""
       bool {name} = false;
-      {body}""",
-    )
+      {body}"""
 
 
 # Generates the Functionalization kernel for:
@@ -415,10 +422,7 @@ def emit_view_functionalization_body(
             e.expr for e in translate(meta_call_ctx, call_sig.arguments(), method=False)
         ]
 
-        (
-            symbolic_inputs_varname,
-            symbolic_inputs_check,
-        ) = emit_has_symbolic_inputs(call_sig)
+        symbolic_inputs_check = emit_has_symbolic_inputs(call_sig)
 
         if "inplace_view" in f.tags:
             # See Note [Functionalization Pass - Inplace View Ops] for more details
@@ -607,6 +611,40 @@ def wrap_propagate_mutations_and_return(
     {returns_str}"""
 
 
+def maybe_replace_cumulative_out_dtype_exprs(
+    f: NativeFunction,
+    functional_sig: DispatcherSignature,
+    functional_exprs: list[str],
+) -> list[str]:
+    if (
+        f.func.kind() != SchemaKind.out
+        or f.func.name not in CUMULATIVE_OUT_OPS_PRESERVING_OUT_DTYPE
+    ):
+        return functional_exprs
+
+    if len(f.func.arguments.out) != 1:
+        raise AssertionError(
+            f"Expected a single out argument for cumulative out op: {f.func.name}"
+        )
+
+    dtype_arg_idx = next(
+        (i for i, arg in enumerate(functional_sig.arguments()) if arg.name == "dtype"),
+        None,
+    )
+    if dtype_arg_idx is None:
+        raise AssertionError(
+            f"Expected dtype argument for cumulative out op: {f.func.name}"
+        )
+
+    adjusted_exprs = functional_exprs.copy()
+    dtype_expr = adjusted_exprs[dtype_arg_idx]
+    adjusted_exprs[dtype_arg_idx] = (
+        f"{dtype_expr}.has_value() ? {dtype_expr} : "
+        f"std::optional<at::ScalarType>({f.func.arguments.out[0].name}_.scalar_type())"
+    )
+    return adjusted_exprs
+
+
 # Generates the Functionalization kernel for:
 # - mutation ops (inplace and out= ops)
 @with_native_function_and
@@ -678,6 +716,9 @@ def emit_inplace_functionalization_body(
         e.expr
         for e in translate(unwrapped_args_ctx, functional_sig.arguments(), method=False)
     ]
+    functional_exprs = maybe_replace_cumulative_out_dtype_exprs(
+        f, functional_sig, functional_exprs
+    )
 
     meta_conversion_str, meta_call_ctx = convert_to_meta_tensors(dispatcher_sig)
     # We don't want to run the inplace meta func for ops like .set_(), because:
@@ -745,6 +786,37 @@ def gen_functionalization_view_inverse_declaration(
         return view_inverse_sig.decl()
 
     return emit_decl_helper(g)
+
+
+# Replaying a multi-output view op to regenerate a single output builds every
+# sibling view and discards all but one, so regenerating the N views of one base
+# costs O(N^2) tensors. Under torch.compile that is O(N^2) fake tensors and
+# proxies, and it shows up as an N-long run of identical view nodes in the traced
+# graph. These are the only multi-output view ops, and each of their outputs is
+# exactly one slice or select of the base, which we can build directly. The
+# original op already validated its arguments when the view was first created.
+#
+# Autograd's restriction on mutating one output of a multi-output view is keyed
+# off CreationMeta, not off the grad_fn, so apply_view_meta_sequence restores it
+# directly. See [Note: multi-output view replay].
+#
+# Keyed by operator name; the body is formatted with the view op to call, which
+# differs between the view and the view_copy variant.
+SINGLE_OUTPUT_VIEW_REPLAY: dict[str, str] = {
+    "split.Tensor": """\
+  // split() chunk `i` is base[i * split_size : (i + 1) * split_size] along dim,
+  // and slice clamps the end, which gives the short final chunk for free.
+  auto start = split_size * out_index;
+  return {slice}(base, dim, start, start + split_size, 1);""",
+    "split_with_sizes": """\
+  c10::SymInt start = 0;
+  for (int64_t i = 0; i < out_index; ++i) {{
+    start += split_sizes[i];
+  }}
+  return {slice}(base, dim, start, start + split_sizes[out_index], 1);""",
+    "unbind.int": """\
+  return {select}(base, dim, out_index);""",
+}
 
 
 # Helper class for generating `ViewMeta` specializations.
@@ -904,14 +976,42 @@ struct TORCH_API {self.classname} : public ViewMeta {{
 
         return f"{opname}({arguments}){maybe_index}"
 
+    @property
+    def single_output_body(self) -> str | None:
+        # A new multi-output view op would otherwise silently keep replaying the
+        # whole operation and stay quadratic, with no golden to flag it.
+        name = str(self.f.func.name)
+        if self.is_multi_output and name not in SINGLE_OUTPUT_VIEW_REPLAY:
+            raise AssertionError(f"no single-output replay for {name}")
+        return SINGLE_OUTPUT_VIEW_REPLAY.get(name)
+
+    # The two arms of `forward`, one per value of `reapply_views`.
+    def forward_arms(self) -> tuple[str, str]:
+        body = self.single_output_body
+        if body is None:
+            return (
+                f"    return {self.opcall(is_reverse=False, reapply_views=True)};",
+                f"    return {self.opcall(is_reverse=False, reapply_views=False)};",
+            )
+
+        def arm(slice_op: str, select_op: str) -> str:
+            filled = body.format(slice=slice_op, select=select_op)
+            return "\n".join("  " + line for line in filled.splitlines())
+
+        return (
+            arm("at::_ops::slice_Tensor::call", "at::_ops::select_int::call"),
+            arm("at::_ops::slice_copy_Tensor::call", "at::_ops::select_copy_int::call"),
+        )
+
     def impl(self) -> list[str]:
+        views_arm, view_copy_arm = self.forward_arms()
         functions = [
             f"""
 at::Tensor {self.classname}::forward(const at::Tensor& base) {{
   if (reapply_views) {{
-    return {self.opcall(is_reverse=False, reapply_views=True)};
+{views_arm}
   }} else {{
-    return {self.opcall(is_reverse=False, reapply_views=False)};
+{view_copy_arm}
   }}
 }}""",
             f"""

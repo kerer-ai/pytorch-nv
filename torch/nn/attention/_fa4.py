@@ -10,6 +10,7 @@ from typing import Any, TYPE_CHECKING
 from typing_extensions import TypeVarTuple, Unpack
 
 from . import _registry
+from ._utils import _empty_with_matching_layout
 
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ class _FA4Handle:
 
     def remove(self) -> None:
         self.library = None
+        torch._C._set_sdp_use_fa4(False)
 
 
 @cache
@@ -53,7 +55,9 @@ def register_flash_attention_fa4(
     global _FA4_MODULE_PATH
     _ = _fa4_import_module(module_path)
     _FA4_MODULE_PATH = module_path
-    return _FA4Handle(_fa4_register_kernels())
+    handle = _FA4Handle(_fa4_register_kernels())
+    torch._C._set_sdp_use_fa4(True)
+    return handle
 
 
 @cache
@@ -65,8 +69,13 @@ def _fa4_import_module(module_path: str) -> ModuleType:
 
 
 def _fa4_register_kernels() -> Library:
-    lib = Library("aten", "IMPL", "CUDA")  # noqa: TOR901
+    lib = Library("aten", "IMPL", "CUDA")
     lib.impl("_flash_attention_forward", _fa4_flash_attention_forward_impl, "CUDA")
+    lib.impl(
+        "_flash_attention_forward_no_dropout_inplace",
+        _fa4_flash_attention_forward_no_dropout_inplace_impl,
+        "CUDA",
+    )
     lib.impl("_flash_attention_backward", _fa4_flash_attention_backward_impl, "CUDA")
     lib.impl(
         "_scaled_dot_product_flash_attention",
@@ -116,6 +125,8 @@ def _fa4_forward_support_error(
     alibi_slopes: torch.Tensor | None,
     seqused_k: torch.Tensor | None,
     cum_seq_q: torch.Tensor | None,
+    block_table: torch.Tensor | None = None,
+    num_splits: int | None = None,
 ) -> str | None:
     if dropout_p != 0.0:
         return "dropout_p must be 0"
@@ -128,6 +139,11 @@ def _fa4_forward_support_error(
             return "seqused_k must be int32"
         if not seqused_k.is_cuda:
             return "seqused_k must be CUDA"
+    major = _get_device_major(query.device)
+    if block_table is not None and major != 10:
+        return f"paged KV (block_table) not supported on SM {major}0"
+    if num_splits is not None and num_splits > 1 and major != 10:
+        return f"SplitKV (num_splits > 1) not supported on SM {major}0"
     error = _fa4_common_support_error(
         query,
         (query, key, value),
@@ -149,13 +165,9 @@ def _fa4_backward_support_error(
     logsumexp: torch.Tensor,
     dropout_p: float,
     cum_seq_q: torch.Tensor | None,
-    window_size_left: int | None,
-    window_size_right: int | None,
 ) -> str | None:
     if dropout_p != 0.0:
         return "dropout_p must be 0"
-    if window_size_left is not None or window_size_right is not None:
-        return "windowed attention not supported"
     error = _fa4_common_support_error(
         query,
         (grad_out, query, key, value, out, logsumexp),
@@ -165,6 +177,11 @@ def _fa4_backward_support_error(
     if error is not None:
         return error
     return None
+
+
+def _aten_to_fa4_window_size(val: int | None) -> int | None:
+    """need to convert -1 to None for FA4"""
+    return None if val == -1 else val
 
 
 Ts = TypeVarTuple("Ts")
@@ -180,30 +197,43 @@ def _fa4_run_forward(
     value: torch.Tensor,
     cu_seq_q: torch.Tensor | None,
     cu_seq_k: torch.Tensor | None,
+    max_q: int | None,
+    max_k: int | None,
     scale: float | None,
     is_causal: bool,
     window_size_left: int | None,
     window_size_right: int | None,
     seqused_k: torch.Tensor | None,
     out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    num_splits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _FA4_MODULE_PATH is None:
         raise RuntimeError("FA4 not registered")
     module = _fa4_import_module(_FA4_MODULE_PATH)
+    if _get_device_major(query.device) != 10:
+        # SplitKV is SM100-only; the support check already rejects num_splits > 1
+        num_splits = 1
+    elif num_splits is None:
+        # FA4 runs its SplitKV heuristic when num_splits < 1
+        num_splits = 1 if torch.are_deterministic_algorithms_enabled() else 0
 
     kwargs: dict[str, Any] = {
         "softmax_scale": scale,
         "causal": is_causal,
-        "window_size_left": window_size_left,
-        "window_size_right": window_size_right,
+        "window_size_left": _aten_to_fa4_window_size(window_size_left),
+        "window_size_right": _aten_to_fa4_window_size(window_size_right),
         "return_lse": True,
         "cu_seqlens_q": cu_seq_q,
         "cu_seqlens_k": cu_seq_k,
+        "max_seqlen_q": max_q,
+        "max_seqlen_k": max_k,
         "seqused_k": seqused_k.contiguous() if seqused_k is not None else None,
+        "page_table": block_table,
+        "num_splits": num_splits,
+        "out": out,
     }
-    if out is not None:
-        kwargs["out"] = out
-    out, lse = module._flash_attn_fwd(query, key, value, **kwargs)
+    out, lse, *_ = module._flash_attn_fwd(query, key, value, **kwargs)
     return out, lse.contiguous()
 
 
@@ -218,6 +248,8 @@ def _fa4_run_backward(
     cu_seq_k: torch.Tensor | None,
     scale: float | None,
     is_causal: bool,
+    window_size_left: int | None,
+    window_size_right: int | None,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _FA4_MODULE_PATH is None:
@@ -232,6 +264,8 @@ def _fa4_run_backward(
         logsumexp.contiguous(),
         softmax_scale=scale,
         causal=is_causal,
+        window_size_left=_aten_to_fa4_window_size(window_size_left),
+        window_size_right=_aten_to_fa4_window_size(window_size_right),
         cu_seqlens_q=cu_seq_q,
         cu_seqlens_k=cu_seq_k,
         deterministic=deterministic,
@@ -257,6 +291,9 @@ def _fa4_flash_attention_forward_impl(
     seqused_k: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    compute_auxiliary: bool = True,
+    num_splits: int | None = None,
 ):
     error = _fa4_forward_support_error(
         query,
@@ -267,6 +304,8 @@ def _fa4_flash_attention_forward_impl(
         alibi_slopes,
         seqused_k,
         cum_seq_q,
+        block_table,
+        num_splits,
     )
     if error is not None:
         raise RuntimeError(f"FA4 flash_attention forward unsupported: {error}")
@@ -276,17 +315,71 @@ def _fa4_flash_attention_forward_impl(
         value,
         cum_seq_q,
         cum_seq_k,
+        max_q,
+        max_k,
         scale,
         is_causal,
         window_size_left,
         window_size_right,
         seqused_k,
         out,
+        block_table,
+        num_splits,
     )
-    rng_state = torch.zeros((2,), dtype=torch.uint64, device=query.device)
-    philox_offset = torch.zeros((), dtype=torch.uint64, device=query.device)
-    debug_mask = torch.empty(0, dtype=query.dtype, device=query.device)
+    if compute_auxiliary:
+        rng_state = torch.zeros((2,), dtype=torch.uint64, device=query.device)
+        philox_offset = torch.zeros((), dtype=torch.uint64, device=query.device)
+        debug_mask = torch.empty(0, dtype=query.dtype, device=query.device)
+    else:
+        rng_state = None
+        philox_offset = None
+        debug_mask = None
     return out, lse, rng_state, philox_offset, debug_mask
+
+
+def _fa4_flash_attention_forward_no_dropout_inplace_impl(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cum_seq_q: torch.Tensor | None,
+    cum_seq_k: torch.Tensor | None,
+    max_q: int,
+    max_k: int,
+    dropout_p: float,
+    is_causal: bool,
+    return_debug_mask: bool,
+    *,
+    scale: float | None = None,
+    window_size_left: int | None = None,
+    window_size_right: int | None = None,
+    seqused_k: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    num_splits: int | None = None,
+):
+    _, lse, _, _, _ = _fa4_flash_attention_forward_impl(
+        query,
+        key,
+        value,
+        cum_seq_q,
+        cum_seq_k,
+        max_q,
+        max_k,
+        dropout_p,
+        is_causal,
+        return_debug_mask,
+        scale=scale,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        seqused_k=seqused_k,
+        alibi_slopes=alibi_slopes,
+        out=out,
+        block_table=block_table,
+        compute_auxiliary=False,
+        num_splits=num_splits,
+    )
+    return lse
 
 
 def _fa4_flash_attention_backward_impl(
@@ -318,8 +411,6 @@ def _fa4_flash_attention_backward_impl(
         logsumexp,
         dropout_p,
         cum_seq_q,
-        window_size_left,
-        window_size_right,
     )
     if error is not None:
         raise RuntimeError(f"FA4 flash_attention backward unsupported: {error}")
@@ -335,6 +426,8 @@ def _fa4_flash_attention_backward_impl(
         cum_seq_k,
         scale,
         is_causal,
+        window_size_left,
+        window_size_right,
         deterministic,
     )
     return dq, dk, dv
@@ -364,10 +457,7 @@ def _fa4_scaled_dot_product_flash_attention_forward_impl(
         raise RuntimeError(f"FA4 SDPA forward unsupported: {error}")
     q, k, v = _transpose_dense(query, key, value)
 
-    # Pre-allocate output with query's strides (BHSD layout), then create
-    # a BSHD view for the kernel. This ensures the returned output has
-    # the same memory layout as the input query.
-    out_bhsd = torch.empty_like(query)
+    out_bhsd = _empty_with_matching_layout(query, (*query.shape[:-1], value.size(-1)))
     out_bshd = out_bhsd.transpose(1, 2)
 
     max_q_flash = q.size(1)
@@ -427,8 +517,6 @@ def _fa4_scaled_dot_product_flash_attention_backward_impl(
         out,
         logsumexp,
         dropout_p,
-        None,
-        None,
         None,
     )
     if error is not None:

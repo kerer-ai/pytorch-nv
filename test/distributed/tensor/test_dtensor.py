@@ -9,6 +9,7 @@ from numpy.testing import assert_array_equal
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed.device_mesh import init_device_mesh
@@ -27,6 +28,7 @@ from torch.distributed.tensor._dtensor_spec import (
     TensorMeta,
 )
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
+from torch.distributed.tensor._utils import compute_local_tensor_info
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.distributed.tensor.parallel import (
@@ -34,6 +36,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
     RowwiseParallel,
 )
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing import make_tensor
 from torch.testing._internal.common_utils import (
     IS_FBCODE,
@@ -43,8 +46,11 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     create_local_tensor_test_class,
+    DTensorContinuousTestBase,
     DTensorTestBase,
+    LocalDTensorContinuousTestBase,
     map_local_tensor_for_rank,
+    NUM_DEVICES,
     with_comms,
 )
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -71,7 +77,9 @@ class DummyMLP(torch.nn.Module):
             self.net2.bias.fill_(1.2)
 
 
-class DTensorTest(DTensorTestBase):
+class DTensorTest(DTensorContinuousTestBase):
+    world_size = NUM_DEVICES
+
     @with_comms
     def test_dtensor_constructor(self):
         device_mesh = self.build_device_mesh()
@@ -529,6 +537,40 @@ class DTensorTest(DTensorTestBase):
                 )
 
     @with_comms
+    def test_to_local_preserves_parameter(self):
+        # Regression test for https://github.com/pytorch/pytorch/issues/166156:
+        # nn.Parameter wrapping a DTensor must remain isinstance(nn.Parameter)
+        # after calling .to_local() (both with and without grad enabled), and
+        # autograd must continue to flow back into the DTensor parameter.
+        device_mesh = self.build_device_mesh()
+        global_tensor = torch.randn(4 * self.world_size, 3, requires_grad=True)
+        dtensor_param = nn.Parameter(
+            distribute_tensor(global_tensor, device_mesh, [Shard(0)])
+        )
+        self.assertTrue(isinstance(dtensor_param, nn.Parameter))
+
+        local = dtensor_param.to_local()
+        self.assertTrue(isinstance(local, nn.Parameter))
+        # requires_grad must follow the DTensor parameter.
+        self.assertTrue(local.requires_grad)
+        # Internal storage must not be mutated into a Parameter.
+        self.assertFalse(getattr(dtensor_param._local_tensor, "_is_param", False))
+
+        # Gradient must still propagate through the returned local Parameter
+        # back into the DTensor parameter (to_local is differentiable).
+        local.sum().backward()
+        self.assertIsNotNone(dtensor_param.grad)
+
+        with torch.no_grad():
+            local_no_grad = dtensor_param.to_local()
+        self.assertTrue(isinstance(local_no_grad, nn.Parameter))
+        self.assertFalse(getattr(dtensor_param._local_tensor, "_is_param", False))
+
+        # A plain DTensor (not a Parameter) must NOT become a Parameter.
+        plain = distribute_tensor(global_tensor, device_mesh, [Shard(0)])
+        self.assertFalse(isinstance(plain.to_local(), nn.Parameter))
+
+    @with_comms
     def test_to_local_grad_hint(self):
         device_mesh = self.build_device_mesh()
         placements = (Shard(0),)
@@ -632,7 +674,9 @@ class DTensorTest(DTensorTestBase):
         # test backward new_empty_strided with sharding works correctly
         my_dtensor.to_local().sum().backward()
         local_tensor.sum().backward()
-        self.assertEqual(my_dtensor.grad, new_strided_dtensor.grad)
+        self.assertEqual(
+            my_dtensor.grad.full_tensor(), new_strided_dtensor.grad.full_tensor()
+        )
         self.assertEqual(
             my_dtensor.grad.redistribute(placements=[Replicate()]).to_local(),
             local_tensor.grad,
@@ -910,9 +954,54 @@ class DTensorTest(DTensorTestBase):
         loss = out1.sum()
         loss.backward()
 
+    @with_comms
+    def test_assert_equal_dtensor(self):
+        mesh = self.build_device_mesh()
+        local = torch.randn(4, 4, device=self.device_type)
+
+        dt1 = DTensor.from_local(local.clone(), mesh, [Replicate()])
+        dt2 = DTensor.from_local(local.clone(), mesh, [Replicate()])
+
+        self.assertEqual(dt1, dt2)
+        torch.testing.assert_close(dt1, dt2)
+
+        dt3 = DTensor.from_local(
+            torch.randn(4, 4, device=self.device_type), mesh, [Replicate()]
+        )
+        with self.assertRaisesRegex(AssertionError, "Tensor-likes are not close"):
+            self.assertEqual(dt1, dt3)
+
+        dt_shard = DTensor.from_local(local.clone(), mesh, [Shard(0)])
+        with self.assertRaisesRegex(AssertionError, "DTensor placements do not match"):
+            self.assertEqual(dt1, dt_shard)
+
+        with self.assertRaisesRegex(
+            TypeError, "Comparing a DTensor to a non-DTensor is ambiguous"
+        ):
+            self.assertEqual(dt1, local)
+        with self.assertRaisesRegex(
+            TypeError, "Comparing a DTensor to a non-DTensor is ambiguous"
+        ):
+            self.assertEqual(local, dt1)
+        with self.assertRaisesRegex(
+            TypeError, "Comparing a DTensor to a non-DTensor is ambiguous"
+        ):
+            torch.testing.assert_close(dt1, local)
+
+        dt_scalar = DTensor.from_local(
+            torch.tensor(42.0, device=self.device_type), mesh, [Replicate()]
+        )
+        with self.assertRaisesRegex(
+            TypeError, "Comparing a DTensor to a non-DTensor is ambiguous"
+        ):
+            self.assertEqual(dt_scalar, 42.0)
+        self.assertEqual(dt_scalar.full_tensor(), 42.0)
+        self.assertEqual(dt_scalar.to_local(), 42.0)
+
 
 DTensorTestWithLocalTensor = create_local_tensor_test_class(
     DTensorTest,
+    base_class=LocalDTensorContinuousTestBase,
     skipped_tests=[
         # Async output in local mode is not supported
         "test_dtensor_async_output",
@@ -922,6 +1011,75 @@ DTensorTestWithLocalTensor = create_local_tensor_test_class(
         "test_dtensor_save_load_import",
     ],
 )
+
+
+class DTensorSubclassTest(DTensorContinuousTestBase):
+    world_size = NUM_DEVICES
+
+    def _make_dtensor(self, cls, mesh):
+        base = DTensor.from_local(
+            torch.randn(4, 4, device=self.device_type), mesh, [Replicate()]
+        )
+        return cls(base._local_tensor, base._spec, requires_grad=False)
+
+    @with_comms
+    def test_subclass_custom_dispatch(self):
+        """Subclass handles the entire dispatch, never calling DTensor dispatch."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        called = False
+
+        class MyDTensor(DTensor):
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                nonlocal called
+                called = True
+                self.assertIs(cls, MyDTensor)
+                return NotImplemented
+
+        my_dt = self._make_dtensor(MyDTensor, mesh)
+        try:
+            my_dt + my_dt
+        except TypeError:
+            pass
+        self.assertTrue(called, "MyDTensor.__torch_dispatch__ was not called")
+
+    @with_comms
+    def test_subclass_no_override(self):
+        """Subclass without __torch_dispatch__ override uses C++ fast path."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+
+        class MyDTensor(DTensor):
+            pass
+
+        my_dt = self._make_dtensor(MyDTensor, mesh)
+        result = my_dt + my_dt
+        self.assertIsInstance(result, DTensor)
+
+    @with_comms
+    def test_subclass_conditional_dispatch(self):
+        """Subclass handles some ops itself, delegates others to DTensor."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        custom_ops: list[torch._ops.OpOverload] = []
+
+        class MyDTensor(DTensor):
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.add.Tensor:
+                    custom_ops.append(func)
+                return super().__torch_dispatch__(func, types, args, kwargs)
+
+        my_dt = self._make_dtensor(MyDTensor, mesh)
+
+        # add: subclass logs it, then delegates to DTensor
+        result = my_dt + my_dt
+        self.assertIsInstance(result, DTensor)
+        self.assertIn(torch.ops.aten.add.Tensor, custom_ops)
+
+        # neg: subclass doesn't do custom handling, just delegates
+        custom_ops.clear()
+        result = -my_dt
+        self.assertIsInstance(result, DTensor)
+        self.assertEqual(len(custom_ops), 0)
 
 
 class DTensorMeshTest(DTensorTestBase):
@@ -1275,7 +1433,7 @@ class DTensorMeshTest(DTensorTestBase):
                 placements=None,
             )
 
-        x = make_dtensor(1, 1, dtype=torch.bfloat16, device="cuda")
+        x = make_dtensor(1, 1, dtype=torch.bfloat16, device=self.device_type)
 
         # Fails with AssertionError: P1972527564
         torch.cond(
@@ -1352,6 +1510,36 @@ class DTensorMeshTest(DTensorTestBase):
         self.assertEqual(result.size(), dtensor.size())
         self.assertEqual(result.stride(), dtensor.stride())
         self.assertEqual(result.to_local(), dtensor.to_local())
+
+    @with_comms
+    def test_as_strided_permutation(self):
+        # AOTAutograd regenerates an output aliasing an input with as_strided,
+        # so a compiled function returning a transposed view lands here.
+        device_mesh = self.build_device_mesh()
+        dtensor = distribute_tensor(
+            torch.randn(4, 6, 8, device=self.device_type), device_mesh, [Shard(0)]
+        )
+
+        for dims in ((1, 0, 2), (2, 1, 0), (0, 2, 1)):
+            expected = dtensor.permute(dims)
+            result = dtensor.as_strided(
+                expected.size(), expected.stride(), expected.storage_offset()
+            )
+            self.assertEqual(result.placements, expected.placements)
+            self.assertEqual(result.full_tensor(), expected.full_tensor())
+
+    @with_comms
+    def test_as_strided_non_permutation_errors(self):
+        device_mesh = self.build_device_mesh()
+        dtensor = distribute_tensor(
+            torch.randn(4, 6, device=self.device_type), device_mesh, [Shard(0)]
+        )
+
+        # Not reachable by permuting the base dims.
+        with self.assertRaisesRegex(RuntimeError, "as_strided not supported"):
+            dtensor.as_strided((4, 3), (6, 1), 0)
+        with self.assertRaisesRegex(RuntimeError, "as_strided not supported"):
+            dtensor.as_strided((4, 6), (6, 1), 1)
 
 
 DTensorMeshTestWithLocalTensor = create_local_tensor_test_class(
@@ -1607,6 +1795,81 @@ class TestDTensorSpec(DTensorTestBase):
             DTensorSpec.is_default_device_order(tensor_global._spec.shard_order)
         )
 
+    @with_comms
+    def test_num_shards_with_strided_shard(self):
+        """DTensorSpec.num_shards must count _StridedShard placements."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        full = torch.randn(4, self.world_size * 2, 6, device=self.device_type)
+        dt = distribute_tensor(full, mesh, [Shard(1)])
+        dt_flat = dt.flatten(0, 1)
+
+        self.assertIsInstance(dt_flat.placements[0], _StridedShard)
+        self.assertEqual(dt_flat._spec.num_shards, self.world_size)
+
+    @with_comms
+    def test_dim_map_with_strided_shard(self):
+        """DTensorSpec.dim_map must map _StridedShard dims to mesh dims."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        full = torch.randn(4, self.world_size * 2, 6, device=self.device_type)
+        dt = distribute_tensor(full, mesh, [Shard(1)])
+        dt_flat = dt.flatten(0, 1)
+
+        self.assertIsInstance(dt_flat.placements[0], _StridedShard)
+        shard_dim = dt_flat.placements[0].dim
+        self.assertEqual(dt_flat._spec.dim_map[shard_dim], 0)
+
+    @with_comms
+    def test_num_shards_map_with_strided_shard(self):
+        """DTensorSpec.num_shards_map must count _StridedShard placements per dim."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        full = torch.randn(4, self.world_size * 2, 6, device=self.device_type)
+        dt = distribute_tensor(full, mesh, [Shard(1)])
+        dt_flat = dt.flatten(0, 1)
+
+        self.assertIsInstance(dt_flat.placements[0], _StridedShard)
+        shard_dim = dt_flat.placements[0].dim
+        self.assertEqual(dt_flat._spec.num_shards_map[shard_dim], self.world_size)
+
+    @with_comms
+    def test_compute_local_tensor_info_with_strided_shard(self):
+        """compute_local_tensor_info must handle _StridedShard placements."""
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        full = torch.randn(4, self.world_size * 2, 6, device=self.device_type)
+        dt = distribute_tensor(full, mesh, [Shard(1)])
+        dt_flat = dt.flatten(0, 1)
+
+        self.assertIsInstance(dt_flat.placements[0], _StridedShard)
+
+        global_tensor = full.flatten(0, 1)
+        local_shape, local_stride = compute_local_tensor_info(
+            global_tensor, mesh, dt_flat.placements
+        )
+        shard_dim = dt_flat.placements[0].dim
+
+        # Verify shape: shard dim divided by world_size, other dims unchanged
+        expected_shape = list(global_tensor.shape)
+        expected_shape[shard_dim] //= self.world_size
+        self.assertEqual(local_shape, expected_shape)
+
+        # Verify stride: non-shard dims with large strides should be shrunk
+        self.assertEqual(len(local_stride), len(list(global_tensor.stride())))
+
+        # _StridedShard on dim 1: shard dim changes, strides on dim 0 should shrink
+        full2 = torch.randn(3, 5, self.world_size * 2, device=self.device_type)
+        dt2 = distribute_tensor(full2, mesh, [Shard(2)])
+        dt2_flat = dt2.flatten(1, 2)  # _StridedShard(dim=1)
+
+        self.assertIsInstance(dt2_flat.placements[0], _StridedShard)
+        self.assertEqual(dt2_flat.placements[0].dim, 1)
+
+        global_tensor2 = full2.flatten(1, 2)
+        local_shape2, _ = compute_local_tensor_info(
+            global_tensor2, mesh, dt2_flat.placements
+        )
+        expected_shape2 = list(global_tensor2.shape)
+        expected_shape2[1] //= self.world_size
+        self.assertEqual(local_shape2, expected_shape2)
+
 
 TestDTensorSpecWithLocalTensor = create_local_tensor_test_class(
     TestDTensorSpec,
@@ -1646,8 +1909,8 @@ class TestMixedPartialTypes(TestCase):
             api()
 
         # Test redistribute_local_tensor separately (different call pattern)
-        # Note: public DTensor.redistribute() doesn't allow Partial targets at all,
-        # so we test the internal redistribute_local_tensor directly
+        # Public DTensor.redistribute() only allows Shard -> Partial(sum), so
+        # test mixed Partial targets through redistribute_local_tensor directly.
         current_spec = DTensorSpec(
             mesh,
             (Replicate(), Replicate()),

@@ -36,12 +36,14 @@ from torch import _guards
 from torch._dynamo.output_graph import GraphCompileReason
 from torch._functorch import config as functorch_config
 from torch._functorch.compilers import ts_compile
+from torch._inductor.output_code import OutputCode
 
 from .common import aot_autograd
 from .registry import CompiledFn, CompilerFn, register_debug_backend as register_backend
 
 
 if TYPE_CHECKING:
+    from torch._inductor.triton_bundler import TritonBundle
     from torch.fx.node import Target
 
 
@@ -151,7 +153,9 @@ def eager_debug(
 def torchscript(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor]
 ) -> torch.jit.ScriptModule:
-    return torch.jit.script(gm)
+    from torch.fx._lazy_graph_module import _unwrap_lazy_graph_module
+
+    return torch.jit.script(_unwrap_lazy_graph_module(gm))
 
 
 def invoke_subgraph_inner_compiler(
@@ -165,14 +169,19 @@ def invoke_subgraph_inner_compiler(
     from torch._dynamo import disable
     from torch._higher_order_ops.invoke_subgraph import invoke_subgraph_infer
 
-    @disable
+    # pyrefly: ignore [deprecated]
     @torch._dynamo.allow_in_graph
+    @disable
     def invoke_subgraph_wrapper_unboxed(*operands: Any) -> Any:
         return invoke_subgraph_infer(subgraph, *operands)
 
     # NB: The direct to unboxed path is broken, you MUST DO THIS
 
     def invoke_subgraph_wrapper(args: list[Any]) -> Any:
+        # `allow_in_graph` is untyped and its `list` branch leaks a
+        # `list | fn` union into the inferred return; as the outer decorator
+        # here that makes `invoke_subgraph_wrapper_unboxed` look non-callable.
+        # pyrefly: ignore [not-callable]
         return invoke_subgraph_wrapper_unboxed(*args)
 
     invoke_subgraph_wrapper._boxed_call = True  # type: ignore[attr-defined]
@@ -260,6 +269,56 @@ def invoke_subgraph(
     )(gm, fake_tensor_inputs)
 
 
+@dataclasses.dataclass
+class AOTEagerOutputCode(OutputCode):
+    """
+    An OutputCode that wraps a GraphModule for eager-mode execution.
+
+    This allows non-inductor backends (like aot_eager) to participate in
+    the bundled autograd cache and aot_compile serialization flow.
+    """
+
+    gm: torch.fx.GraphModule | None = None
+    _serialized_gm: bytes | None = dataclasses.field(default=None, init=False)
+
+    def __call__(self, inputs: Any) -> Any:
+        if self.gm is None:
+            raise AssertionError("gm must not be None")
+        return self.gm.forward(inputs)
+
+    def prepare_for_serialization(self) -> None:
+        from torch.fx._graph_pickler import GraphPickler, Options
+
+        if self.gm is None:
+            raise AssertionError("gm must not be None")
+        for node in self.gm.graph.nodes:
+            node.meta.pop("nn_module_stack", None)
+            node.meta.pop("source_fn_stack", None)
+            node.meta.pop("example_value", None)
+
+        self._serialized_gm = GraphPickler.dumps(self.gm, Options(ops_filter=None))
+        self.gm = None
+
+    def post_compile(self, *args: Any, **kwargs: Any) -> None:
+        if self.gm is None and self._serialized_gm is not None:
+            from torch._subclasses import FakeTensorMode
+            from torch.fx._graph_pickler import GraphPickler
+            from torch.fx.experimental.symbolic_shapes import ShapeEnv
+            from torch.fx.graph import _BoxedCodeGen
+
+            fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+            gm = GraphPickler.loads(self._serialized_gm, fake_mode)
+            if not isinstance(gm, torch.fx.GraphModule):
+                raise AssertionError(f"Expected torch.fx.GraphModule, got {type(gm)}")
+            self.gm = gm
+            self.gm.graph.set_codegen(_BoxedCodeGen())
+            self.gm.recompile()
+            self._serialized_gm = None
+
+    def set_triton_bundle(self, triton_bundle: "TritonBundle") -> None:
+        pass
+
+
 # used boxed call to discard inputs when they are no longer needed
 def boxed_nop(
     fx_g: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
@@ -269,6 +328,11 @@ def boxed_nop(
     # Set the graph to use boxed codegen
     fx_g.graph.set_codegen(_BoxedCodeGen())
     fx_g.recompile()
+
+    if functorch_config.force_autograd_cache or functorch_config.bundled_autograd_cache:
+        result = AOTEagerOutputCode(gm=fx_g)
+        result._boxed_call = True  # type: ignore[attr-defined]
+        return result
 
     # Wrap the forward method in a function so we can set _boxed_call attribute
     forward_fn = fx_g.forward
@@ -343,7 +407,11 @@ def get_nop_func() -> Callable[
     elif torch._functorch.config.fake_tensor_crossref == "all":
         return fake_crossref_boxed_nop
     else:
-        assert torch._functorch.config.fake_tensor_crossref == "custom_ops"
+        if torch._functorch.config.fake_tensor_crossref != "custom_ops":
+            raise AssertionError(
+                f"Expected fake_tensor_crossref to be 'custom_ops', "
+                f"got {torch._functorch.config.fake_tensor_crossref!r}"
+            )
         return functools.partial(fake_crossref_boxed_nop, ignore_op_fn=ignore_builtins)
 
 
@@ -414,8 +482,8 @@ register_backend(
 )
 
 
-# aot_eager_decomp_partition_with_mode is similar as aot_eager_decomp_partition,
-# except that it takes a TorchDispatchMode mode and run the fw/bw in the mode
+# aot_eager_decomp_partition_with_mode is similar to aot_eager_decomp_partition,
+# except that it takes a TorchDispatchMode mode and runs the fw/bw in the mode
 def aot_eager_decomp_partition_with_mode(
     gm: torch.fx.GraphModule,
     fake_tensor_inputs: list[torch.Tensor],

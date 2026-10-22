@@ -11,6 +11,7 @@ from .optimizer import (
     _device_dtype_check_for_fused,
     _differentiable_doc,
     _foreach_doc,
+    _functional_api_doc,
     _fused_doc,
     _maximize_doc,
     _params_doc,
@@ -25,7 +26,7 @@ from .optimizer import (
 __all__ = ["SGD", "sgd"]
 
 
-class SGD(Optimizer):  # noqa: D101
+class SGD(Optimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -39,14 +40,14 @@ class SGD(Optimizer):  # noqa: D101
         foreach: bool | None = None,
         differentiable: bool = False,
         fused: bool | None = None,
-    ) -> None:  # noqa: D107
+    ) -> None:
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
-        if lr < 0.0:
+        if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if momentum < 0.0:
+        if not 0.0 <= momentum:
             raise ValueError(f"Invalid momentum value: {momentum}")
-        if weight_decay < 0.0:
+        if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
         defaults = {
@@ -72,7 +73,7 @@ class SGD(Optimizer):  # noqa: D101
             if foreach:
                 raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
-    def __setstate__(self, state):  # noqa: D105
+    def __setstate__(self, state):
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
@@ -263,15 +264,11 @@ def sgd(
     *,
     weight_decay: float,
     momentum: float,
-    lr: float,
+    lr: float | Tensor,
     dampening: float,
     nesterov: bool,
     maximize: bool,
 ) -> None:
-    r"""Functional API that performs SGD algorithm computation.
-
-    See :class:`~torch.optim.SGD` for details.
-    """
     # Respect when the user inputs False/True for foreach or fused. We only want to change
     # the default when neither have been user-specified. Note that we default to foreach
     # and pass False to use_fused. This is not a mistake--we want to give the fused impl
@@ -319,6 +316,9 @@ def sgd(
     )
 
 
+sgd.__doc__ = _functional_api_doc.format(optimizer="SGD")
+
+
 def _single_tensor_sgd(
     params: list[Tensor],
     grads: list[Tensor],
@@ -328,7 +328,7 @@ def _single_tensor_sgd(
     *,
     weight_decay: float,
     momentum: float,
-    lr: float,
+    lr: float | Tensor,
     dampening: float,
     nesterov: bool,
     maximize: bool,
@@ -388,7 +388,7 @@ def _multi_tensor_sgd(
     *,
     weight_decay: float,
     momentum: float,
-    lr: float,
+    lr: float | Tensor,
     dampening: float,
     nesterov: bool,
     maximize: bool,
@@ -469,11 +469,11 @@ def _multi_tensor_sgd(
                 grads_x_lr = torch._foreach_mul(device_grads, -lr)
                 torch._foreach_add_(device_params, grads_x_lr)
             else:
-                torch._foreach_add_(device_params, device_grads, alpha=-lr)
+                torch._foreach_add_(device_params, device_grads, alpha=-lr)  # type: ignore[arg-type]
         else:
             # foreach APIs don't support sparse
             for i in range(len(device_params)):
-                device_params[i].add_(device_grads[i], alpha=-lr)
+                device_params[i].add_(device_grads[i], alpha=-lr)  # type: ignore[arg-type]
 
 
 def _fused_sgd(
@@ -485,7 +485,7 @@ def _fused_sgd(
     *,
     weight_decay: float,
     momentum: float,
-    lr: float,
+    lr: float | Tensor,
     dampening: float,
     nesterov: bool,
     maximize: bool,

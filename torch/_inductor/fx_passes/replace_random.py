@@ -3,6 +3,7 @@ import collections
 import logging
 
 import torch
+from torch.fx.experimental.symbolic_shapes import guard_or_false, statically_known_true
 from torch.fx.passes.graph_transform_observer import GraphTransformObserver
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
 
@@ -21,6 +22,40 @@ patterns = PatternMatcherPass(subsystem="joint_graph_passes")
 aten = torch.ops.aten
 
 
+def _shape_to_offset(shape, device: torch.device):
+    # Modified from torch/_prims/rng_prims.py:philox_rand_offset
+    nelem = 1
+    for s in shape:
+        nelem *= s
+
+    # Empty tensor: no random numbers are generated/consumed.
+    is_empty = nelem == 0
+    if statically_known_true(is_empty) or guard_or_false(is_empty):
+        return 0
+
+    if device is None:
+        device = torch.device("cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    if device.type != "cuda":
+        return 0
+
+    block_size = 256
+    unroll = 4
+    curand4_engine_calls = 4
+
+    device_property = torch.cuda.get_device_properties(device)
+
+    blocks_per_sm = device_property.max_threads_per_multi_processor // block_size
+    max_grid = device_property.multi_processor_count * blocks_per_sm
+    grid_size = (nelem + block_size - 1) // block_size
+    grid_size = -torch.sym_min(-grid_size, -1)
+    grid_size = torch.sym_min(grid_size, max_grid)
+
+    return ((nelem - 1) // (block_size * grid_size * unroll) + 1) * curand4_engine_calls
+
+
 def replace_random_passes(gm: torch.fx.GraphModule):
     """Modify the given FX graph to use backend-native random ops"""
     if config.fallback_random:
@@ -29,8 +64,61 @@ def replace_random_passes(gm: torch.fx.GraphModule):
     count = patterns.apply(gm)
     with GraphTransformObserver(gm, "fuse_seed_creation_pass", "joint_graph_passes"):
         count += fuse_seed_creation_pass(gm.graph)
+    if config.align_random_eager:
+        with GraphTransformObserver(gm, "fuse_offset_creation_pass"):
+            count += fuse_offset_creation_pass(gm.graph)
 
     return count
+
+
+def fuse_offset_creation_pass(graph: torch.fx.Graph) -> int:
+    """
+    Here offset node means seed << 32 + offset, will be unpacked in
+    lowering.py:inductor_random()
+    Horizontally fuse all the seed generation on each device
+        a = inductor_prims.rand_eager_offset(offset, dev)
+        b = inductor_prims.rand_eager_offset(offset, dev)
+    Becomes:
+        offsets = inductor_prims.rand_eager_offsets([offset1, offset2...], dev)
+        a = torch.ops.aten.select.int(offsets, 0, 0)
+        b = torch.ops.aten.select.int(offsets, 0, 1)
+    We do this because seed creation is entirely launch overhead bound.
+    """
+    device_offsets = collections.defaultdict(list)
+    for node in graph.nodes:
+        if CallFunctionVarArgs(inductor_prims.rand_eager_offset).match(node):
+            device_offsets[_device_key(node.args[1])].append(node)
+
+    if not device_offsets:
+        return 0
+
+    for offsets in device_offsets.values():
+        device = offsets[0].args[1]
+        with graph.inserting_before(offsets[0]):
+            offs = [n.args[0] for n in offsets]
+            combined = graph.call_function(
+                inductor_prims.rand_eager_offsets, (offs, device)
+            )
+            combined.meta.update(offsets[0].meta)
+            val_device = _concrete_device(device)
+            with V.fake_mode:
+                combined.meta["val"] = torch.empty(
+                    [len(offsets), 2], device=val_device, dtype=torch.int64
+                )
+                combined.meta["tensor_meta"] = _extract_tensor_metadata(
+                    combined.meta["val"]
+                )
+
+        for idx, offset in enumerate(offsets):
+            with graph.inserting_before(offset):
+                new_state = graph.call_function(
+                    torch.ops.aten.select.int, (combined, 0, idx)
+                )
+            offset.replace_all_uses_with(new_state)
+            new_state.meta.update(offset.meta)
+            graph.erase_node(offset)
+
+    return len(device_offsets)
 
 
 def fuse_seed_creation_pass(graph: torch.fx.Graph):
@@ -50,17 +138,19 @@ def fuse_seed_creation_pass(graph: torch.fx.Graph):
     device_seeds = collections.defaultdict(list)
     for node in graph.nodes:
         if CallFunctionVarArgs(inductor_prims.seed).match(node):
-            device_seeds[node.args[0]].append(node)
+            device_seeds[_device_key(node.args[0])].append(node)
 
     if not device_seeds:
         return 0
 
-    for device, seeds in device_seeds.items():
+    for seeds in device_seeds.values():
+        device = seeds[0].args[0]
         with graph.inserting_before(seeds[0]):
             combined = graph.call_function(inductor_prims.seeds, (len(seeds), device))
+            combined.meta.update(seeds[0].meta)
             with V.fake_mode:
                 combined.meta["val"] = torch.empty(
-                    [len(seeds)], device=device, dtype=torch.int64
+                    [len(seeds)], device=_concrete_device(device), dtype=torch.int64
                 )
                 combined.meta["tensor_meta"] = _extract_tensor_metadata(
                     combined.meta["val"]
@@ -82,7 +172,40 @@ def default_kwargs(device):
     return {}
 
 
+def _is_coor_device(device) -> bool:
+    if not isinstance(device, torch.fx.Node):
+        return False
+    if device.target is not torch.ops.coor.current_device.default:
+        raise AssertionError(
+            f"replace_random: device operand is an unexpected graph node: {device}"
+        )
+    return True
+
+
+def _device_key(device):
+    # compile-on-one-rank: each replacement is traced separately and brings its own
+    # current_device() node, but they all denote the same device.
+    return torch.ops.coor.current_device.default if _is_coor_device(device) else device
+
+
+def _concrete_device(device):
+    """A real torch.device for a device operand that may still be a CooR node.
+
+    compile-on-one-rank: these passes run on the joint graph, where a factory op's
+    device operand is still a coor current_device() node -- respecialize_current_device_nodes
+    does not concretise those until post_grad. Resolve it the way that pass does. Nothing
+    is pinned by doing so: the replacement is traced with compile-on-one-rank live, which
+    turns the device back into a current_device() node.
+    """
+    if _is_coor_device(device):
+        from torch.fx.experimental.proxy_tensor import _coor_current_device
+
+        return _coor_current_device()
+    return device
+
+
 def get_device(device):
+    device = _concrete_device(device)
     if device is not None:
         return device
     return torch.empty([]).device  # default device
@@ -108,6 +231,8 @@ def replace_random(
 ):
     if generator is not None:
         return
+    if pin_memory:
+        return
 
     def replacement(size):
         result = inductor_prims.random(
@@ -124,8 +249,32 @@ def replace_random(
         match.output_node().target.overloadpacket  # type: ignore[union-attr]
     ]  # type: ignore[union-attr]
     device = get_device(device)
+    replacement_fn = replacement
+
+    if mode == "rand" and config.align_random_eager and device.type == "cuda":
+        # Only enable when align_random_eager is on.
+        def replacement_align(size):
+            offset = _shape_to_offset(size, device)
+
+            align_dtype = dtype
+            if isinstance(align_dtype, (tuple, list)):
+                align_dtype = align_dtype[0] if len(align_dtype) else None
+
+            result = inductor_prims.random(
+                size,
+                inductor_prims.rand_eager_offset(offset, device),
+                mode,
+                **default_kwargs(device),
+                align_dtype=align_dtype,
+            )
+            if dtype is not None:
+                result = result.to(dtype)
+            return result
+
+        replacement_fn = replacement_align
+
     # pyrefly: ignore [bad-argument-type]
-    match.replace_by_example(replacement, [size])
+    match.replace_by_example(replacement_fn, [size])
 
 
 # pyrefly: ignore [bad-argument-type]
@@ -141,6 +290,9 @@ def replace_randint(
     layout=None,
     pin_memory=None,
 ):
+    if pin_memory:
+        return
+
     def replacement(low, high, size):
         result = inductor_prims.randint(low, high, size, inductor_prims.seed(device))
         return result.to(dtype)

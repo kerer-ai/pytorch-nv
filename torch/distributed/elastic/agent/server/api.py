@@ -65,17 +65,16 @@ class WorkerSpec:
         max_restarts: number of max retries for the workers
         monitor_interval: monitor status of workers every ``n`` seconds
         master_port: fixed port to run the c10d store on rank 0
-                     if not specified then will chose a random free port
+                     if not specified then will choose a random free port
         master_addr: fixed master_addr to run the c10d store on rank 0
-                     if not specified then will chose hostname on agent rank 0
-        redirects: redirect std streams to a file,
-                   selectively redirect for a particular
-                   local rank by passing a map
-        tee: tees the specified std stream(s) to console + file,
-             selectively tee for a particular local rank by passing a map,
-             takes precedence over ``redirects`` settings.
+                     if not specified then will choose hostname on agent rank 0
+        local_addr: address of the local node, informational only; the agent
+                    does not read it. The address advertised during rendezvous
+                    comes from ``RendezvousParameters.local_addr`` (defaults to
+                    the local FQDN)
         event_log_handler: name of the event logging handler as registered in
           `elastic/events/handlers.py <https://docs.pytorch.org/docs/stable/elastic/events.html>`_.
+        numa_options: NUMA binding options for the workers (see :ref:`numa-api`)
         duplicate_stdout_filters: If non-empty, duplicates stdout to a file containing only lines
                                  that match _any_ of the filter strings.
         duplicate_stderr_filters: If non-empty, duplicates stderr to a file containing only lines
@@ -148,7 +147,6 @@ class Worker:
     agent it could be encoded as ``host:port (string)``.
 
     Args:
-        id (Any): uniquely identifies a worker (interpreted by the agent)
         local_rank (int): local rank of the worker
         global_rank (int): global rank of the worker
         role_rank (int): rank of the worker across all workers that have the same role
@@ -236,7 +234,7 @@ class WorkerState(str, Enum):
     1. Worker group failure|unhealthy observed
     2. Membership change detected
 
-    When actions (start, stop, rdzv, retry, etc) on worker group fails
+    When actions (start, stop, rdzv, retry, etc) on worker group fail
     and results in the action being partially applied to the worker group
     the state will be ``UNKNOWN``. Typically this happens on uncaught/unhandled
     exceptions during state change events on the agent. The agent is not
@@ -462,15 +460,23 @@ class SimpleElasticAgent(ElasticAgent):
     def __init__(
         self,
         spec: WorkerSpec,
-        exit_barrier_timeout: float = 300,
+        exit_barrier_timeout: float | None = None,
         shutdown_timeout: int = 30,
     ):
         self._worker_group = WorkerGroup(spec)
         self._remaining_restarts = self._worker_group.spec.max_restarts
         self._store = None
-        self._exit_barrier_timeout = exit_barrier_timeout
+        # Resolve exit_barrier_timeout: explicit arg wins, then env var, then
+        # the historical default of 300 s.
+        if exit_barrier_timeout is None:
+            self._exit_barrier_timeout = float(
+                os.environ.get("TORCH_ELASTIC_EXIT_BARRIER_TIMEOUT", "300")
+            )
+        else:
+            self._exit_barrier_timeout = exit_barrier_timeout
         self._shutdown_timeout = shutdown_timeout
         self._total_execution_time = 0
+        self._in_exit_barrier: bool = False
 
     def get_worker_group(self, role: str = DEFAULT_ROLE) -> WorkerGroup:
         return self._worker_group
@@ -595,16 +601,16 @@ class SimpleElasticAgent(ElasticAgent):
         Time complexity: each worker O(1), overall O(1)
 
         Slow Path: when workers have different roles and world sizes. We use the
-        the following algorithm:
+        following algorithm:
 
         1. Each agent writes its configuration(group_rank, group_world_size
            , num_workers) to the common store.
         2. The rank 0 agent reads all the role_info from the store and
-           determines each agents worker ranks.
+           determines each agent's worker ranks.
         3. Determine the global rank: the global rank of the workers is computed
            by cumulative sum of the local_world_size for all workers in front of it.
            For efficiency reasons each worker is assigned a base global rank
-           such that it's workers are in the range [base_global_rank,
+           such that its workers are in the range [base_global_rank,
            base_global_rank + local_world_size).
         4. Determine the role rank: The role rank is determined using the algorithms
            in the point 3 with the exception that the ranks are calculated with
@@ -747,7 +753,7 @@ class SimpleElasticAgent(ElasticAgent):
             self._record_worker_events(result)
             return result
         except RendezvousGracefulExitError as e:
-            logger.info("Rendezvous gracefully exited: %s", e)  # noqa: G200
+            logger.info("Rendezvous gracefully exited: %s", e)
         except SignalException as e:
             logger.warning("Received %s death signal, shutting down workers", e.sigval)
             self._shutdown(e.sigval, timeout=self._shutdown_timeout)
@@ -902,18 +908,8 @@ class SimpleElasticAgent(ElasticAgent):
 
         put_metric(f"workers.{spec.role}.flakiness", int(flakiness))
 
-    def _pre_invoke_run(self) -> None:
-        """Hook called before the worker lifecycle loop in ``_invoke_run``.
-
-        Subclasses can override this to perform setup that must happen
-        before rendezvous and worker initialization (e.g. starting a
-        health check server).  The default implementation is a no-op.
-        """
-
     def _invoke_run(self, role: str = DEFAULT_ROLE) -> RunResult:
         # NOTE: currently only works for a single role
-
-        self._pre_invoke_run()
 
         spec = self._worker_group.spec
         role = spec.role
@@ -998,6 +994,7 @@ class SimpleElasticAgent(ElasticAgent):
             self._exit_barrier_timeout,
         )
         start = time.time()
+        self._in_exit_barrier = True
         try:
             store_util.barrier(
                 store=self._store,
@@ -1017,3 +1014,5 @@ class SimpleElasticAgent(ElasticAgent):
                 "Error waiting on exit barrier. Elapsed: %s seconds",
                 time.time() - start,
             )
+        finally:
+            self._in_exit_barrier = False

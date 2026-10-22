@@ -3,6 +3,8 @@ import abc
 import cmath
 import collections.abc
 import contextlib
+import dataclasses
+import types
 from collections.abc import Callable, Collection, Sequence
 from typing import Any, NoReturn
 from typing_extensions import deprecated
@@ -18,9 +20,51 @@ except ModuleNotFoundError:
     HAS_NUMPY = False
     np = None  # type: ignore[assignment]
 
+# Types for which Dynamo can fault if we call dataclasses.is_dataclass on them.
+_IS_DATACLASS_SKIP_TYPES: tuple[type, ...] = (
+    type,
+    torch.Tensor,
+    types.UnionType,
+    types.GenericAlias,
+)
+if HAS_NUMPY:
+    # pyrefly: ignore [missing-attribute]
+    _IS_DATACLASS_SKIP_TYPES = (*_IS_DATACLASS_SKIP_TYPES, np.ndarray, np.generic)
+
+_HAS_DTENSOR = torch.distributed.is_available()
+
+
+def _unwrap_dtensor_for_comparison(actual, expected):
+    """Handle DTensor inputs for assertEqual/assert_close."""
+    if not _HAS_DTENSOR:
+        return actual, expected
+    from torch.distributed.tensor import DTensor
+
+    actual_dt = isinstance(actual, DTensor)
+    expected_dt = isinstance(expected, DTensor)
+    if actual_dt and expected_dt:
+        if actual.placements != expected.placements:
+            raise AssertionError(
+                f"DTensor placements do not match: "
+                f"{actual.placements} != {expected.placements}"
+            )
+        if actual.device_mesh != expected.device_mesh:
+            raise AssertionError(
+                f"DTensor device meshes do not match: "
+                f"{actual.device_mesh} != {expected.device_mesh}"
+            )
+        return actual.to_local(), expected.to_local()
+    elif actual_dt != expected_dt:
+        raise TypeError(
+            "Comparing a DTensor to a non-DTensor is ambiguous. "
+            "Call .full_tensor() to compare the full logical tensor "
+            "or .to_local() to compare the local shard."
+        )
+    return actual, expected
+
 
 class ErrorMeta(Exception):
-    """Internal testing exception that makes that carries error metadata."""
+    """Internal testing exception that carries error metadata."""
 
     def __init__(
         self, type: type[Exception], msg: str, *, id: tuple[Any, ...] = ()
@@ -102,7 +146,7 @@ def get_tolerances(
     atol: float | None,
     id: tuple[Any, ...] = (),
 ) -> tuple[float, float]:
-    """Gets absolute and relative to be used for numeric comparisons.
+    """Gets absolute and relative tolerances to be used for numeric comparisons.
 
     If both ``rtol`` and ``atol`` are specified, this is a no-op. If both are not specified, the return value of
     :func:`default_tolerances` is used.
@@ -114,7 +158,7 @@ def get_tolerances(
         (Tuple[float, float]): Valid absolute and relative tolerances.
     """
     if (rtol is None) ^ (atol is None):
-        # We require both tolerance to be omitted or specified, because specifying only one might lead to surprising
+        # We require both tolerances to be omitted or specified, because specifying only one might lead to surprising
         # results. Imagine setting atol=0.0 and the tensors still match because rtol>0.0.
         raise ErrorMeta(
             ValueError,
@@ -337,7 +381,7 @@ def make_tensor_mismatch_msg(
     )
 
 
-class UnsupportedInputs(Exception):  # noqa: B903
+class UnsupportedInputs(Exception):
     """Exception to be raised during the construction of a :class:`Pair` in case it doesn't support the inputs."""
 
 
@@ -648,9 +692,9 @@ class TensorLikePair(Pair):
     Kwargs:
         allow_subclasses (bool):
         rtol (Optional[float]): Relative tolerance. If specified ``atol`` must also be specified. If omitted, default
-            values based on the type are selected. See :func:assert_close: for details.
+            values based on the type are selected. See :func:`assert_close` for details.
         atol (Optional[float]): Absolute tolerance. If specified ``rtol`` must also be specified. If omitted, default
-            values based on the type are selected. See :func:assert_close: for details.
+            values based on the type are selected. See :func:`assert_close` for details.
         equal_nan (bool): If ``True``, two ``NaN`` values are considered equal. Defaults to ``False``.
         check_device (bool): If ``True`` (default), asserts that corresponding tensors are on the same
             :attr:`~torch.Tensor.device`. If this check is disabled, tensors on different
@@ -808,7 +852,7 @@ class TensorLikePair(Pair):
 
         If ``actual`` and ``expected`` are ...
 
-        - ... not on the same :attr:`~torch.Tensor.device`, they are moved CPU memory.
+        - ... not on the same :attr:`~torch.Tensor.device`, they are moved to CPU memory.
         - ... not of the same ``dtype``, they are promoted  to a common ``dtype`` (according to
             :func:`torch.promote_types`).
         - ... not of the same ``layout``, they are converted to strided tensors.
@@ -1124,8 +1168,9 @@ def originate_pairs(
 ) -> list[Pair]:
     """Originates pairs from the individual inputs.
 
-    ``actual`` and ``expected`` can be possibly nested :class:`~collections.abc.Sequence`'s or
-    :class:`~collections.abc.Mapping`'s. In this case the pairs are originated by recursing through them.
+    ``actual`` and ``expected`` can be possibly nested :class:`~collections.abc.Sequence`'s,
+    :class:`~collections.abc.Mapping`'s, or dataclass instances. In this case the pairs are
+    originated by recursing through them.
 
     Args:
         actual (Any): Actual input.
@@ -1216,6 +1261,50 @@ def originate_pairs(
             )
         return pairs
 
+    # Dataclass instances normally compare via ``==`` / ObjectPair so custom ``__eq__``
+    # (including ``eq=False`` classes) is respected. Generated dataclass ``__eq__``
+    # treats each field comparison as a Python bool, so multi-element tensor fields
+    # raise on Python 3.13+ (no same-object shortcut), or return a Tensor when that
+    # field is the sole compare=True field. Only then recurse field-by-field so
+    # tensors use the normal tensor comparison path.
+    #
+    # Skip is_dataclass for types Dynamo mishandles (Tensor, ndarray, UnionType, ...).
+    elif (
+        not isinstance(actual, _IS_DATACLASS_SKIP_TYPES)
+        and not isinstance(expected, _IS_DATACLASS_SKIP_TYPES)
+        and dataclasses.is_dataclass(actual)
+        and dataclasses.is_dataclass(expected)
+        and type(actual) is type(expected)
+    ):
+        try:
+            equal = actual == expected
+        except RuntimeError as error:
+            if "Boolean value of Tensor" not in str(error):
+                raise
+        else:
+            # Single tensor-field dataclasses can return a Tensor from __eq__
+            # without raising; only a real bool means == is usable as-is.
+            if type(equal) is bool:
+                return [ObjectPair(actual, expected, id=id, **options)]
+
+        pairs = []
+        # pyrefly: ignore [bad-argument-type]  # narrowed by is_dataclass above
+        for field in dataclasses.fields(actual):
+            if not field.compare:
+                continue
+            pairs.extend(
+                originate_pairs(
+                    getattr(actual, field.name),
+                    getattr(expected, field.name),
+                    pair_types=pair_types,
+                    sequence_types=sequence_types,
+                    mapping_types=mapping_types,
+                    id=(*id, field.name),
+                    **options,
+                )
+            )
+        return pairs
+
     else:
         for pair_type in pair_types:
             try:
@@ -1288,7 +1377,7 @@ def not_close_error_metas(
         )
     except ErrorMeta as error_meta:
         # Explicitly raising from None to hide the internal traceback
-        raise error_meta.to_error() from None  # noqa: RSE102
+        raise error_meta.to_error() from None
 
     error_metas: list[ErrorMeta] = []
     for pair in pairs:
@@ -1572,6 +1661,8 @@ def assert_close(
     """
     # Hide this function from `pytest`'s traceback
     __tracebackhide__ = True
+
+    actual, expected = _unwrap_dtensor_for_comparison(actual, expected)
 
     error_metas = not_close_error_metas(
         actual,

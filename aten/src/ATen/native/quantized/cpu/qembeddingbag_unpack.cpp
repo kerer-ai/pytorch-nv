@@ -94,7 +94,6 @@ at::Tensor PackedEmbeddingBagWeight::unpack() {
   TORCH_INTERNAL_ASSERT(
       false,
       "We currently only support 8-bit and 4-bit quantization of embedding_bag.");
-  return weight_origin;
 }
 
 namespace at::native {
@@ -197,7 +196,7 @@ Tensor _qembeddingbag_nbit_unpack_helper(
       output_dimensions,
       packed_weight.options().dtype(kFloat),
       packed_weight.suggest_memory_format());
-  float* output_data = output.data_ptr<float>();
+  float* output_data = output.mutable_data_ptr<float>();
 #ifdef USE_FBGEMM
   at::parallel_for(0, input_rows, 1, [&](int64_t start_idx, int64_t end_idx) {
     fbgemm::FusedNBitRowwiseQuantizedSBHalfToFloatOrHalf<float>(

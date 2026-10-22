@@ -3,6 +3,7 @@
 """Test examples for NEP 50."""
 
 import itertools
+from contextlib import contextmanager
 from unittest import skipIf as skipif, SkipTest
 
 
@@ -10,7 +11,7 @@ try:
     import numpy as _np
 
     v = _np.__version__.split(".")
-    HAVE_NUMPY = int(v[0]) >= 1 and int(v[1]) >= 24
+    HAVE_NUMPY = (int(v[0]), int(v[1])) >= (1, 24)
 except ImportError:
     HAVE_NUMPY = False
 
@@ -31,6 +32,7 @@ from torch._numpy import (  # noqa: F401
 from torch._numpy.testing import assert_allclose
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
+    IS_WINDOWS,
     parametrize,
     run_tests,
     TestCase,
@@ -49,6 +51,20 @@ from pytest import raises as assert_raises
 
 
 unchanged = None
+
+
+@contextmanager
+def _promotional_state_cm(state):
+    if hasattr(_np, "_get_promotion_state"):
+        previous_state = _np._get_promotion_state()
+        _np._set_promotion_state(state)
+        try:
+            yield
+        finally:
+            _np._set_promotion_state(previous_state)
+    else:
+        yield
+
 
 # expression    old result   new_result
 examples = {
@@ -161,10 +177,7 @@ class TestCompareToNumpy(TestCase):
     @parametrize("scalar, array, dtype", itertools.product(weaks, non_weaks, dtypes))
     def test_direct_compare(self, scalar, array, dtype):
         # compare to NumPy w/ NEP 50.
-        try:
-            state = _np._get_promotion_state()
-            _np._set_promotion_state("weak")
-
+        with _promotional_state_cm("weak"):
             if dtype is not None:
                 kwargs = {"dtype": dtype}
             try:
@@ -174,7 +187,11 @@ class TestCompareToNumpy(TestCase):
 
             kwargs = {}
             if dtype is not None:
-                kwargs = {"dtype": getattr(tnp, dtype.__name__)}
+                kwargs = {
+                    "dtype": getattr(tnp, dtype.__name__)
+                    if dtype is not _np.bool_
+                    else tnp.bool_
+                }
             result = tnp.add(scalar, array, **kwargs).tensor.numpy()
             if result.dtype != result_numpy.dtype:
                 raise AssertionError(
@@ -182,9 +199,6 @@ class TestCompareToNumpy(TestCase):
                 )
             if result != result_numpy:
                 raise AssertionError(f"Expected result == {result_numpy}, got {result}")
-
-        finally:
-            _np._set_promotion_state(state)
 
     @parametrize("name", tnp._ufuncs._binary)
     @parametrize("scalar, array", itertools.product(weaks, non_weaks))
@@ -195,10 +209,7 @@ class TestCompareToNumpy(TestCase):
         ):
             raise SkipTest(f"{name}(..., dtype=array.dtype)")
 
-        try:
-            state = _np._get_promotion_state()
-            _np._set_promotion_state("weak")
-
+        with _promotional_state_cm("weak"):
             if name in ["matmul", "modf", "divmod", "ldexp"]:
                 return
             ufunc = getattr(tnp, name)
@@ -206,7 +217,7 @@ class TestCompareToNumpy(TestCase):
 
             try:
                 result = ufunc(scalar, array)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 # RuntimeError: "bitwise_xor_cpu" not implemented for 'ComplexDouble' etc
                 result = None
 
@@ -216,14 +227,36 @@ class TestCompareToNumpy(TestCase):
                 # TypeError: ufunc 'hypot' not supported for the input types
                 result_numpy = None
 
-            if result is not None and result_numpy is not None:
-                if result.tensor.numpy().dtype != result_numpy.dtype:
-                    raise AssertionError(
-                        f"Expected result dtype == {result_numpy.dtype}, got {result.tensor.numpy().dtype}"
-                    )
+            type_mismatch = False
+            expected_numpy_dtype = None
+            expected_torch_dtype = None
 
-        finally:
-            _np._set_promotion_state(state)
+            if result is not None and result_numpy is not None:
+                expected_numpy_dtype = result_numpy.dtype
+                expected_torch_dtype = result.tensor.numpy().dtype
+                if IS_WINDOWS:
+                    if (
+                        array.tensor.numpy().dtype != _np.bool_
+                        and result.tensor.numpy().dtype != result_numpy.dtype
+                    ):
+                        type_mismatch = True
+
+                    if (
+                        array.tensor.numpy().dtype == _np.bool_
+                        and result_numpy.dtype == _np.int32
+                        and result.tensor.numpy().dtype != _np.int64
+                    ):
+                        expected_numpy_dtype = _np.int32
+                        expected_torch_dtype = tnp.int64
+                        type_mismatch = True
+                else:
+                    if result.tensor.numpy().dtype != result_numpy.dtype:
+                        type_mismatch = True
+
+            if type_mismatch:
+                raise AssertionError(
+                    f"Expected result numpy dtype == {expected_numpy_dtype}, torch dtype == {expected_torch_dtype}"
+                )
 
 
 if __name__ == "__main__":

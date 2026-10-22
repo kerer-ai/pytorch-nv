@@ -65,7 +65,6 @@ Tensor adaptive_avg_pool2d_quantized_cuda(
     return at::quantize_per_tensor(result_fp32, input.q_scale(), input.q_zero_point(), input.scalar_type());
 #else // USE_CUDA
   TORCH_CHECK(false, "at::native::adaptive_avg_pool2d_quantized_cuda: ATen not compiled with USE_CUDA support");
-  return Tensor{}; // never reached, placates the compiler
 #endif
 }
 
@@ -201,10 +200,10 @@ Tensor quantized_max_pool2d_cudnn(
                       poolingDesc,
                       &one,
                       xDesc.desc(),
-                      input.data_ptr<int8_t>(),
+                      input.const_data_ptr<int8_t>(),
                       &zero,
                       yDesc.desc(),
-                      qy.data_ptr<int8_t>());
+                      qy.mutable_data_ptr<int8_t>());
 
   // recall we casted our input and output to 4D if qx was 3D, so we recast it back to 3D prior to returning
   return (ndim == 3 ? qy.view(std::vector<int64_t>(output_shape.begin() + 1, output_shape.end())) : qy);
@@ -214,7 +213,6 @@ Tensor quantized_max_pool2d_cudnn(
 #endif // AT_CUDNN_ENABLED()
 #else // USE_CUDA
   TORCH_CHECK(false, "at::native::quantized_max_pool2d_cudnn: ATen not compiled with USE_CUDA support");
-  return Tensor{}; // never reached, placates the compiler
 #endif
 }
 

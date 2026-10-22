@@ -6,8 +6,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <string>
+#include <string_view>
+
+#if defined(USE_ROCM) && defined(__has_include) && \
+    __has_include(<ATen/ROCmCKSDPAConfig.h>)
+#include <ATen/ROCmCKSDPAConfig.h>
+#endif
+#ifndef AT_ROCM_CK_SDPA_ARCHS
+// Non-CMake ROCm builds (e.g. Buck) do not generate the header but still
+// build CK SDPA, so fall back to the archs it supported before the header
+// existed. An empty list here would make ckSDPASupported() return false and
+// silently reroute a CK preference to AOTriton, which internal builds stub
+// out with a runtime error.
+#define AT_ROCM_CK_SDPA_ARCHS "gfx942,gfx950"
+#endif
 
 #include <ATen/cpu/FlushDenormal.h>
 
@@ -21,13 +36,28 @@ C10_DIAGNOSTIC_POP()
 #endif
 namespace at {
 
+namespace {
+
+std::atomic<bool> xnnpack_backend_available{false};
+
+} // namespace
+
+namespace native::xnnpack::internal {
+
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+TORCH_API void register_backend() {
+  xnnpack_backend_available.store(true, std::memory_order_relaxed);
+}
+
+} // namespace native::xnnpack::internal
+
 /*
   These const variables defined the fp32 precisions for different backend
   We have "generic", "cuda", "mkldnn" backend now and we can choose fp32
-  prevision from "ieee", "tf32", "bf16" and "none". The "ieee" precision means
-  IEEE standard floating point format, "tf32" and "bf16" means we are allowed to
-  use "tf32" or "bf16" as internal computation data types for fp32 computations.
-  And "none" means it is override-able by parent's node
+  precision from "ieee", "tf32", "bf16", "bfx9", and "none". The "ieee"
+  precision means IEEE standard floating point format. "tf32", "bf16", and
+  "bfx9" allow reduced-precision arithmetic internally for fp32 computations.
+  "none" means it is override-able by its parent node.
 
   generic->mkldnn->matmul
                 ->conv
@@ -68,6 +98,8 @@ Float32Precision str2precision(const std::string& name) {
     return Float32Precision::TF32;
   else if (name == "bf16")
     return Float32Precision::BF16;
+  else if (name == "bfx9")
+    return Float32Precision::BF16X9;
   TORCH_CHECK(false, "Unknown precision: ", name);
 }
 
@@ -81,12 +113,41 @@ std::string precision2str(Float32Precision prec) {
       return "tf32";
     case Float32Precision::BF16:
       return "bf16";
+    case Float32Precision::DEFAULT:
+      // DEFAULT is an internal sentinel and should be resolved before reaching here
+      TORCH_CHECK(false, "DEFAULT precision should not be visible externally");
+    case Float32Precision::BF16X9:
+      return "bfx9";
   }
   TORCH_CHECK(false, "Invalid enum Float32Precision(", static_cast<int>(prec), ")");
 }
 
+CuDNNDepthwiseKernel str2cudnn_depthwise(const std::string& name) {
+  if (name == "auto")
+    return CuDNNDepthwiseKernel::AUTO;
+  else if (name == "cudnn")
+    return CuDNNDepthwiseKernel::CUDNN;
+  else if (name == "native")
+    return CuDNNDepthwiseKernel::NATIVE;
+  TORCH_CHECK(false, "Unknown cuDNN depthwise kernel mode: ", name,
+              ". Expected one of: auto, cudnn, native");
+}
+
+std::string cudnn_depthwise2str(CuDNNDepthwiseKernel k) {
+  switch (k) {
+    case CuDNNDepthwiseKernel::AUTO:
+      return "auto";
+    case CuDNNDepthwiseKernel::CUDNN:
+      return "cudnn";
+    case CuDNNDepthwiseKernel::NATIVE:
+      return "native";
+  }
+  TORCH_CHECK(false, "Invalid enum CuDNNDepthwiseKernel(", static_cast<int>(k), ")");
+}
+
 #ifdef USE_ROCM
 static constexpr const auto rocm_allow_group_gemm_ck = "ROCM_ALLOW_GROUP_GEMM_CK";
+static constexpr const auto rocm_allow_group_gemm_ck_tile = "ROCM_ALLOW_GROUP_GEMM_CK_TILE";
 #endif
 
 Context::Context() = default;
@@ -182,6 +243,14 @@ void Context::setUserEnabledNNPACK(bool e) {
   enabled_nnpack = e;
 }
 
+CuDNNDepthwiseKernel Context::cudnnDepthwiseKernel() const {
+  return depthwise_kernel_cudnn;
+}
+
+void Context::setCuDNNDepthwiseKernel(CuDNNDepthwiseKernel k) {
+  depthwise_kernel_cudnn = k;
+}
+
 bool Context::allowTF32CuDNN(std::optional<Float32Op> op) const {
   if (!op.has_value()) {
     bool allow_tf32_rnn = float32Precision(Float32Backend::CUDA, Float32Op::RNN) == Float32Precision::TF32;
@@ -237,6 +306,10 @@ bool Context::rocmAllowGroupGemmCk() const {
     const auto allow_group_gemm_ck = c10::utils::check_env(rocm_allow_group_gemm_ck) == true;
     return allow_group_gemm_ck;
 }
+bool Context::rocmAllowGroupGemmCkTile() const {
+    const auto allow_group_gemm_ck_tile = c10::utils::check_env(rocm_allow_group_gemm_ck_tile) == true;
+    return allow_group_gemm_ck_tile;
+}
 #endif
 
 bool Context::userEnabledFlashSDP() const {
@@ -253,6 +326,14 @@ bool Context::userEnabledFA3SDP() const {
 
 void Context::setSDPUseFA3(bool e) {
   enabled_fa3SDP = e;
+}
+
+bool Context::userEnabledFA4SDP() const {
+  return enabled_fa4SDP;
+}
+
+void Context::setSDPUseFA4(bool e) {
+  enabled_fa4SDP = e;
 }
 
 bool Context::userEnabledMemEfficientSDP() const {
@@ -336,6 +417,14 @@ void Context::setAllowTF32CuBLAS(bool b) {
   setFloat32Precision(Float32Backend::CUDA, Float32Op::MATMUL, b ? Float32Precision::TF32 : Float32Precision::IEEE);
 }
 
+bool Context::preferCublasltGroupedGemm() const {
+  return prefer_cublaslt_grouped_gemm;
+}
+
+void Context::setPreferCublasltGroupedGemm(bool b) {
+  prefer_cublaslt_grouped_gemm = b;
+}
+
 Float32MatmulPrecision Context::float32MatmulPrecision() const {
   bool invalid = float32Precision(Float32Backend::CUDA, Float32Op::MATMUL) == Float32Precision::TF32 &&
       float32_matmul_precision == at::Float32MatmulPrecision::HIGHEST;
@@ -345,6 +434,9 @@ Float32MatmulPrecision Context::float32MatmulPrecision() const {
   invalid = invalid ||
       (float32Precision(Float32Backend::MKLDNN, Float32Op::MATMUL) == Float32Precision::TF32 &&
        float32_matmul_precision != at::Float32MatmulPrecision::HIGH);
+  invalid = invalid ||
+      (float32Precision(Float32Backend::CUDA, Float32Op::MATMUL) == Float32Precision::BF16X9 &&
+       float32_matmul_precision != at::Float32MatmulPrecision::HIGHEST);
   TORCH_CHECK(
       !invalid,
       "PyTorch is checking the matmul precision without a specific backend name,",
@@ -360,6 +452,25 @@ Float32Precision Context::float32Precision(Float32Backend backend, Float32Op op)
   TORCH_CHECK(it != fp32_precision.end(), "Invalid (backend, op) pair: (", backend, ", ", op, ")");
 
   Float32Precision precision = it->second;
+
+  // DEFAULT means "inherit from parent if set, otherwise use the legacy TF32
+  // default". It is only used as the initial state for CUDA conv/rnn.
+  if (precision == Float32Precision::DEFAULT) {
+    key.second = Float32Op::ALL;
+    Float32Precision parent = fp32_precision.find(key)->second;
+    if (parent == Float32Precision::NONE || parent == Float32Precision::DEFAULT) {
+      key.first = Float32Backend::GENERIC;
+      parent = fp32_precision.find(key)->second;
+    }
+    if (parent != Float32Precision::NONE && parent != Float32Precision::DEFAULT) {
+      // A parent explicitly overrides; apply it (cuda does not support bf16).
+      return (backend == Float32Backend::CUDA && parent == Float32Precision::BF16)
+          ? Float32Precision::NONE
+          : parent;
+    }
+    return Float32Precision::TF32;
+  }
+
   if (precision == Float32Precision::NONE) {
     key.second = Float32Op::ALL;
     precision = fp32_precision.find(key)->second;
@@ -414,6 +525,21 @@ void Context::setFloat32Precision(Float32Backend backend, Float32Op op, Float32P
   TORCH_CHECK(
       !(backend == Float32Backend::CUDA && p == Float32Precision::BF16),
       "backend 'cuda' does not support precision 'bf16'");
+  if (p == Float32Precision::BF16X9) {
+    TORCH_CHECK(
+        backend == Float32Backend::CUDA && op == Float32Op::MATMUL,
+        "precision 'bfx9' is only supported for backend 'cuda' and op 'matmul'");
+    const auto& cuda_hooks = detail::getCUDAHooks();
+    TORCH_CHECK(
+        !cuda_hooks.hasROCM(),
+        "bfx9 precision is only supported on NVIDIA CUDA");
+    TORCH_CHECK(
+        cuda_hooks.hasCUDART() && cuda_hooks.versionCUDART() >= 12090,
+        "bfx9 precision requires PyTorch to be built with CUDA 12.9 or later");
+  }
+  TORCH_CHECK(
+      p != Float32Precision::DEFAULT,
+      "DEFAULT precision is internal and cannot be set explicitly");
 
   it->second = p;
 }
@@ -452,37 +578,29 @@ void Context::setLinalgPreferredBackend(at::LinalgBackend b) {
   }
 }
 
-at::BlasBackend Context::blasPreferredBackend() {
-  // Rather than put logic for interpreting what Default means at every
-  // call site for blasPreferredBackend(), we set it to an actual value.
-  if (blas_preferred_backend == at::BlasBackend::Default) {
+at::BlasBackend Context::blasDefaultBackend() {
+  at::BlasBackend result = at::BlasBackend::Cublas;
 #ifdef USE_ROCM
-    // ROCm - BLAS is default. May change to Lt in the code below.
-    blas_preferred_backend = at::BlasBackend::Cublas;
-#else
-    // CUDA - Lt by default if available
-    blas_preferred_backend = hasCuBLASLt()
-      ? at::BlasBackend::Cublaslt
-      : at::BlasBackend::Cublas;
-#endif
-    // This logic sits in the getter because it needs to validate
-    // values set via env vars such as TORCH_BLAS_PREFER_CUBLASLT
-    // which initialize the backend without calling the setter
-#ifdef USE_ROCM
-    // AMD Instinct targets prefer hipblaslt
-    static const bool hipblaslt_preferred = []() {
-      const auto& archs = detail::getCUDAHooks().getHipblasltPreferredArchs();
-      for (auto index: c10::irange(detail::getCUDAHooks().deviceCount())) {
-        if (!detail::getCUDAHooks().isGPUArch(archs, index)) {
-          return false;
-        }
+  // AMD Instinct targets prefer hipblaslt
+  static const bool hipblaslt_preferred = []() {
+    const auto& archs = detail::getCUDAHooks().getHipblasltPreferredArchs();
+    for (auto index : c10::irange(detail::getCUDAHooks().deviceCount())) {
+      if (!detail::getCUDAHooks().isGPUArch(archs, index)) {
+        return false;
       }
-      return true;
-    }();
-    if (hipblaslt_preferred) {
-      blas_preferred_backend = at::BlasBackend::Cublaslt;
     }
+    return true;
+  }();
+  if (hipblaslt_preferred) {
+    result = at::BlasBackend::Cublaslt;
+  }
 #endif
+  return result;
+}
+
+at::BlasBackend Context::blasPreferredBackend() {
+  if (blas_preferred_backend == at::BlasBackend::Default) {
+    blas_preferred_backend = blasDefaultBackend();
   }
 
 #ifdef USE_ROCM
@@ -510,15 +628,57 @@ at::BlasBackend Context::blasPreferredBackend() {
   return blas_preferred_backend;
 }
 
-bool Context::ckSupported() {
+bool Context::ckSDPASupported() {
 #ifdef USE_ROCM
+  // CK SDPA is only built for a subset of architectures to limit compile time.
+  // AT_ROCM_CK_SDPA_ARCHS is the set this build was compiled for, so the check
+  // stays in step with the build. It is empty when CK SDPA was not built.
+  static const std::vector<std::string> supported_archs = [] {
+    std::vector<std::string> archs;
+    std::string_view rest{AT_ROCM_CK_SDPA_ARCHS};
+    while (!rest.empty()) {
+      const auto comma = rest.find(',');
+      archs.emplace_back(rest.substr(0, comma));
+      if (comma == std::string_view::npos) {
+        break;
+      }
+      rest.remove_prefix(comma + 1);
+    }
+    return archs;
+  }();
+  if (supported_archs.empty()) {
+    return false;
+  }
+  for (auto index : c10::irange(detail::getCUDAHooks().deviceCount())) {
+    if (!detail::getCUDAHooks().isGPUArch(supported_archs, index)) {
+      TORCH_WARN_ONCE(
+          "Attempting to use CK SDPA on an unsupported architecture! Cannot set "
+          "SDPA backend to CK");
+      return false;
+    }
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool Context::ckGemmSupported() {
+#ifdef USE_ROCM
+  // CK GEMM support is broader than CK SDPA.
+  // Keep in sync with torch_filter_ck_gemm_arches (cmake/public/utils.cmake),
+  // which restricts the ck_gemm build to these archs, and the runtime dispatch
+  // in aten/src/ATen/native/hip/ck_gemm_{half,bfloat16}.hip.
   static const std::vector<std::string> supported_archs = {
-    "gfx90a", "gfx942", "gfx950"
+      "gfx90a",
+      "gfx942",
+      "gfx950",
   };
   for (auto index : c10::irange(detail::getCUDAHooks().deviceCount())) {
-    if(!detail::getCUDAHooks().isGPUArch(supported_archs, index)) {
+    if (!detail::getCUDAHooks().isGPUArch(supported_archs, index)) {
       TORCH_WARN_ONCE(
-        "Attempting to use CK on an unsupported architecture! Cannot set backend to CK");
+          "Attempting to use CK GEMM on an unsupported architecture! Cannot set "
+          "blas backend to CK");
       return false;
     }
   }
@@ -538,11 +698,11 @@ void Context::setBlasPreferredBackend(at::BlasBackend b) {
   TORCH_CHECK((b != at::BlasBackend::Cublaslt) || hasCuBLASLt(),
       "Cannot set preferred backend to cuBLASLt if PyTorch has not been compiled with cuBLASLt.");
 #ifdef USE_ROCM
-  static const bool ckSupportedFlag = ckSupported();
+  static const bool ckGemmSupportedFlag = ckGemmSupported();
   static const bool hasCKGEMMFlag = hasCKGEMM();
-  TORCH_CHECK((b != at::BlasBackend::Ck) || (ckSupportedFlag && hasCKGEMMFlag),
+  TORCH_CHECK((b != at::BlasBackend::Ck) || (ckGemmSupportedFlag && hasCKGEMMFlag),
       "Cannot set preferred blas backend to CK since following conditions are not true: ",
-      "architecture supported for CK: ", ckSupportedFlag,
+      "architecture supported for CK GEMM: ", ckGemmSupportedFlag,
       ", PyTorch built with CK GEMM support: ", hasCKGEMMFlag);
 #endif
   if (b != at::BlasBackend::Default && b != at::BlasBackend::Cublas) {
@@ -568,12 +728,12 @@ at::ROCmFABackend Context::getROCmFAPreferredBackend() {
     // which initialize the backend without calling the setter
     // Perform validity checking
     static const bool hasCKSDPAFlag = hasCKSDPA();
-    static const bool ckSupportedFlag = ckSupported();
-    if(!(hasCKSDPAFlag && ckSupportedFlag)){
+    static const bool ckSDPASupportedFlag = ckSDPASupported();
+    if (!(hasCKSDPAFlag && ckSDPASupportedFlag)) {
       TORCH_WARN_ONCE(
-        "Cannot set preferred SDPA backend to CK since following conditions are not true: ",
-        "architecture supported for CK: ", ckSupportedFlag,
-        ", PyTorch built with CK SDPA support: ", hasCKSDPAFlag);
+          "Cannot set preferred SDPA backend to CK since following conditions are not true: ",
+          "architecture supported for CK SDPA: ", ckSDPASupportedFlag,
+          ", PyTorch built with CK SDPA support: ", hasCKSDPAFlag);
       rocm_fa_preferred_backend = at::ROCmFABackend::AOTriton;
     }
   }
@@ -585,10 +745,10 @@ at::ROCmFABackend Context::getROCmFAPreferredBackend() {
 void Context::setROCmFAPreferredBackend(at::ROCmFABackend b) {
 #ifdef USE_ROCM
   static const bool hasCKSDPAFlag = hasCKSDPA();
-  static const bool ckSupportedFlag = ckSupported();
-  TORCH_CHECK((b != at::ROCmFABackend::Ck) || (hasCKSDPAFlag && ckSupportedFlag),
+  static const bool ckSDPASupportedFlag = ckSDPASupported();
+  TORCH_CHECK((b != at::ROCmFABackend::Ck) || (hasCKSDPAFlag && ckSDPASupportedFlag),
       "Cannot set preferred SDPA backend to CK since following conditions are not true: ",
-      "architecture supported for CK: ", ckSupportedFlag,
+      "architecture supported for CK SDPA: ", ckSDPASupportedFlag,
       ", PyTorch built with CK SDPA support: ", hasCKSDPAFlag);
 #endif
   rocm_fa_preferred_backend = b;
@@ -598,7 +758,7 @@ CuBLASReductionOption Context::allowFP16ReductionCuBLAS() const {
   return allow_fp16_reduction_cublas;
 }
 
-CuBLASReductionOption inline get_reduction_option(bool allow_reduced_precision, bool allow_splitk) {
+static CuBLASReductionOption inline get_reduction_option(bool allow_reduced_precision, bool allow_splitk) {
   TORCH_CHECK(
       !(allow_reduced_precision && !allow_splitk),
       "allow_splitk=False is not supported when reduced precision reductions are enabled");
@@ -752,11 +912,7 @@ const std::vector<at::QEngine>& Context::supportedQEngines() {
 }
 
 bool Context::isXNNPACKAvailable() {
-#ifdef USE_XNNPACK
-  return true;
-#else
-  return false;
-#endif
+  return xnnpack_backend_available.load(std::memory_order_acquire);
 }
 
 void Context::setCheckSparseTensorInvariants(std::optional<bool> e = std::nullopt) {
@@ -793,27 +949,28 @@ Allocator* getCPUAllocator() {
   return c10::GetCPUAllocator();
 }
 
-// override_allow_tf32_flag = true
-//    means the allow_tf32 flags are overridden and tf32 is force disabled
-// override_allow_tf32_flag = false
-//    means the original allow_tf32 flags are followed
-thread_local static bool override_allow_tf32_flag = false;
+// True while reduced-precision FP32 matmul modes are force disabled.
+thread_local static bool override_fp32_reduced_precision_flag = false;
 
 NoTF32Guard::NoTF32Guard() {
-  if (!override_allow_tf32_flag) {
+  if (!override_fp32_reduced_precision_flag) {
     changed = true;
-    override_allow_tf32_flag = true;
+    override_fp32_reduced_precision_flag = true;
   }
 }
 
 NoTF32Guard::~NoTF32Guard() {
   if (changed) {
-    override_allow_tf32_flag = false;
+    override_fp32_reduced_precision_flag = false;
   }
 }
 
+bool NoTF32Guard::should_disable_fp32_reduced_precision() {
+  return override_fp32_reduced_precision_flag;
+}
+
 bool NoTF32Guard::should_disable_tf32() {
-  return override_allow_tf32_flag;
+  return should_disable_fp32_reduced_precision();
 }
 
 // Ops can query this flag to know they are in the backward pass.
@@ -850,6 +1007,14 @@ void Context::setWarnOnAccumulateGradStreamMismatch(bool enabled) {
   warn_on_accumulate_grad_stream_mismatch_ = enabled;
 }
 
+bool Context::overrideStaleCaptureStream() const {
+  return override_stale_capture_stream_;
+}
+
+void Context::setOverrideStaleCaptureStream(bool enabled) {
+  override_stale_capture_stream_ = enabled;
+}
+
 bool Context::isDefaultMobileCPUAllocatorSet() {
   return prev_allocator_ptr_ != nullptr;
 }
@@ -874,6 +1039,24 @@ void Context::unsetDefaultMobileCPUAllocator() {
 
 bool Context::allowFP16ReductionCPU() const {
   return allow_fp16_reduction_cpu;
+}
+
+// Plain bools, like the other user-facing toggles on Context (enabled_cudnn,
+// _deterministic_algorithms, ...): set rarely, read per op call, publishing no data.
+bool Context::allowNativeAot() const {
+  return allow_native_aot;
+}
+
+void Context::setAllowNativeAot(bool b) {
+  allow_native_aot = b;
+}
+
+bool Context::maskUnconditionalNativeAot() const {
+  return mask_unconditional_native_aot;
+}
+
+void Context::setMaskUnconditionalNativeAot(bool b) {
+  mask_unconditional_native_aot = b;
 }
 
 void Context::setAllowFP16ReductionCPU(bool b) {

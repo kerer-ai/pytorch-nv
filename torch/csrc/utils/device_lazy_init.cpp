@@ -12,24 +12,21 @@
 namespace torch::utils {
 namespace {
 
-std::array<bool, at::COMPILE_TIME_MAX_DEVICE_TYPES> is_initialized{};
-std::array<bool, at::COMPILE_TIME_MAX_DEVICE_TYPES> is_in_bad_fork{};
-std::array<bool, at::COMPILE_TIME_MAX_DEVICE_TYPES> at_fork_registered{};
+std::array<std::atomic<bool>, at::COMPILE_TIME_MAX_DEVICE_TYPES>
+    is_initialized{};
+std::array<std::atomic<bool>, at::COMPILE_TIME_MAX_DEVICE_TYPES>
+    is_in_bad_fork{};
+std::array<std::atomic<bool>, at::COMPILE_TIME_MAX_DEVICE_TYPES>
+    at_fork_registered{};
 c10::once_flag at_fork_register_once{};
 
 } // anonymous namespace
 
 bool is_device_initialized(at::DeviceType device_type) {
-  pybind11::gil_scoped_acquire g;
   return is_initialized[static_cast<int>(device_type)];
 }
 
 void device_lazy_init(at::DeviceType device_type) {
-  pybind11::gil_scoped_acquire g;
-  // Protected by the GIL.  We don't use call_once because under ASAN it
-  // has a buggy implementation that deadlocks if an instance throws an
-  // exception.  In any case, call_once isn't necessary, because we
-  // have taken a lock.
   if (is_device_initialized(device_type)) {
     return;
   }
@@ -40,24 +37,25 @@ void device_lazy_init(at::DeviceType device_type) {
     return;
   }
 
+  // Don't use call_once because under ASAN it has a buggy implementation that
+  // deadlocks if an instance throws an exception and Python _lazy_init()
+  // functions are idempotent.
+  pybind11::gil_scoped_acquire g;
   std::string module_name = "torch." + at::DeviceTypeName(device_type, true);
   auto module = THPObjectPtr(PyImport_ImportModule(module_name.c_str()));
-  if (!module) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(module);
 
   if (device_type == at::DeviceType::PrivateUse1) {
     auto has_lazy_init_method =
         PyObject_HasAttrString(module.get(), "_lazy_init") == 1;
     if (!has_lazy_init_method) {
+      is_initialized[static_cast<int>(device_type)] = true;
       return;
     }
   }
 
   auto res = THPObjectPtr(PyObject_CallMethod(module.get(), "_lazy_init", ""));
-  if (!res) {
-    throw python_error();
-  }
+  TORCH_CHECK_PYTHON(res);
 
   is_initialized[static_cast<int>(device_type)] = true;
 }

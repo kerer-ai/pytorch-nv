@@ -12,6 +12,7 @@ from .optimizer import (
     _differentiable_doc,
     _disable_dynamo_if_unsupported,
     _foreach_doc,
+    _functional_api_doc,
     _get_capturable_supported_devices,
     _get_scalar_dtype,
     _maximize_doc,
@@ -27,7 +28,7 @@ from .optimizer import (
 __all__ = ["Rprop", "rprop"]
 
 
-class Rprop(Optimizer):  # noqa: D101
+class Rprop(Optimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -39,7 +40,7 @@ class Rprop(Optimizer):  # noqa: D101
         foreach: bool | None = None,
         maximize: bool = False,
         differentiable: bool = False,
-    ) -> None:  # noqa: D107
+    ) -> None:
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -58,7 +59,7 @@ class Rprop(Optimizer):  # noqa: D101
         }
         super().__init__(params, defaults)
 
-    def __setstate__(self, state):  # noqa: D105
+    def __setstate__(self, state):
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -429,10 +430,6 @@ def rprop(
     etaminus: float,
     etaplus: float,
 ) -> None:
-    r"""Functional API that performs rprop algorithm computation.
-
-    See :class:`~torch.optim.Rprop` for details.
-    """
     # this check is slow during compilation, so we skip it
     # if it's strictly needed we can add this check back in dynamo
     if not torch.compiler.is_compiling() and not all(
@@ -470,3 +467,6 @@ def rprop(
         differentiable=differentiable,
         has_complex=has_complex,
     )
+
+
+rprop.__doc__ = _functional_api_doc.format(optimizer="Rprop")

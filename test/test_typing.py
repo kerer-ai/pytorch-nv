@@ -52,7 +52,7 @@ def _strip_filename(msg: str) -> str:
 def _run_mypy() -> dict[str, list[str]]:
     """Clears the cache and run mypy before running any of the typing tests."""
     if os.path.isdir(CACHE_DIR):
-        shutil.rmtree(CACHE_DIR)
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
 
     rc: dict[str, list[str]] = {}
     for directory in (REVEAL_DIR, PASS_DIR, FAIL_DIR):
@@ -171,7 +171,7 @@ class TestTyping(TestCase):
     @parametrize(
         "path",
         get_test_cases(PASS_DIR),
-        name_fn=lambda b: os.path.relpath(b, start=PASS_DIR),
+        name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=PASS_DIR))[0],
     )
     def test_success(self, path) -> None:
         output_mypy = self.get_mypy_output()
@@ -183,10 +183,10 @@ class TestTyping(TestCase):
     @parametrize(
         "path",
         get_test_cases(FAIL_DIR),
-        name_fn=lambda b: os.path.relpath(b, start=FAIL_DIR),
+        name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=FAIL_DIR))[0],
     )
     def test_fail(self, path):
-        __tracebackhide__ = True  # noqa: F841
+        __tracebackhide__ = True
 
         with open(path) as fin:
             lines = fin.readlines()
@@ -213,7 +213,9 @@ class TestTyping(TestCase):
 
             target_line = lines[lineno - 1]
             self.assertIn(
-                "# E:", target_line, f"Unexpected mypy output\n\n{errors[lineno]}"
+                "# E:",
+                target_line,
+                lambda msg: f"{msg}\nUnexpected mypy output\n\n{errors[lineno]}",
             )
             marker = target_line.split("# E:")[-1].strip()
             expected_error = errors.get(lineno)
@@ -222,10 +224,10 @@ class TestTyping(TestCase):
     @parametrize(
         "path",
         get_test_cases(REVEAL_DIR),
-        name_fn=lambda b: os.path.relpath(b, start=REVEAL_DIR),
+        name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=REVEAL_DIR))[0],
     )
     def test_reveal(self, path):
-        __tracebackhide__ = True  # noqa: F841
+        __tracebackhide__ = True
 
         with open(path) as fin:
             lines = _parse_reveals(fin)

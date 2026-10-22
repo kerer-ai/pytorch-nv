@@ -11,12 +11,12 @@ load("//tools/build_defs:fbsource_utils.bzl", "is_arvr_mode")
 load("//tools/build_defs:glob_defs.bzl", "subdir_glob")
 load("//tools/build_defs:platform_defs.bzl", "IOS", "MACOSX")
 load("//tools/build_defs:type_defs.bzl", "is_list", "is_string")
-load("//tools/build_defs/android:build_mode_defs.bzl", is_production_build_android = "is_production_build")
-load("//tools/build_defs/apple:build_mode_defs.bzl", is_production_build_ios = "is_production_build", is_profile_build_ios = "is_profile_build")
+load("//tools/build_defs/apple:build_mode_defs.bzl", "build_mode_select")
 load(
     ":build_variables.bzl",
     "aten_cpu_source_list",
     "aten_native_source_list",
+    "aten_native_xnnpack_source_list",
     "core_sources_common",
     "core_sources_full_mobile_no_backend_interface_xplat",
     "core_trainer_sources",
@@ -71,15 +71,19 @@ def read_bool(section, field, default, required = True):
     else:
         fail("`{}:{}`: no value set".format(section, field))
 
-def _is_build_mode_dev():
-    if is_production_build_android():
-        # Android Prod builds
-        return False
-    if is_production_build_ios() or is_profile_build_ios():
-        # iOS Prod builds
-        return False
+def _select_if_build_mode_dev(dev_value, default = []):
+    dev_select = select({
+        "DEFAULT": default,
+        "ovr_config//build_mode:optimization[dev]": dev_value,
+    })
+    return build_mode_select(
+        local = dev_select,
+        development = dev_select,
+        production = default,
+        profile = default,
+        release = dev_select,
+    )
 
-    return True
 
 def _get_enable_lightweight_dispatch():
     return read_bool("pt", "enable_lightweight_dispatch", False)
@@ -93,10 +97,27 @@ def get_enable_mobile_dispatch_keys_trimming():
 def get_disable_per_op_profiling():
     return read_bool("pt", "disable_per_op_profiling", True)
 
-def get_strip_error_messages():
+def strip_error_messages_select(value, default = []):
     if IS_OSS:
-        return True  # always strip in OSS CI to expose potential issues
-    return read_bool("pt", "strip_error_messages", not _is_build_mode_dev())
+        return value  # always strip in OSS CI to expose potential issues
+    strip_error = read_bool("pt", "strip_error_messages", default = None, required = False)
+
+    if strip_error == None:
+        opt_select = select({
+            "DEFAULT": default,
+            "ovr_config//build_mode:optimization[opt]": value,
+        })
+        return build_mode_select(
+            local = opt_select,
+            development = opt_select,
+            production = value,
+            profile = value,
+            release = opt_select,
+        )
+
+    if strip_error:
+        return value
+    return default
 
 def get_disable_warn():
     return read_bool("pt", "disable_warn", False)
@@ -164,6 +185,7 @@ THIRD_PARTY_LIBS = {
     "FP16": ["//xplat/third-party/FP16:FP16", "//third_party:FP16"],
     "FXdiv": ["//xplat/third-party/FXdiv:FXdiv", "//third_party:FXdiv"],
     "XNNPACK": ["//xplat/third-party/XNNPACK:XNNPACK", "//third_party:XNNPACK"],
+    "XNNPACK_interface": ["//xplat/third-party/XNNPACK:interface", "//third_party:interface"],
     "clog": ["//xplat/third-party/clog:clog", "//third_party:clog"],
     "cpuinfo": ["//third-party/cpuinfo:cpuinfo", "//third_party:cpuinfo"],
     "flatbuffers-api": ["//third-party/flatbuffers/fbsource_namespace:flatbuffers-api", "//third_party:flatbuffers-api"],
@@ -172,8 +194,8 @@ THIRD_PARTY_LIBS = {
     "glog": ["//third-party/glog:glog", "//third_party:glog"],
     "gmock": ["//third-party/googletest:gmock_main", "//third_party:gmock"],
     "gtest": ["//third-party/googletest:gtest_main", "//third_party:gtest"],
-    "kineto": ["//xplat/kineto/libkineto:libkineto", "//third_party:libkineto"],
-    "libkineto_headers": ["//xplat/kineto/libkineto:libkineto_headers", "//third_party:libkineto_headers"],
+    "kineto": ["//xplat/caffe2/torch/csrc/profiler/kineto/libkineto:libkineto", "//torch/csrc/profiler/kineto/libkineto:libkineto"],
+    "libkineto_headers": ["//xplat/caffe2/torch/csrc/profiler/kineto/libkineto:libkineto_headers", "//torch/csrc/profiler/kineto/libkineto:libkineto_headers"],
     "omp": ["//xplat/third-party/linker_lib:omp", "//third_party:no-op"],
     "pocketfft": ["//third-party/pocket_fft:pocketfft", "//third_party:pocketfft_header"],
     "psimd": ["//xplat/third-party/psimd:psimd", "//third_party:psimd"],
@@ -249,9 +271,7 @@ _COMMON_PREPROCESSOR_FLAGS = [
     "-DNO_EXPORT",
 ] + (
     ["-DC10_MOBILE_TRIM_DISPATCH_KEYS"] if get_enable_mobile_dispatch_keys_trimming() else []
-) + (
-    ["-DSTRIP_ERROR_MESSAGES"] if get_strip_error_messages() else []
-) + (
+) + strip_error_messages_select(["-DSTRIP_ERROR_MESSAGES"]) + (
     ["-DDISABLE_WARN"] if get_disable_warn() else []
 )
 
@@ -272,7 +292,6 @@ def get_aten_preprocessor_flags():
         "-DATEN_MKL_SEQUENTIAL_FBXPLAT=0",
         "-DUSE_PYTORCH_METAL",
         "-DUSE_PYTORCH_QNNPACK",
-        "-DUSE_XNNPACK",
         "-DPYTORCH_QNNPACK_RUNTIME_QUANTIZATION",
         "-DAT_PARALLEL_OPENMP_FBXPLAT=0",
         "-DAT_PARALLEL_NATIVE_FBXPLAT=1",
@@ -282,9 +301,9 @@ def get_aten_preprocessor_flags():
         "-DUSE_RUY_QMATMUL",
     ]
     if get_disable_per_op_profiling():
-        ATEN_PREPROCESSOR_FLAGS.append("-DPYTORCH_DISABLE_PER_OP_PROFILING")
+        ATEN_PREPROCESSOR_FLAGS += ["-DPYTORCH_DISABLE_PER_OP_PROFILING"]
     if _get_enable_record_kernel_dtype():
-        ATEN_PREPROCESSOR_FLAGS.append("-DENABLE_RECORD_KERNEL_FUNCTION_DTYPE")
+        ATEN_PREPROCESSOR_FLAGS += ["-DENABLE_RECORD_KERNEL_FUNCTION_DTYPE"]
     return ATEN_PREPROCESSOR_FLAGS
 
 def get_pt_preprocessor_flags():
@@ -295,8 +314,7 @@ def get_pt_preprocessor_flags():
         "-DNO_CUDNN_DESTROY_HANDLE",
     ]
 
-    if _is_build_mode_dev():
-        PT_PREPROCESSOR_FLAGS.append("-DENABLE_PYTORCH_NON_PRODUCTION_BUILDS")
+    PT_PREPROCESSOR_FLAGS += _select_if_build_mode_dev(["-DENABLE_PYTORCH_NON_PRODUCTION_BUILDS"])
     return PT_PREPROCESSOR_FLAGS
 
 # This needs to be kept in sync with https://github.com/pytorch/pytorch/blob/release/1.9/torchgen/gen.py#L892  @lint-ignore
@@ -399,7 +417,6 @@ def get_aten_generated_files(enabled_backends):
         "core/TensorBody.h",
         "core/TensorMethods.cpp",
         "core/aten_interned_strings.h",
-        "core/enum_tag.h",
         "torch/csrc/inductor/aoti_torch/generated/c_shim_cpu.cpp",
     ] + get_aten_derived_type_srcs(enabled_backends)
 
@@ -414,6 +431,14 @@ def get_aten_generated_files(enabled_backends):
         # build CUDA is not enabled and thus the ufunc codegen for CUDA gets
         # skipped
         src_files.extend(aten_ufunc_generated_cuda_sources())
+        # AOTInductor CUDA C-shim (aoti_torch_cuda_*), the CUDA counterpart of
+        # c_shim_cpu.cpp above. torchgen always emits this when --aoti_install_dir
+        # is set (aoti_backends hardcodes DispatchKey.CUDA in torchgen/gen.py), but
+        # it must be declared as a genrule output to be consumable. Required so
+        # AOTInductor .pt2 models can resolve the CUDA fallback-op shim at runtime.
+        src_files.append(
+            "torch/csrc/inductor/aoti_torch/generated/c_shim_cuda.cpp",
+        )
 
     res = {}
     for file_name in src_files:
@@ -672,6 +697,11 @@ def pt_operator_query_codegen(
         ":{}[autograd/generated/VariableType_2.cpp]".format(unboxing_and_autograd_genrule),
         ":{}[autograd/generated/VariableType_3.cpp]".format(unboxing_and_autograd_genrule),
         ":{}[autograd/generated/VariableType_4.cpp]".format(unboxing_and_autograd_genrule),
+        ":{}[autograd/generated/VariableType_5.cpp]".format(unboxing_and_autograd_genrule),
+        ":{}[autograd/generated/VariableType_6.cpp]".format(unboxing_and_autograd_genrule),
+        ":{}[autograd/generated/VariableType_7.cpp]".format(unboxing_and_autograd_genrule),
+        ":{}[autograd/generated/VariableType_8.cpp]".format(unboxing_and_autograd_genrule),
+        ":{}[autograd/generated/VariableType_9.cpp]".format(unboxing_and_autograd_genrule),
         ":{}[autograd/generated/ADInplaceOrViewType_0.cpp]".format(unboxing_and_autograd_genrule),
         ":{}[autograd/generated/ADInplaceOrViewType_1.cpp]".format(unboxing_and_autograd_genrule),
     ] if train else []) + ([
@@ -862,6 +892,8 @@ def get_pt_operator_registry_dict(
             ROOT + ":torch_mobile_core",
             ROOT + ":aten_cpu",
             ROOT + ":aten_metal_prepack_header",
+            ROOT + ":aten_xnnpack_interface",
+            third_party("XNNPACK"),
             third_party("glog"),
             C10,
         ] + ([ROOT + ":torch_mobile_train"] if train else []),
@@ -905,6 +937,7 @@ def define_buck_targets(
             ("aten/src", "ATen/ops/*.h"),
             # ATen Base
             ("aten/src", "ATen/*.h"),
+            ("aten/src", "ATen/accelerator/*.h"),
             ("aten/src", "ATen/cpu/**/*.h"),
             ("aten/src", "ATen/detail/*.h"),
             ("aten/src", "ATen/functorch/**/*.h"),
@@ -932,6 +965,11 @@ def define_buck_targets(
             ("aten/src", "ATen/native/mkl/*.h"),
             ("aten/src", "ATen/native/mkldnn/*.h"),
         ]),
+        # ATen/core/enum_tag.h is a forwarding header that includes from
+        # torch/headeronly, so we need to export that dependency.
+        exported_deps = [
+            "//xplat/caffe2/torch/headeronly:torch_headeronly",
+        ],
         visibility = ["PUBLIC"],
         labels = labels,
     )
@@ -955,31 +993,70 @@ def define_buck_targets(
         labels = labels,
     )
 
+    _torch_headers_exclude = [
+        # Don't need on mobile.
+        "torch/csrc/Exceptions.h",
+        "torch/csrc/python_headers.h",
+        "torch/csrc/jit/serialization/mobile_bytecode_generated.h",
+    ]
+
+    # On Windows/MSVC, the ("", "torch/csrc/**/*.h") glob creates duplicate
+    # header map entries for files under torch/csrc/api/include/ (e.g.
+    # torch/ordered_dict.h AND torch/csrc/api/include/torch/ordered_dict.h).
+    # MSVC's #pragma once uses the symlink path, not the target, so it sees
+    # these as separate files and produces C2953 redefinition errors.
+    # Fix: on Windows, exclude torch/csrc/api/include/ from the torch/csrc/**
+    # glob so each header has exactly one entry, and add include_directories
+    # so long-path includes (torch/csrc/api/include/torch/X.h) still resolve.
+    _torch_headers_common_globs = [
+        ("torch/csrc/api/include", "torch/**/*.h"),
+        ("", "torch/nativert/**/*.h"),
+        ("", "torch/headeronly/**/*.h"),
+        ("", "torch/script.h"),
+        ("", "torch/library.h"),
+        ("", "torch/custom_class.h"),
+        ("", "torch/custom_class_detail.h"),
+        # Add again due to namespace difference from aten_header.
+        ("", "aten/src/ATen/*.h"),
+        ("", "aten/src/ATen/functorch/**/*.h"),
+        ("", "aten/src/ATen/quantized/*.h"),
+    ]
+
+    _torch_headers_all = subdir_glob(
+        _torch_headers_common_globs + [
+            ("", "torch/csrc/**/*.h"),
+        ],
+        exclude = _torch_headers_exclude,
+    )
+
     fb_xplat_cxx_library(
         name = "torch_headers",
         header_namespace = "",
-        exported_headers = subdir_glob(
-            [
-                ("torch/csrc/api/include", "torch/**/*.h"),
-                ("", "torch/csrc/**/*.h"),
-                ("", "torch/nativert/**/*.h"),
-                ("", "torch/headeronly/**/*.h"),
-                ("", "torch/script.h"),
-                ("", "torch/library.h"),
-                ("", "torch/custom_class.h"),
-                ("", "torch/custom_class_detail.h"),
-                # Add again due to namespace difference from aten_header.
-                ("", "aten/src/ATen/*.h"),
-                ("", "aten/src/ATen/functorch/**/*.h"),
-                ("", "aten/src/ATen/quantized/*.h"),
-            ],
-            exclude = [
-                # Don't need on mobile.
-                "torch/csrc/Exceptions.h",
-                "torch/csrc/python_headers.h",
-                "torch/csrc/jit/serialization/mobile_bytecode_generated.h",
-            ],
-        ),
+        exported_headers = select({
+            "DEFAULT": _torch_headers_all,
+            # On Windows, use raw_headers instead of exported_headers to
+            # avoid duplicate header map entries that break MSVC #pragma once.
+            "ovr_config//os:windows": {},
+        }),
+        raw_headers = select({
+            "DEFAULT": [],
+            "ovr_config//os:windows": glob([
+                "torch/csrc/**/*.h",
+                "torch/nativert/**/*.h",
+                "torch/headeronly/**/*.h",
+                "torch/script.h",
+                "torch/library.h",
+                "torch/custom_class.h",
+                "torch/custom_class_detail.h",
+                "aten/src/ATen/*.h",
+                "aten/src/ATen/functorch/**/*.h",
+                "aten/src/ATen/quantized/*.h",
+            ], exclude = _torch_headers_exclude),
+        }),
+        public_include_directories = select({
+            "DEFAULT": [],
+            "ovr_config//os:windows": ["torch/csrc/api/include", "."],
+        }),
         labels = labels,
         visibility = ["PUBLIC"],
         deps = [
@@ -1116,7 +1193,7 @@ def define_buck_targets(
         ],
     )
 
-    # TODO: Enable support for KleidiAI bazel build
+    # TODO: Enable support for KleidiAI
     # @lint-ignore BUCKLINT
     fb_native.genrule(
         name = "generate_aten_config",
@@ -1219,7 +1296,6 @@ def define_buck_targets(
             "ViewMetaClasses.h": ":gen_aten[ViewMetaClasses.h]",
             "core/TensorBody.h": ":gen_aten[core/TensorBody.h]",
             "core/aten_interned_strings.h": ":gen_aten[core/aten_interned_strings.h]",
-            "core/enum_tag.h": ":gen_aten[core/enum_tag.h]",
         }),
         labels = labels,
     )
@@ -1485,6 +1561,25 @@ def define_buck_targets(
         ],
     )
 
+    # Standalone target for the C++ API enum tag definitions
+    # (torch/csrc/api/src/enum.cpp). Lets consumers link only the enum
+    # globals without pulling in the full torch C++ API.
+    # @lint-ignore BUCKLINT link_whole
+    pt_xplat_cxx_library(
+        name = "torch_enum",
+        srcs = ["torch/csrc/api/src/enum.cpp"],
+        compiler_flags = get_pt_compiler_flags(),
+        exported_preprocessor_flags = get_pt_preprocessor_flags(),
+        link_whole = True,
+        linker_flags = get_no_as_needed_linker_flag(),
+        visibility = ["PUBLIC"],
+        exported_deps = [
+            ":aten_cpu",
+            ":torch_headers",
+            C10,
+        ],
+    )
+
     pt_xplat_cxx_library(
         name = "torch_core",
         srcs = core_sources_full_mobile_no_backend_interface_xplat,
@@ -1497,6 +1592,7 @@ def define_buck_targets(
         ],
         deps = [
             ":aten_cpu",
+            ":aten_xnnpack_interface",
             ":backend_interface_lib",
             ":generated-autograd-headers",
             ":torch_headers",
@@ -1519,7 +1615,12 @@ def define_buck_targets(
         srcs = [
             "torch/csrc/api/src/data/samplers/random.cpp",
             "torch/csrc/api/src/data/samplers/sequential.cpp",
+            "torch/csrc/api/src/optim/adagrad.cpp",
+            "torch/csrc/api/src/optim/adam.cpp",
+            "torch/csrc/api/src/optim/adamw.cpp",
+            "torch/csrc/api/src/optim/lbfgs.cpp",
             "torch/csrc/api/src/optim/optimizer.cpp",
+            "torch/csrc/api/src/optim/rmsprop.cpp",
             "torch/csrc/api/src/optim/serialize.cpp",
             "torch/csrc/api/src/optim/sgd.cpp",
             "torch/csrc/api/src/serialize/input-archive.cpp",
@@ -1988,8 +2089,30 @@ def define_buck_targets(
         ],
     )
 
+    # Public ATen headers expose XNNPACK-backed class layouts when USE_XNNPACK
+    # is enabled. Keep that compile-time ABI coupled to headers, not the
+    # implementation archive.
+    fb_xplat_cxx_library(
+        name = "aten_xnnpack_interface",
+        exported_preprocessor_flags = [
+            "-DUSE_XNNPACK",
+        ] + ([] if IS_OSS else [
+            "-DXNNPACK_NO_CODE_CACHE",
+        ]),
+        visibility = ["PUBLIC"],
+        exported_deps = [
+            third_party("XNNPACK_interface"),
+        ],
+        labels = labels,
+    )
+
     # aten_cpu and aten_native_cpu
-    for name, srcs in [
+    #
+    # extra_deps carries the XNNPACK dep, which only aten_native_cpu needs: some of
+    # its quantized kernels call the xnn_* API directly. aten_cpu touches no XNNPACK
+    # API at all, so it does not name an XNNPACK implementation and consumers of it
+    # (notably torch_mobile_core) are free to choose one.
+    for name, srcs, extra_deps, extra_exported_deps, target_visibility in [
         ("aten_cpu", jit_core_sources + aten_cpu_source_list + [
             # Generated
             ":gen_aten[Functions.cpp]",
@@ -2002,8 +2125,12 @@ def define_buck_targets(
             ":gen_aten[core/TensorMethods.cpp]",
             # Needed by ATen/native/EmbeddingBag.cpp
             "caffe2/perfkernels/embedding_lookup_idx.cc",
-        ]),
-        ("aten_native_cpu", aten_native_source_list),
+        ], [], [], ["PUBLIC"]),
+        ("aten_native_cpu", aten_native_source_list, [
+            ":aten_native_xnnpack",
+            ":aten_xnnpack_interface",
+            third_party("XNNPACK"),
+        ], [":aten_xnnpack_interface"], []),
     ]:
         fb_xplat_cxx_library(
             name = name,
@@ -2011,12 +2138,11 @@ def define_buck_targets(
             header_namespace = "",
             # @lint-ignore BUCKLINT
             link_whole = True,
-            visibility = ["PUBLIC"],
-            deps = [
+            visibility = target_visibility,
+            deps = extra_deps + [
                 third_party("omp"),
                 third_party("cpuinfo"),
                 third_party("glog"),
-                third_party("XNNPACK"),
                 third_party("pocketfft"),
             ] + select({
                 "DEFAULT": [],
@@ -2043,7 +2169,7 @@ def define_buck_targets(
                 "ovr_config//os:android": c2_fbandroid_xplat_compiler_flags,
             }),
             exported_preprocessor_flags = get_aten_preprocessor_flags(),
-            exported_deps = [
+            exported_deps = extra_exported_deps + [
                 ":aten_header",
                 ":caffe2_headers",
                 ":common_core",
@@ -2059,6 +2185,63 @@ def define_buck_targets(
             labels = labels,
             **aten_default_args
         )
+
+    # The ATen operators implemented directly on top of the XNNPACK API. Split out
+    # of aten_native_cpu so that the XNNPACK dep sits at a level each consumer picks
+    # for itself, letting full PyTorch and PyTorch mobile diverge later. Both use
+    # third_party("XNNPACK") today, so this is a no-op for now.
+    fb_xplat_cxx_library(
+        name = "aten_native_xnnpack",
+        srcs = aten_native_xnnpack_source_list,
+        header_namespace = "",
+        # Operator registrations live in static initializers, so nothing may be
+        # dropped at link time.
+        # @lint-ignore BUCKLINT
+        link_whole = True,
+        # Selective registries compile these sources themselves with per-app
+        # registration flags. Restrict this archive so both owners cannot enter
+        # the same link and register the same classes twice.
+        visibility = [ROOT + ":aten_native_cpu"],
+        deps = [
+            ":aten_xnnpack_interface",
+            third_party("XNNPACK"),
+        ],
+        compiler_flags = get_aten_compiler_flags() + select({
+            "DEFAULT": [],
+            "ovr_config//os:android-arm32": [
+                "-mfpu=vfpv3-d16",
+                "-march=armv7-a",
+                "-mthumb",
+                "-mfpu=neon",
+            ],
+            "ovr_config//os:android-x86_32": [
+                "-mssse3",
+            ],
+            "ovr_config//os:android-x86_64": [
+                "-mssse3",
+            ],
+        }) + select({
+            "DEFAULT": [],
+            "ovr_config//os:android": c2_fbandroid_xplat_compiler_flags,
+        }),
+        exported_preprocessor_flags = get_aten_preprocessor_flags(),
+        exported_deps = [
+            ":aten_cpu",
+            ":aten_header",
+            ":caffe2_headers",
+            ":common_core",
+            ":generated_aten_config_header",
+            ":generated_aten_headers_cpu",
+            ":jit_core_headers",
+            ":pthreadpool",
+            third_party("fmt"),
+            third_party("ruy"),
+            C10,
+            ROOT_PATH + "aten/src/ATen/native/quantized/cpu/qnnpack:pytorch_qnnpack",
+        ],
+        labels = labels,
+        **aten_default_args
+    )
 
     fb_xplat_cxx_library(
         name = "lean_runtime_with_flatbuffer",

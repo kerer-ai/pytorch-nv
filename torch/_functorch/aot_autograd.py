@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import itertools
 import time
 from contextlib import nullcontext
 from functools import wraps
-from typing import Any, TYPE_CHECKING
+from typing import Any, cast, Literal, TYPE_CHECKING
 from typing_extensions import ParamSpec, TypeVar
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from torch import Tensor
 from torch._decomp.decompositions_for_rng import PhiloxStateTracker, rng_decompositions
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo import compiled_autograd
+from torch._dynamo.graph_bytecode_inputs import install_active_registry
 from torch._dynamo.utils import (
     CompileEventLogger,
     dynamo_timed,
@@ -25,23 +27,22 @@ from torch._dynamo.utils import (
     set_feature_use,
 )
 from torch._guards import detect_fake_mode
-from torch._inductor.utils import BoxedBool
-from torch._subclasses import FakeTensor, FakeTensorMode
+from torch._inductor.codecache import resolve_pre_grad_pass_timing
+
+# Runtime annotation consumers still resolve BoxedBool from module globals.
+from torch._subclasses import FakeTensorMode
+from torch._subclasses.fake_tensor import maybe_get_fake_mode
 from torch.export._tree_utils import reorder_kwargs
 from torch.fx.experimental.proxy_tensor import make_fx
 
-
-static_inputs_log = torch._logging.getArtifactLogger(
-    __name__, "cudagraph_static_inputs"
-)
 from . import config
-from ._aot_autograd.autograd_cache import (  # noqa: F401
+from ._aot_autograd import autograd_cache
+from ._aot_autograd.autograd_cache import (
     AOTAutogradCache,
-    autograd_cache_key,
     should_use_local_autograd_cache,
     should_use_remote_autograd_cache,
 )
-from ._aot_autograd.collect_metadata_analysis import (  # noqa: F401
+from ._aot_autograd.collect_metadata_analysis import (
     run_functionalized_fw_and_collect_metadata,
 )
 from ._aot_autograd.descriptors import (
@@ -79,7 +80,7 @@ from ._aot_autograd.graph_capture_wrappers import (  # noqa: F401
     fn_input_mutations_to_outputs,
     fn_prepped_for_autograd,
 )
-from ._aot_autograd.graph_compile import (  # noqa: F401
+from ._aot_autograd.graph_compile import (
     aot_stage1_graph_capture,
     aot_stage2_compile,
     aot_stage2_export,
@@ -110,6 +111,7 @@ from ._aot_autograd.runtime_wrappers import (  # noqa: F401
     SerializableCompiledFunction,
 )
 from ._aot_autograd.schemas import (  # noqa: F401
+    ActInputPath,
     AOTConfig,
     AOTDispatchCompiler,
     AOTGraphCapture,
@@ -139,9 +141,12 @@ from ._aot_autograd.subclass_utils import (  # noqa: F401
     wrap_tensor_subclasses,
     wrap_tensor_subclasses_maybe_joint,
 )
+from ._aot_autograd.to_standalone_python import (  # noqa: F401
+    compile_to_python,
+    load_from_python,
+)
 from ._aot_autograd.utils import (  # noqa: F401
     _get_autocast_states,
-    _get_symint_hints,
     call_func_at_runtime_with_args,
     create_tree_flattened_fn,
     KNOWN_TYPES,
@@ -159,12 +164,12 @@ from .partitioners import default_partition
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from torch._inductor.cudagraph_utils import BoxedDeviceIndex
+    from torch._inductor.compile_fx import CompilerConfigExtra
     from torch._inductor.output_code import OutputCode
     from torch._inductor.utils import InputType
-    from torch._ops import OpOverload
+    from torch._ops import OperatorBase, OpOverload
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 _P = ParamSpec("_P")
@@ -184,6 +189,7 @@ zip = strict_zip
 # one counter is allocated per entire compiled block (but this block
 # may involve compiling multiple subgraphs; e.g., for forwards/backwards)
 AOT_COUNTER = itertools.count()
+
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -424,7 +430,7 @@ AOT_COUNTER = itertools.count()
 
 # Note [Side-Effectful Tokens in AOTAutograd]
 #
-# We allow some some side-effectful operators in
+# We allow some side-effectful operators in
 # the post-AOTAutograd (functional) graph, such as prints and torchbind operations.
 # To ensure that these side-effects are compatible to future graph passes that
 # assume that the graph is functional, we will thread "effect tokens" to show
@@ -449,7 +455,7 @@ AOT_COUNTER = itertools.count()
 # However, Inductor does not want the concept of tokens in the final generated
 # code's input and output. Since changing the graph signature inside of inductor
 # is difficult, after generating the forward graph, we will run a pass to
-# remove the tokens from the inputgenerate the following graph for Inductor, where
+# remove the tokens from the input and generate the following graph for Inductor, where
 # the tokens are created and sunk within the graph, rather than as inputs and
 # outputs:
 #
@@ -508,20 +514,23 @@ def create_aot_state(
     # TODO: Chillee argues that dynamo itself should pass in fake tensors to
     # the list of arguments when compiling; at the moment we do not do this
 
-    if aot_config.decompositions is None:
-        aot_config.decompositions = {}
-
-    aot_config.decompositions = {
+    decompositions = aot_config.decompositions or {}
+    decompositions = {
         **aot_autograd_decompositions,
-        **aot_config.decompositions,
+        **decompositions,
     }
 
     if config.functionalize_rng_ops:
         # Update the decompositions with functionalized random decompositions
-        aot_config.decompositions = {  # type: ignore[assignment]
+        decompositions = {
             **rng_decompositions,
-            **aot_config.decompositions,
+            **decompositions,
         }
+
+    aot_config = dataclasses.replace(
+        aot_config,
+        decompositions=cast("dict[OpOverload, Callable[..., Any]]", decompositions),
+    )
 
     # Check flat_args to see if they're already fake.  If so, use that fake
     # mode instead.
@@ -529,6 +538,10 @@ def create_aot_state(
     python_dispatcher_mode = (
         enable_python_dispatcher() if shape_env is not None else nullcontext()
     )
+
+    # Tracing runs the graph's get_external_object_by_index calls, and the
+    # backend may have run other compiled functions since Dynamo traced it.
+    install_active_registry()
 
     # See NOTE: [Deferring tensor pack/unpack hooks until runtime]
     # If any saved tensor hooks are active, we **don't** want to trace them.
@@ -544,7 +557,7 @@ def create_aot_state(
     )
 
     from torch._library.fake_class_registry import FakeScriptObject, maybe_to_fake_obj
-    from torch._library.opaque_object import is_opaque_type
+    from torch._library.opaque_object import is_custom_class
 
     # Tracing may mutate the states the fake script object,
     # so we need to duplicate the fake script objects so that subsequent tracing
@@ -552,7 +565,7 @@ def create_aot_state(
     def _dup_fake_script_obj(fake_flat_args: FakifiedFlatArgs) -> list[Any]:
         return [
             maybe_to_fake_obj(detect_fake_mode(fake_flat_args), arg.real_obj)
-            if isinstance(arg, FakeScriptObject) or is_opaque_type(type(arg))
+            if isinstance(arg, FakeScriptObject) or is_custom_class(type(arg))
             else arg
             for arg in fake_flat_args
         ]
@@ -580,13 +593,16 @@ def create_aot_state(
                     "aot_collect_metadata", log_pt2_compile_event=True
                 )
 
-            with dynamo_timed_ctx, ctx:
+            with (
+                dynamo_timed_ctx,
+                ctx,
+                torch._dynamo.eval_frame._use_eager_on_nested_compile(),
+            ):
                 fw_metadata = run_functionalized_fw_and_collect_metadata(
                     flat_fn,
                     flat_args_descs=flat_args_descs,
                     static_input_indices=aot_config.static_input_indices,
                     keep_input_mutations=aot_config.keep_inference_input_mutations,
-                    is_train=needs_autograd,
                     pre_dispatch=aot_config.pre_dispatch,
                 )(*_dup_fake_script_obj(fake_flat_args))
 
@@ -622,35 +638,6 @@ def create_aot_state(
                 # and none of the inputs that require grad are mutated.
                 # so we actually have an inference graph.
                 needs_autograd = False
-                # A bit silly: right now in the subclass codepath, our ViewAndMutationMeta
-                # changes depending on whether we pass in is_train / keep_input_mutations,
-                # so we're forced to recompute the metadata.
-                # TODO: refactor the subclass path of run_functionalized_fw_and_collect_metadata
-                # so that this is unnecessary.
-                if req_subclass_dispatch:
-                    fw_metadata = run_functionalized_fw_and_collect_metadata(
-                        flat_fn,
-                        flat_args_descs=flat_args_descs,
-                        keep_input_mutations=aot_config.keep_inference_input_mutations,
-                        is_train=False,
-                        pre_dispatch=aot_config.pre_dispatch,
-                        static_input_indices=aot_config.static_input_indices,
-                    )(*fake_flat_args)
-                else:
-                    fw_metadata = ViewAndMutationMeta(
-                        input_info=fw_metadata.input_info,
-                        output_info=fw_metadata.output_info,
-                        num_intermediate_bases=fw_metadata.num_intermediate_bases,
-                        keep_input_mutations=aot_config.keep_inference_input_mutations,
-                        traced_tangents=fw_metadata.traced_tangents,
-                        traced_tangents_descs=fw_metadata.traced_tangents_descs,
-                        subclass_inp_meta=fw_metadata.subclass_inp_meta,
-                        subclass_fw_graph_out_meta=fw_metadata.subclass_fw_graph_out_meta,
-                        subclass_tangent_meta=fw_metadata.subclass_tangent_meta,
-                        is_train=False,
-                        tokens=fw_metadata.tokens,
-                        static_input_indices=fw_metadata.static_input_indices,
-                    )
 
     if fw_metadata.num_intermediate_bases > 0:
         if req_subclass_dispatch:
@@ -824,7 +811,8 @@ def aot_function(
         if cached_res is None:
             flat_fn, out_spec = create_tree_flattened_fn(fn, args, kwargs)
             (fake_mode, shape_env) = construct_fake_mode(flat_args, aot_config)
-            fake_flat_args: FakifiedFlatArgs = process_inputs(
+            fake_flat_args: FakifiedFlatArgs
+            fake_flat_args, act_input_paths = process_inputs(
                 flat_args, aot_config, fake_mode, shape_env
             )
             # TODO: We actually could use the pytree path to make better descs.
@@ -842,6 +830,7 @@ def aot_function(
                     fake_mode,
                     shape_env,
                 )
+                aot_state.fw_metadata.act_input_paths = act_input_paths
                 aot_graph_capture = aot_stage1_graph_capture(aot_state, flat_fn)
                 compiled_fn, _ = aot_stage2_compile(
                     aot_state,
@@ -921,39 +910,60 @@ def aot_module(mod: nn.Module, *args: Any, **kwargs: Any) -> nn.Module:
     return AOTModule()
 
 
-def prepare_aot_module_simplified(
+def autograd_cache_key(
+    graph,
+    example_inputs,
+    ignore_shape_env: bool,
+    decompositions,
+    compiler_config_extra: CompilerConfigExtra,
+    keep_inference_input_mutations: bool = False,
+    disable_functionalization: bool = False,
+):
+    (
+        _params_buffers_flat,
+        _params_spec,
+        _buffers_spec,
+        full_args,
+        _full_args_descs,
+        aot_config,
+    ) = prepare_aot_config(
+        graph,
+        example_inputs,
+        decompositions,
+        keep_inference_input_mutations,
+        ignore_shape_env,
+        force_non_lazy_backward_lowering=config.force_non_lazy_backward_lowering,
+        disable_functionalization=disable_functionalization,
+    )
+
+    fake_mode, shape_env = construct_fake_mode(full_args, aot_config)
+    fake_flat_args, act_input_paths = process_inputs(
+        full_args, aot_config, fake_mode, shape_env, ignore_shape_env
+    )
+
+    return autograd_cache.autograd_cache_key(
+        graph, fake_flat_args, aot_config, compiler_config_extra, act_input_paths
+    )
+
+
+def prepare_aot_config(
     mod: nn.Module,
     args: Iterable[Any],
-    kwargs: dict[str, Any] | None,
     decompositions: dict[OpOverload, Callable[..., Any]] | None,
     keep_inference_input_mutations: bool,
-    boxed_forward_device_index: BoxedDeviceIndex | None,
     ignore_shape_env: bool,
-    flatten: bool,
     *,
     force_non_lazy_backward_lowering: bool = False,
     disable_functionalization: bool = False,
-    _record_nn_module_stack: bool = False,
     _disable_torch_fn_metadata_mode: bool = False,
 ) -> tuple[
-    Any,
     list[torch.nn.Parameter | Tensor],
     list[str],
     list[str],
-    FakifiedFlatArgs,
+    list[Any],
     list[Any],
     AOTConfig,
-    FakeTensorMode,
-    ShapeEnv | None,
-    pytree.TreeSpec | None,
-    PytreeThunk | None,
 ]:
-    if not flatten:
-        if kwargs is not None:
-            raise AssertionError("kwargs must be None when flatten=False")
-    elif kwargs is None:
-        kwargs = {}
-
     # TODO: There's something a bit suspicious here; typically simplified
     # module shouldn't actually have any parameters...
     params = dict(mod.named_parameters(remove_duplicate=False))
@@ -967,41 +977,14 @@ def prepare_aot_module_simplified(
 
     params_buffers = {**params, **buffers}
     params_buffers_flat = params_flat + buffers_flat
-    params_buffers_spec = params_spec + buffers_spec
-
-    # Take a break to figure what we're doing with the module
-
-    # NB: This doesn't change the in/out convention, except adding the
-    # parameters as explicit arguments
-    functional_call = create_functional_call(
-        mod,
-        params_buffers_spec,
-        params_len + buffers_len,
-        strict_out_tuple=not flatten,
-        # We need this for export to run ModuleStackTracer
-        # instead of PythonKeyTracer
-        store_orig_mod=_record_nn_module_stack,
-    )
 
     full_args = [*params_flat, *buffers_flat, *args]
-    in_spec, out_spec = None, None
-    if flatten:
-        functional_call, out_spec = create_tree_flattened_fn(
-            functional_call, full_args, kwargs
-        )
-        full_args, in_spec = pytree.tree_flatten((full_args, kwargs))
-
-    del kwargs
 
     # OK, set up the descs
 
     full_args_descs: list[DifferentiableAOTInput] = []
     full_args_descs.extend(ParamAOTInput(fqn) for fqn in params_spec)
     full_args_descs.extend(BufferAOTInput(fqn) for fqn in buffers_spec)
-    # TODO: it would be better to put pytree information in here
-    full_args_descs.extend(
-        PlainAOTInput(i) for i in range(len(full_args) - len(full_args_descs))
-    )
 
     # TODO: These tracing_context fields should become unnecessary once we
     # always maintain sources on all arguments
@@ -1024,8 +1007,9 @@ def prepare_aot_module_simplified(
 
     dynamic_shapes = False
     for x in full_args:
-        if isinstance(x, FakeTensor):
-            dynamic_shapes = x.fake_mode.shape_env is not None
+        fake_mode = maybe_get_fake_mode(x)
+        if fake_mode is not None:
+            dynamic_shapes = fake_mode.shape_env is not None
             break
 
     aot_config = AOTConfig(
@@ -1050,9 +1034,97 @@ def prepare_aot_module_simplified(
         disable_functionalization=disable_functionalization,
         _disable_torch_fn_metadata_mode=_disable_torch_fn_metadata_mode,
     )
+
+    return (
+        params_buffers_flat,
+        params_spec,
+        buffers_spec,
+        full_args,
+        full_args_descs,
+        aot_config,
+    )
+
+
+def prepare_aot_module_simplified(
+    mod: nn.Module,
+    args: Iterable[Any],
+    kwargs: dict[str, Any] | None,
+    decompositions: dict[OpOverload, Callable[..., Any]] | None,
+    keep_inference_input_mutations: bool,
+    ignore_shape_env: bool,
+    flatten: bool,
+    *,
+    force_non_lazy_backward_lowering: bool = False,
+    disable_functionalization: bool = False,
+    _record_nn_module_stack: bool = False,
+    _disable_torch_fn_metadata_mode: bool = False,
+) -> tuple[
+    Any,
+    list[torch.nn.Parameter | Tensor],
+    list[str],
+    list[str],
+    FakifiedFlatArgs,
+    list[Any],
+    AOTConfig,
+    FakeTensorMode,
+    ShapeEnv | None,
+    pytree.TreeSpec | None,
+    PytreeThunk | None,
+    list[ActInputPath],
+]:
+    if not flatten:
+        if kwargs is not None:
+            raise AssertionError("kwargs must be None when flatten=False")
+    elif kwargs is None:
+        kwargs = {}
+
+    (
+        params_buffers_flat,
+        params_spec,
+        buffers_spec,
+        full_args,
+        full_args_descs,
+        aot_config,
+    ) = prepare_aot_config(
+        mod,
+        args,
+        decompositions,
+        keep_inference_input_mutations,
+        ignore_shape_env,
+        force_non_lazy_backward_lowering=force_non_lazy_backward_lowering,
+        disable_functionalization=disable_functionalization,
+        _disable_torch_fn_metadata_mode=_disable_torch_fn_metadata_mode,
+    )
+
+    params_buffers_spec = params_spec + buffers_spec
+
+    # NB: This doesn't change the in/out convention, except adding the
+    # parameters as explicit arguments
+    functional_call = create_functional_call(
+        mod,
+        params_buffers_spec,
+        aot_config.num_params_buffers,
+        strict_out_tuple=not flatten,
+        # We need this for export to run ModuleStackTracer
+        # instead of PythonKeyTracer
+        store_orig_mod=_record_nn_module_stack,
+    )
+
+    in_spec, out_spec = None, None
+    if flatten:
+        functional_call, out_spec = create_tree_flattened_fn(
+            functional_call, full_args, kwargs
+        )
+        full_args, in_spec = pytree.tree_flatten((full_args, kwargs))
+
+    # TODO: it would be better to put pytree information in here
+    full_args_descs.extend(
+        PlainAOTInput(i) for i in range(len(full_args) - len(full_args_descs))
+    )
+
     fake_mode, shape_env = construct_fake_mode(full_args, aot_config)
     # NB: full_args_descs not needed here, fake_flat_args is 1:1 with full_args
-    fake_flat_args = process_inputs(
+    fake_flat_args, act_input_paths = process_inputs(
         full_args, aot_config, fake_mode, shape_env, ignore_shape_env
     )
 
@@ -1068,12 +1140,13 @@ def prepare_aot_module_simplified(
         shape_env,
         in_spec,
         out_spec,
+        act_input_paths,
     )
 
 
 def aot_module_simplified(
     mod: torch.fx.GraphModule | torch._dynamo.utils.GmWrapper,
-    args: Iterable[Any],
+    args: Sequence[Any],
     fw_compiler: AOTDispatchCompiler,
     bw_compiler: AOTDispatchCompiler | None = None,
     partition_fn: Callable[..., Any] = default_partition,
@@ -1082,8 +1155,7 @@ def aot_module_simplified(
     inference_compiler: AOTDispatchCompiler | None = None,
     # TODO: This doesn't seem to be used in any nontrivial way, check if it's
     # actually needed
-    cudagraphs: BoxedBool | None = None,
-    boxed_forward_device_index: BoxedDeviceIndex | None = None,
+    compiler_config_extra: CompilerConfigExtra | None = None,
     ignore_shape_env: bool = False,
     disable_functionalization: bool = False,
     # Optional callback to run passes on the module at the start of AOT autograd.
@@ -1091,6 +1163,7 @@ def aot_module_simplified(
         [torch.fx.GraphModule, Sequence[InputType]], torch.fx.GraphModule
     ]
     | None = None,
+    compile_region_name: str | None = None,
 ) -> Callable[..., Any]:
     """
     This is the simplified or low overhead version of aot_module. For frontends
@@ -1103,8 +1176,14 @@ def aot_module_simplified(
     :func:`aot_module_simplified` removes these overheads.
     """
 
-    if cudagraphs is None:
-        cudagraphs = BoxedBool(torch._inductor.config.triton.cudagraphs)
+    pre_grad_pass_timing: Literal["early", "late"] = resolve_pre_grad_pass_timing()
+
+    if (
+        pre_grad_pass_timing == "early"
+        and pre_grad_passes
+        and isinstance(mod, torch.fx.GraphModule)
+    ):
+        mod = pre_grad_passes(mod, args)
 
     with contextlib.ExitStack() as stack:
         (
@@ -1119,13 +1198,13 @@ def aot_module_simplified(
             shape_env,
             _in_spec,
             _out_spec,
+            act_input_paths,
         ) = prepare_aot_module_simplified(
             mod,
             args,
             None,
             decompositions,
             keep_inference_input_mutations,
-            boxed_forward_device_index,
             ignore_shape_env,
             flatten=False,
             force_non_lazy_backward_lowering=config.force_non_lazy_backward_lowering,
@@ -1142,20 +1221,24 @@ def aot_module_simplified(
             remote = should_use_remote_autograd_cache()
             if local or remote:
                 set_feature_use("aot_autograd_remote_cache", remote)
-                compiled_fn = AOTAutogradCache.try_load(
+                compiled_fn, aot_config = AOTAutogradCache.try_load(
                     mod,
                     fake_flat_args,
                     aot_config,
-                    cudagraphs,
-                    boxed_forward_device_index,
+                    compiler_config_extra,
                     local,
                     remote,
+                    act_input_paths,
+                    compile_region_name=compile_region_name,
                 )
 
         if compiled_fn is None:
-            # Run pre-grad passes after cache lookup to cache pre-grad transforms.
-            if pre_grad_passes is not None and isinstance(mod, torch.fx.GraphModule):
-                mod = pre_grad_passes(mod, fake_flat_args)
+            if (
+                pre_grad_pass_timing == "late"
+                and pre_grad_passes
+                and isinstance(mod, torch.fx.GraphModule)
+            ):
+                mod = pre_grad_passes(mod, args)
 
             stack.enter_context(compiled_autograd._disable())
             aot_state = create_aot_state(
@@ -1167,6 +1250,7 @@ def aot_module_simplified(
                 fake_mode,
                 shape_env,
             )
+            aot_state.fw_metadata.act_input_paths = act_input_paths
             aot_graph_capture = aot_stage1_graph_capture(aot_state, functional_call)
             compiled_fn, _ = aot_stage2_compile(
                 aot_state,
@@ -1178,6 +1262,12 @@ def aot_module_simplified(
             )
     if compiled_fn is None:
         raise AssertionError("compiled_fn must not be None")
+    # Skip SerializableCompiledFunction's pass-through __call__ on the hot path.
+    runtime_fn = (
+        compiled_fn.compiled_fn
+        if isinstance(compiled_fn, SerializableCompiledFunction)
+        else compiled_fn
+    )
     if isinstance(mod, torch._dynamo.utils.GmWrapper):
         # This function is called by the flatten_graph_inputs wrapper, which boxes
         # the inputs so that they can be freed before the end of this scope.
@@ -1185,13 +1275,9 @@ def aot_module_simplified(
         # https://github.com/pytorch/pytorch/pull/122535/files#r1560096481
         @simple_wraps(compiled_fn)
         def forward(runtime_args: list[Any]) -> Any:
-            flat_args = []
-            flat_args.extend(params_buffers_flat)
-            flat_args.extend(runtime_args)
+            flat_args = [*params_buffers_flat, *runtime_args]
             runtime_args.clear()
-            if compiled_fn is None:
-                raise AssertionError("compiled_fn must not be None")
-            return compiled_fn(flat_args)
+            return runtime_fn(flat_args)
 
     else:
         # TODO: There is something deeply wrong here; compiled_fn running with
@@ -1201,13 +1287,7 @@ def aot_module_simplified(
         # NB: GraphModule/nn.Module rely on the non-boxed calling convention here
         @simple_wraps(compiled_fn)
         def forward(*runtime_args: tuple[Any]) -> Any:
-            full_args = []
-            full_args.extend(params_buffers_flat)
-            # pyrefly: ignore[bad-argument-type]
-            full_args.extend(runtime_args)
-            if compiled_fn is None:
-                raise AssertionError("compiled_fn must not be None")
-            return compiled_fn(full_args)
+            return runtime_fn([*params_buffers_flat, *runtime_args])
 
     # Just for convenience
     forward.zero_grad = mod.zero_grad  # type: ignore[attr-defined]
@@ -1230,7 +1310,7 @@ def aot_module_simplified(
 def boxed_nop_preserve_node_meta(
     gm: torch.fx.GraphModule, example_inputs: Sequence[InputType]
 ) -> Any:
-    def run(args: Sequence[Any]) -> OutputCode:
+    def run(args: list[Any]) -> OutputCode:
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(gm).boxed_run(args)
 
@@ -1323,6 +1403,7 @@ def aot_export_joint_with_descriptors(
         shape_env,
         in_spec,
         out_spec,
+        act_input_paths,
     ) = prepare_aot_module_simplified(
         mod,
         args,
@@ -1330,7 +1411,6 @@ def aot_export_joint_with_descriptors(
         # In contrast, decompositions are needed at this stage.
         decompositions,
         keep_inference_input_mutations,
-        None,
         ignore_shape_env,
         flatten=True,
         # Without this, we will attempt to "compile" the backward lazily
@@ -1357,6 +1437,7 @@ def aot_export_joint_with_descriptors(
         fake_mode,
         shape_env,
     )
+    aot_state.fw_metadata.act_input_paths = act_input_paths
 
     # NB: no cache lookup!
     aot_graph_capture = aot_stage1_graph_capture(aot_state, functional_call)
@@ -1410,10 +1491,13 @@ def aot_compile_joint_with_descriptors(
 
     cache_ctx = nullcontext()
     if serializable:
-        jd._aot_state.aot_config.cache_info = AOTAutogradCacheInfo(
-            jd.cache_hash(),
-            time.time_ns(),
-            forward_symints=[],
+        jd._aot_state.aot_config = dataclasses.replace(
+            jd._aot_state.aot_config,
+            cache_info=AOTAutogradCacheInfo(
+                jd.cache_hash(),
+                time.time_ns(),
+                forward_symints=[],
+            ),
         )
         cache_ctx = torch._functorch.config.patch(
             {
@@ -1462,6 +1546,32 @@ def aot_compile_joint_with_descriptors(
         return pytree.tree_unflatten(flat_outputs, jd.out_spec)
 
     return unflattened_compiled_fn
+
+
+@contextlib.contextmanager
+def _aot_export_decomposition_context(
+    decompositions: dict[OpOverload, Callable[..., Any]] | None,
+) -> Iterator[dict[OpOverload, Callable[..., Any]] | None]:
+    if decompositions is None:
+        yield decompositions
+        return
+
+    from torch.export.decomp_utils import CustomDecompTable
+    from torch.export.exported_program import (
+        _override_composite_implicit_decomp,
+        _split_decomp_table_to_cia_and_python_decomp,
+    )
+
+    decomp_table = (
+        decompositions.materialize()
+        if isinstance(decompositions, CustomDecompTable)
+        else cast("dict[OperatorBase, Callable[..., Any]]", dict(decompositions))
+    )
+    cia_to_decomp, python_decomp_table = _split_decomp_table_to_cia_and_python_decomp(
+        decomp_table
+    )
+    with _override_composite_implicit_decomp(cia_to_decomp):
+        yield cast("dict[OpOverload, Callable[..., Any]]", python_decomp_table)
 
 
 def aot_export_module(
@@ -1716,14 +1826,22 @@ def aot_export_joint_simple(
         # Run under no_grad, so our tracing machinery only traces an inference graph.
         ctx = torch.no_grad
 
-    with ctx():
-        fx_g, metadata, in_spec, out_spec = _aot_export_function(
-            func,
-            args,
-            decompositions=decompositions,
-            trace_joint=trace_joint,
-        )
-        in_spec, _kw_in_spec = in_spec.children()
+    # Preserved CIA ops only receive autograd_not_implemented kernels, so a
+    # joint graph would lose its gradients; keep raw decompositions there.
+    decomp_ctx = (
+        contextlib.nullcontext(decompositions)
+        if trace_joint
+        else _aot_export_decomposition_context(decompositions)
+    )
+    with decomp_ctx as decompositions_for_aot:
+        with ctx():
+            fx_g, metadata, in_spec, out_spec = _aot_export_function(
+                func,
+                args,
+                decompositions=decompositions_for_aot,
+                trace_joint=trace_joint,
+            )
+            in_spec, _kw_in_spec = in_spec.children()
     # At this point, we can just directly return the (joint or inference graph) that we traced.
     # First though: a bunch of assertions to make sure that our graph doesn't require
     # any calling convention changes compared to the original function.
@@ -1770,7 +1888,7 @@ def aot_export_joint_simple(
 
     if config.debug_assert:
         # Smoke test that after partitioning, we can run the forward without any calling convention changes.
-        fw_module, _bw_module = default_partition(  # noqa: F821
+        fw_module, _bw_module = default_partition(
             # type: ignore[bad-argument-type]
             fx_g,
             args,
@@ -1847,9 +1965,6 @@ def _aot_export_function(
         decompositions=decompositions,
         num_params_buffers=num_params_buffers,
         aot_id=next(AOT_COUNTER),
-        # For now there's no use case involving keeping input mutations in the graph
-        # (which we can only do in the inference case anyway).
-        # We can add this later if we need to.
         keep_inference_input_mutations=keep_input_mutations,
         dynamic_shapes=dynamic_shapes,
         aot_autograd_arg_pos_to_source=None,
@@ -1862,7 +1977,9 @@ def _aot_export_function(
         fake_mode, shape_env = construct_fake_mode(flat_args, aot_config)
     else:
         shape_env = fake_mode.shape_env
-    fake_flat_args = process_inputs(flat_args, aot_config, fake_mode, shape_env)
+    fake_flat_args, act_input_paths = process_inputs(
+        flat_args, aot_config, fake_mode, shape_env
+    )
     # TODO: Improve the descs here with pytree information
     fake_flat_args_descs: list[AOTInput] = [
         PlainAOTInput(i) for i in range(len(fake_flat_args))
@@ -1878,6 +1995,7 @@ def _aot_export_function(
             fake_mode,
             shape_env,
         )
+        aot_state.fw_metadata.act_input_paths = act_input_paths
         aot_graph_capture = aot_stage1_graph_capture(aot_state, flat_fn)
         fx_g, meta = aot_stage2_export(aot_state, aot_graph_capture)
 

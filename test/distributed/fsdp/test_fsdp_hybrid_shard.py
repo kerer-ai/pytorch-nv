@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.fsdp._traversal_utils as traversal_utils
 import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.distributed_c10d import _rank_not_in_group
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -29,6 +29,7 @@ from torch.testing._internal.common_fsdp import (
     DEVICEInitMode,
     FSDPInitMode,
     FSDPTestContinuous,
+    FSDPTestMultiThread,
     TransformerWithSharedParams,
 )
 from torch.testing._internal.common_utils import (
@@ -69,15 +70,15 @@ def patch_allreduce(new_allreduce):
 @contextlib.contextmanager
 def patch_reduce_scatter(new_reduce_scatter):
     """
-    Patches dist.reduce_scatter_tensor with a new reduce_scatter_tensor and
+    Patches dist.reduce_scatter_single with a new reduce_scatter_tensor and
     restores upon exiting.
     """
-    orig_reduce_scatter = dist.reduce_scatter_tensor
-    dist.reduce_scatter_tensor = new_reduce_scatter
+    orig_reduce_scatter = dist.reduce_scatter_single
+    dist.reduce_scatter_single = new_reduce_scatter
     try:
         yield
     finally:
-        dist.reduce_scatter_tensor = orig_reduce_scatter
+        dist.reduce_scatter_single = orig_reduce_scatter
 
 
 class MyModel(nn.Module):
@@ -244,6 +245,10 @@ class TestFSDPHybridShard(FSDPTestContinuous):
             2. Process groups are the same across FSDP wrapped instances
             3. reduce_scatter and allreduce called the expected no. of times
         """
+        # The workers are reused for every test in this class, and each new mesh
+        # adds NCCL communicators that hold /dev/shm until the workers exit, so
+        # build the mesh once rather than once per subtest.
+        device_mesh = init_device_mesh(device_type, (1, self.world_size))
         self.run_subtests(
             {
                 "hsdp_sharding_strategy": [
@@ -257,25 +262,22 @@ class TestFSDPHybridShard(FSDPTestContinuous):
                 "use_orig_params": [False, True],
                 "use_device_mesh": [False, True],
             },
-            self._test_fsdp_hybrid_shard_basic_setup,
+            partial(self._test_fsdp_hybrid_shard_basic_setup, device_mesh),
         )
 
     def _test_fsdp_hybrid_shard_basic_setup(
         self,
+        device_mesh: DeviceMesh,
         hsdp_sharding_strategy: ShardingStrategy,
         sharding_strategy_mode: ShardingStrategyMode,
         use_orig_params: bool,
         use_device_mesh: bool,
     ):
-        if use_device_mesh:
-            device_mesh = init_device_mesh(device_type, (1, self.world_size))
-        else:
-            device_mesh = None
         hsdp_model = self._init_hsdp_model(
             hsdp_sharding_strategy,
             sharding_strategy_mode,
             use_orig_params,
-            hsdp_device_mesh=device_mesh,
+            hsdp_device_mesh=device_mesh if use_device_mesh else None,
         )
         # All FSDP modules should have state.process_group as the process group over which to
         # shard (default process group), and state._inter_node_pg (process group containing only
@@ -311,7 +313,7 @@ class TestFSDPHybridShard(FSDPTestContinuous):
         self.assertEqual(1, len(inter_node_pgs))
 
         orig_ar = dist.all_reduce
-        orig_rs = dist.reduce_scatter_tensor
+        orig_rs = dist.reduce_scatter_single
 
         def patched_collective(orig_collective, counter, *args, **kwargs):
             counter[orig_collective] += 1
@@ -341,8 +343,18 @@ class TestFSDPHybridShard(FSDPTestContinuous):
             self.assertEqual(num_hsdp_flat_params, cntr[orig_ar])
             self.assertEqual(num_flat_params, cntr[orig_rs])
 
+        if not use_device_mesh:
+            # FSDP created these groups for this model only, and each one holds
+            # /dev/shm until the workers exit, so free them with the model.
+            for pg in intra_node_pgs | inter_node_pgs:
+                dist.destroy_process_group(pg)
+
     @skip_if_lt_x_gpu(4)
     def test_fsdp_hybrid_shard_parity(self):
+        # Build the HSDP groups once rather than once per subtest; see
+        # test_fsdp_hybrid_shard_basic_setup.
+        global_pg = dist.distributed_c10d._get_default_group()
+        hsdp_pgs = _init_intra_and_inter_node_groups(global_pg, 2)
         self.run_subtests(
             {
                 "hsdp_sharding_strategy": [
@@ -351,15 +363,17 @@ class TestFSDPHybridShard(FSDPTestContinuous):
                 ],
                 "use_orig_params": [False, True],
             },
-            self._test_fsdp_hybrid_shard_parity,
+            partial(self._test_fsdp_hybrid_shard_parity, hsdp_pgs),
         )
 
     def _test_fsdp_hybrid_shard_parity(
-        self, hsdp_sharding_strategy: ShardingStrategy, use_orig_params: bool
+        self,
+        hsdp_pgs: tuple[dist.ProcessGroup, dist.ProcessGroup],
+        hsdp_sharding_strategy: ShardingStrategy,
+        use_orig_params: bool,
     ):
         fsdp_model = self._init_fsdp_model(use_orig_params)
         global_pg = dist.distributed_c10d._get_default_group()
-        hsdp_pgs = _init_intra_and_inter_node_groups(global_pg, 2)
         hsdp_model = self._init_hsdp_model(
             hsdp_sharding_strategy,
             ShardingStrategyMode.ALL_HYBRID_SHARD,
@@ -448,6 +462,69 @@ class TestFSDPHybridShard(FSDPTestContinuous):
                 use_orig_params=use_orig_params,
             )
         return hsdp_model
+
+
+class TestHSDPSyncModuleStates(FSDPTestMultiThread):
+    class _ModelWithBuffer(nn.Module):
+        def __init__(self, device):
+            super().__init__()
+            self.lin = nn.Linear(10, 10, device=device)
+            self.bn = nn.BatchNorm1d(10, device=device)
+
+        def forward(self, x):
+            return self.bn(self.lin(x))
+
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @skip_if_lt_x_gpu(1)
+    def test_hsdp_buffer_sync_from_meta_device(self):
+        """Test that HSDP sync_module_states correctly broadcasts buffers
+        when only rank 0 has real weights and other ranks use meta device.
+
+        _sync_module_params_and_buffers marks buffers with FSDP_SYNCED=True
+        to avoid redundant syncs in nested wrapping. With two-phase broadcast
+        (inter-node then intra-node), this flag must be reset between phases,
+        otherwise the intra-node broadcast skips buffers. Non-persistent
+        buffers (e.g. RoPE inv_freq) that are materialized from meta device
+        via to_empty() and not restored by reset_parameters() would remain
+        as uninitialized values on local ranks 1..N.
+
+        Parameters are unaffected by broadcast order because they are
+        unconditionally included in every sync call. This test specifically
+        targets buffers, which are the only tensors gated by FSDP_SYNCED.
+        """
+        dev = torch.device(device_type)
+        mesh_2d = init_device_mesh(device_type, (2, self.world_size // 2))
+
+        if self.rank == 0:
+            model = self._ModelWithBuffer(device=dev)
+            model.bn.running_mean.fill_(42.0)
+            model.bn.running_var.fill_(7.0)
+        else:
+            model = self._ModelWithBuffer(device="meta")
+
+        def param_init_fn(module):
+            if any(p.is_meta for p in module.parameters(recurse=False)) or any(
+                b.is_meta for b in module.buffers(recurse=False)
+            ):
+                module.to_empty(device=dev, recurse=False)
+
+        model = FSDP(
+            model,
+            device_mesh=mesh_2d,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+            use_orig_params=True,
+            sync_module_states=True,
+            param_init_fn=param_init_fn,
+        )
+
+        # Buffers are not sharded by FSDP, so each rank has a local copy.
+        # If the FSDP_SYNCED reset is missing, ranks on non-source nodes
+        # will have uninitialized buffer values instead of rank 0's values.
+        self.assertEqual(model.bn.running_mean, torch.full((10,), 42.0))
+        self.assertEqual(model.bn.running_var, torch.full((10,), 7.0))
 
 
 instantiate_parametrized_tests(TestFSDPHybridShard)

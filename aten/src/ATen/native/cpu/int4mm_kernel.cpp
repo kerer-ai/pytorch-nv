@@ -10,6 +10,7 @@
 #include <ATen/native/cpu/utils.h>
 #include <cmath>
 #include <c10/util/Unroll.h>
+#include <c10/util/bit_cast.h>
 #include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
@@ -40,7 +41,7 @@ inline bool is_block_start(int index, int BLOCK_SIZE) {
 #if (defined(CPU_CAPABILITY_AVX512) || defined(CPU_CAPABILITY_AVX2)) && !defined(_MSC_VER)
 // convert 16x int4 to int8, handle 64 bits at a time
 // used in avx2 and avx512
-inline __m128i conver_int4_to_int8(const uint8_t* data) {
+inline __m128i convert_int4_to_int8(const uint8_t* data) {
   __m128i tmp = _mm_loadu_si64((const __m128i*)data);
   __m128i bytes = _mm_cvtepu8_epi16(tmp);
   const __m128i lowMask = _mm_set1_epi8(0xF);
@@ -169,7 +170,7 @@ inline void tinygemm_kernel(
           vb[3] = _mm512_fmadd_ps(vb[3], scale[3], zero[3]);
         }
       } else {
-        __m128i b8 = conver_int4_to_int8(B + k * ldb + col * 8);
+        __m128i b8 = convert_int4_to_int8(B + k * ldb + col * 8);
         __m512i b32 = _mm512_cvtepu8_epi32(b8);
         vb[col] = _mm512_permutexvar_ps(b32, lut);
         vb[col] = _mm512_fmadd_ps(vb[col], scale[col], zero[col]);
@@ -312,7 +313,7 @@ inline void tinygemm_kernel(
       } else {
         if constexpr (col % 2 == 0) {
           // de-quantize per 64 bits (16x int4)
-          __m128i b8 = conver_int4_to_int8(B + k * ldb + col * 4);
+          __m128i b8 = convert_int4_to_int8(B + k * ldb + col * 4);
           __m128i b8_val0 = _mm_set1_epi64x(_mm_extract_epi64(b8, 0));
           __m128i b8_val1 = _mm_set1_epi64x(_mm_extract_epi64(b8, 1));
           if (k + PREFETCH_SIZE_K < K) {
@@ -619,7 +620,7 @@ void weight_to_int4pack_kernel(
     const Tensor& weight) {
 
   auto weight_packed_data = reinterpret_cast<uint8_t*>(weight_packed.data_ptr());
-  const auto weight_data = weight.data_ptr<int32_t>();
+  const auto weight_data = weight.const_data_ptr<int32_t>();
 
   int N = weight.size(0);
   int K = weight.size(1);
@@ -810,16 +811,12 @@ static void ref_dyn_quant_matmul_4bit_channelwise_kernel_bf16(
   // Cast bfloat16 to float32 inline
   auto cast_bf16_to_f32 = [](uint16_t bf16_val) {
     uint32_t tmp = static_cast<uint32_t>(bf16_val) << 16;
-    float f;
-    std::memcpy(&f, &tmp, sizeof(f));
-    return f;
+    return c10::bit_cast<float>(tmp);
   };
 
   // Cast float32 to bfloat16 inline
   auto cast_f32_to_bf16 = [](float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-    return static_cast<uint16_t>(bits >> 16);
+    return static_cast<uint16_t>(c10::bit_cast<uint32_t>(f) >> 16);
   };
 
   // Quantization pack lambda (channelwise QA8DX)

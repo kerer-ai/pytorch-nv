@@ -1,6 +1,7 @@
 # Owner(s): ["oncall: distributed"]
 
 import copy
+import io
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import random
 import sys
 import tempfile
 import time
+import unittest
 from datetime import timedelta
 from functools import reduce
 from itertools import groupby
@@ -54,6 +56,7 @@ from torch.testing._internal.common_distributed import (
     verify_ddp_error_logged,
 )
 from torch.testing._internal.common_utils import (
+    IS_MACOS,
     retry_on_connect_failures,
     run_tests,
     skip_but_pass_in_sandcastle,
@@ -235,21 +238,74 @@ class RendezvousEnvTest(TestCase):
     @requires_gloo()
     @retry_on_connect_failures
     def test_logging_init(self):
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(common.find_free_port())
-        os.environ["RANK"] = "0"
+        # retry_on_connect_failures re-runs this whole body on a RuntimeError,
+        # so every mutation below has to be undone before the next attempt.
+        try:
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(common.find_free_port())
+            os.environ["RANK"] = "0"
 
-        previous_handlers = logging.root.handlers
+            previous_handlers = logging.root.handlers
 
-        c10d.init_process_group(backend="gloo", init_method="env://")
+            c10d.init_process_group(backend="gloo", init_method="env://")
 
-        current_handlers = logging.root.handlers
-        self.assertEqual(len(previous_handlers), len(current_handlers))
-        for current, previous in zip(current_handlers, previous_handlers):
-            self.assertEqual(current, previous)
+            current_handlers = logging.root.handlers
+            self.assertEqual(len(previous_handlers), len(current_handlers))
+            for current, previous in zip(current_handlers, previous_handlers):
+                self.assertEqual(current, previous)
 
-        c10d.destroy_process_group()
+            c10d.destroy_process_group()
+        finally:
+            if c10d.is_initialized():
+                c10d.destroy_process_group()
+            for var in ("WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "RANK"):
+                os.environ.pop(var, None)
+
+    @requires_gloo()
+    @retry_on_connect_failures
+    def test_device_id_cpu(self):
+        try:
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(common.find_free_port())
+            os.environ["RANK"] = "0"
+
+            c10d.init_process_group(
+                backend="gloo", init_method="env://", device_id=torch.device("cpu:0")
+            )
+
+            self.assertTrue(c10d.is_initialized())
+
+            c10d.destroy_process_group()
+
+        finally:
+            if c10d.is_initialized():
+                c10d.destroy_process_group()
+            for var in ("WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "RANK"):
+                os.environ.pop(var, None)
+
+    @requires_gloo()
+    @retry_on_connect_failures
+    def test_device_id_cpu_no_index(self):
+        try:
+            os.environ["WORLD_SIZE"] = "1"
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(common.find_free_port())
+            os.environ["RANK"] = "0"
+
+            with self.assertRaisesRegex(
+                ValueError, "must be a device with a valid index"
+            ):
+                c10d.init_process_group(
+                    backend="gloo", init_method="env://", device_id=torch.device("cpu")
+                )
+
+        finally:
+            if c10d.is_initialized():
+                c10d.destroy_process_group()
+            for var in ("WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "RANK"):
+                os.environ.pop(var, None)
 
 
 class TimeoutTest(test_c10d_common.AbstractTimeoutTest, TestCase):
@@ -293,6 +349,43 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         # Execute 2x the number of operations to ensure we use every device.
         for fut in [pg.allreduce(torch.ones(i + 1)).get_future() for i in range(4)]:
             fut.wait()
+
+    @requires_gloo()
+    def test_split_world_pg_created_after_another_gloo_pg(self):
+        # Regression test: ProcessGroupGloo::groupRanks() used to derive the
+        # identity rank mapping only when local_id_ == 0. local_id_ is a
+        # process-global counter over every ProcessGroupGloo constructed in the
+        # process, so a world-sized pg built after any other gloo pg (e.g. a
+        # stateless pg, or one inherited across fork) fell through to its empty
+        # global_ranks_in_group, and split() then indexed that empty vector and
+        # segfaulted on a null data pointer.
+        store = c10d.FileStore(self.file_name, self.world_size)
+        # (1) burn local_id_ == 0 on an unrelated gloo pg.
+        self._create_process_group_gloo(
+            c10d.PrefixStore("prior", store),
+            self.rank,
+            self.world_size,
+            self.opts(group_name="prior"),
+        )
+        # (2) a world-sized pg: default options -> global_ranks_in_group empty.
+        pg = self._create_process_group_gloo(
+            c10d.PrefixStore("world", store),
+            self.rank,
+            self.world_size,
+            self.opts(group_name="world"),
+        )
+
+        ranks = list(range(self.world_size))
+        split = pg.split(
+            c10d.PrefixStore("split", store), ranks, self.opts(group_name="split")
+        )
+        self.assertIsNotNone(split)
+        self.assertEqual(split.options.global_ranks_in_group, ranks)
+
+        tensor = torch.full((4,), float(self.rank + 1))
+        split.allreduce([tensor]).wait()
+        expected = float(sum(r + 1 for r in ranks))
+        self.assertEqual(tensor, torch.full_like(tensor, expected))
 
     @requires_gloo()
     def test_empty_tensors(self):
@@ -435,7 +528,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             self.assertEqual(
                 torch.tensor([(i * self.world_size) + (i % self.world_size)]),
                 inputs[i],
-                msg=(f"Mismatch in iteration {i:d}"),
+                msg=(lambda msg: f"{msg}\nMismatch in iteration {i:d}"),
             )
 
     @requires_gloo()
@@ -445,7 +538,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_broadcast_stress_cuda(self):
         inputs = [
             torch.tensor([i * self.world_size + self.rank]).cuda() for i in range(1000)
@@ -486,8 +581,14 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
         if self.rank == 0:
             t1 = torch.zeros([1], dtype=torch.float32)
+            work = pg.allreduce([t1], opts)
             with self.assertRaisesRegex(RuntimeError, "Timed out waiting 1ms"):
-                pg.allreduce([t1], opts).wait()
+                work.wait()
+            # Regression for #147312: Work.exception() must hand back a typed
+            # Python exception, not a raw std::exception_ptr.
+            exc = work.exception()
+            self.assertIsInstance(exc, RuntimeError)
+            self.assertIn("Timed out", str(exc))
 
     @requires_gloo()
     def test_allreduce_overall_timeout(self):
@@ -595,7 +696,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                     ]
                 ),
                 future_handle.value()[0],
-                msg=(f"Mismatch in iteration {i:d}"),
+                msg=(lambda msg: f"{msg}\nMismatch in iteration {i:d}"),
             )
 
     @requires_gloo()
@@ -605,7 +706,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_allreduce_stress_cuda(self):
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_allreduce_stress(inputs)
@@ -692,30 +795,13 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             self.assertEqual(
                 self._expected_output(i),
                 result,
-                msg=f"Mismatch in iteration {i}",
+                msg=lambda msg: f"{msg}\nMismatch in iteration {i}",
             )
 
     @requires_gloo()
     def test_allreduce_coalesced_stress(self):
         inputs = [2 * [torch.tensor([i + self.rank])] for i in range(1000)]
         self._test_allreduce_coalesced_stress(inputs)
-
-    @requires_gloo()
-    def test_allreduce_coalesced_async(self):
-        store = c10d.FileStore(self.file_name, self.world_size)
-        c10d.init_process_group(
-            backend="gloo", rank=self.rank, world_size=self.world_size, store=store
-        )
-
-        xs = [2 * [torch.tensor([i + self.rank])] for i in range(2)]
-        futs = [c10d.all_reduce_coalesced(x, async_op=True) for x in xs]
-        torch.futures.wait_all(futs)
-        for i, fut in enumerate(futs):
-            self.assertEqual(
-                self._expected_output(i),
-                fut.wait(),
-                msg=f"Mismatch in iteration {i}",
-            )
 
     @requires_gloo()
     def test_sparse_allreduce_checks(self):
@@ -860,7 +946,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 expect = torch.full((3,), expected_val)
                 self.assertTrue(
                     torch.allclose(output, expect),
-                    f"op={op}, rank={self.rank}: output={output}, expected={expect}",
+                    lambda msg: f"{msg}\nop={op}, rank={self.rank}: output={output}, expected={expect}",
                 )
 
     @requires_gloo()
@@ -890,7 +976,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                     input[i * out_size : (i + 1) * out_size] = float(self.rank + i + 1)
                 output = torch.empty(out_size)
 
-                work = dist.reduce_scatter_tensor(output, input, op=op, async_op=True)
+                work = dist.reduce_scatter_single(output, input, op=op, async_op=True)
                 work.wait()
 
                 r = self.rank
@@ -913,7 +999,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 expect = torch.full((out_size,), expected_val)
                 self.assertTrue(
                     torch.allclose(output, expect),
-                    f"op={op}, rank={self.rank}: output={output[0]}, expected={expect[0]}",
+                    lambda msg: f"{msg}\nop={op}, rank={self.rank}: output={output[0]}, expected={expect[0]}",
                 )
 
     @requires_gloo()
@@ -976,7 +1062,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                     expect = torch.full((out_size,), expected_val)
                     self.assertTrue(
                         torch.allclose(output, expect),
-                        f"op={op}, rank={self.rank}: output={output[0]}, expected={expect[0]}",
+                        lambda msg: f"{msg}\nop={op}, rank={self.rank}: output={output[0]}, expected={expect[0]}",
                     )
 
     @requires_gloo()
@@ -1127,7 +1213,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             self.assertEqual(
                 torch.tensor([iter + root]),
                 result[0],
-                msg=(f"Mismatch in iteration {iter:d} for rank {root:d}"),
+                msg=(
+                    lambda msg: f"{msg}\nMismatch in iteration {iter:d} for rank {root:d}"
+                ),
             )
 
     @requires_gloo()
@@ -1142,13 +1230,13 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         self.assertEqual(pg.options._timeout, timedelta(seconds=23))
 
     @requires_gloo()
-    def test_gloo_set_pg_timeout_api(self):
+    def test_gloo_set_timeout_api(self):
         """
-        Test _set_pg_timeout API for Gloo backend (issue #165422).
-        This test demonstrates that dynamically changing timeout via _set_pg_timeout
+        Test set_timeout API for Gloo backend (issue #165422).
+        This test demonstrates that dynamically changing timeout via set_timeout
         actually affects operation timeouts by:
         1. verifying operations complete successfully with normal timeout
-        2. setting a very short timeout via _set_pg_timeout
+        2. setting a very short timeout via set_timeout
         3. demonstrating that operations timeout with the new short timeout value
         """
         store = c10d.FileStore(self.file_name, self.world_size)
@@ -1168,9 +1256,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         tensor = torch.rand(10)
         pg.allreduce(tensor).wait()
 
-        # change timeout to a very short value using _set_pg_timeout
+        # change timeout to a very short value using set_timeout
         # this is the API from issue #165422
-        c10d.distributed_c10d._set_pg_timeout(timedelta(milliseconds=1), pg)
+        c10d.set_timeout(timedelta(milliseconds=1), pg)
         self.assertEqual(backend.options._timeout, timedelta(milliseconds=1))
 
         # demonstrate that the new timeout is actually enforced
@@ -1179,6 +1267,30 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             t1 = torch.zeros([1], dtype=torch.float32)
             with self.assertRaisesRegex(RuntimeError, "Timed out waiting 1ms"):
                 pg.allreduce([t1]).wait()
+
+        dist.destroy_process_group()
+
+    @requires_gloo()
+    def test_gloo_set_pg_timeout_deprecated(self):
+        """
+        The private `_set_pg_timeout` alias is deprecated but must remain
+        functional, delegating to the public `set_timeout`.
+        """
+        store = c10d.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(
+            backend="gloo",
+            store=store,
+            rank=self.rank,
+            world_size=self.world_size,
+            timeout=timedelta(seconds=50),
+        )
+
+        pg = dist.distributed_c10d._get_default_group()
+        backend = pg._get_backend(torch.device("cpu"))
+
+        with self.assertWarnsRegex(FutureWarning, "_set_pg_timeout"):
+            c10d.distributed_c10d._set_pg_timeout(timedelta(seconds=23), pg)
+        self.assertEqual(backend.options._timeout, timedelta(seconds=23))
 
         dist.destroy_process_group()
 
@@ -1195,7 +1307,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     )
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_scatter_stress_cuda(self):
         inputs = [
             [torch.tensor([i + self.rank]) for _ in range(self.world_size)]
@@ -1360,7 +1474,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 self.assertEqual(
                     expected_outputs[iter],
                     [result],
-                    msg=(f"Mismatch in iteration {iter:d} for root {root:d}"),
+                    msg=(
+                        lambda msg: f"{msg}\nMismatch in iteration {iter:d} for root {root:d}"
+                    ),
                 )
 
     @requires_gloo()
@@ -1369,7 +1485,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         self._test_gather_stress(inputs, lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     @requires_gloo()
     def test_gather_stress_cuda(self):
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
@@ -1496,7 +1614,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             self.assertEqual(
                 expected_outputs[i],
                 [result],
-                msg=(f"Mismatch in iteration {i:d}"),
+                msg=(lambda msg: f"{msg}\nMismatch in iteration {i:d}"),
             )
 
     @requires_gloo()
@@ -1506,7 +1624,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_allgather_stress_cuda(self):
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_allgather_stress(inputs, lambda t: t.clone().cuda())
@@ -1683,7 +1803,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                         ]
                     ),
                     result[0],
-                    msg=(f"Mismatch in iteration {iter:d} with root rank {root:d}"),
+                    msg=(
+                        lambda msg: f"{msg}\nMismatch in iteration {iter:d} with root rank {root:d}"
+                    ),
                 )
 
     @requires_gloo()
@@ -1693,11 +1815,14 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_reduce_stress_cuda(self):
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_reduce_stress(inputs)
 
+    @unittest.skipIf(IS_MACOS, "https://github.com/pytorch/pytorch/issues/71195")
     @requires_gloo()
     def test_send_recv_all_to_all(self):
         store = c10d.FileStore(self.file_name, self.world_size)
@@ -1762,7 +1887,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
-    @skipIfRocm
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
     def test_block_current_stream_cuda(self):
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
@@ -1790,6 +1917,230 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             recv_tensor = torch.rand(10, 10, dtype=torch.cfloat)
             pg.recv([recv_tensor], 0, 0).wait()
             self.assertEqual(send_tensor, recv_tensor)
+
+    @requires_gloo()
+    def test_alltoall_checks(self):
+        store = c10d.FileStore(self.file_name, self.world_size)
+        pg = self._create_process_group_gloo(
+            store, self.rank, self.world_size, self.opts()
+        )
+
+        t1 = torch.zeros([1], dtype=torch.float32)
+        t2 = torch.zeros([1], dtype=torch.float64)
+        t3 = torch.zeros([2], dtype=torch.float32)
+
+        # Check input tensor list size does not match world size
+        with self.assertRaisesRegex(
+            RuntimeError, "input tensor list size.*does not match world size"
+        ):
+            pg.alltoall([t1] * self.world_size, [t1] * (self.world_size - 1))
+
+        # Check output tensor list size does not match world size
+        with self.assertRaisesRegex(
+            RuntimeError, "output tensor list size.*does not match world size"
+        ):
+            pg.alltoall([t1] * (self.world_size - 1), [t1] * self.world_size)
+
+        # Check invalid tensor type in inputs
+        with self.assertRaisesRegex(RuntimeError, "invalid tensor type"):
+            pg.alltoall([t1] * self.world_size, [t1, t2] + [t1] * (self.world_size - 2))
+
+        # Check invalid tensor size in inputs
+        with self.assertRaisesRegex(RuntimeError, "invalid tensor size"):
+            pg.alltoall([t1] * self.world_size, [t1, t3] + [t1] * (self.world_size - 2))
+
+        # Check invalid tensor type in outputs
+        with self.assertRaisesRegex(RuntimeError, "invalid tensor type"):
+            pg.alltoall([t1, t2] + [t1] * (self.world_size - 2), [t1] * self.world_size)
+
+        # Check invalid tensor size in outputs
+        with self.assertRaisesRegex(RuntimeError, "invalid tensor size"):
+            pg.alltoall([t1, t3] + [t1] * (self.world_size - 2), [t1] * self.world_size)
+
+        # Check input and output tensors must have the same type
+        with self.assertRaisesRegex(
+            RuntimeError, "input and output tensors must have the same type"
+        ):
+            pg.alltoall([t2] * self.world_size, [t1] * self.world_size)
+
+        # Check input and output tensors must have the same size
+        with self.assertRaisesRegex(
+            RuntimeError, "input and output tensors must have the same size"
+        ):
+            pg.alltoall([t3] * self.world_size, [t1] * self.world_size)
+
+    def _test_alltoall_basics(self, fn):
+        store = c10d.FileStore(self.file_name, self.world_size)
+        pg = self._create_process_group_gloo(
+            store, self.rank, self.world_size, self.opts()
+        )
+
+        # Preallocate tensors for input/output
+        # Each rank sends tensor with value equal to rank to each other rank
+        input_tensors = [fn(torch.tensor([self.rank])) for _ in range(self.world_size)]
+        output_tensors = [fn(torch.tensor([-1])) for _ in range(self.world_size)]
+
+        # Perform all-to-all
+        fut = pg.alltoall(output_tensors, input_tensors).get_future()
+        fut.wait()
+
+        # After alltoall, rank i should have received tensor with value j from rank j
+        # in output_tensors[j]
+        for i in range(self.world_size):
+            self.assertEqual(torch.tensor([i]), output_tensors[i])
+
+    @requires_gloo()
+    def test_alltoall_basics(self):
+        self._test_alltoall_basics(lambda t: t.clone())
+
+    @skip_if_lt_x_gpu(2)
+    @requires_gloo()
+    def test_alltoall_basics_cuda(self):
+        self._test_alltoall_basics(lambda t: t.clone().cuda())
+
+    def _test_alltoall_stress(self, inputs, fn):
+        store = c10d.FileStore(self.file_name, self.world_size)
+        pg = self._create_process_group_gloo(
+            store, self.rank, self.world_size, self.opts(threads=8)
+        )
+
+        outputs = [
+            [fn(torch.tensor([-1])) for _ in range(self.world_size)]
+            for _ in range(len(inputs))
+        ]
+
+        future_handles = []
+        for i in range(len(inputs)):
+            input_tensors = [fn(inputs[i][j]) for j in range(self.world_size)]
+            fut = pg.alltoall(outputs[i], input_tensors).get_future()
+            future_handles.append(fut)
+
+        for i, future_handle in enumerate(future_handles):
+            future_handle.wait()
+
+            # Verify correctness: output_tensors[j] should contain the value
+            # that rank j sent to this rank (self.rank) at position self.rank in rank j's input.
+            # All ranks construct inputs[i] = [tensor([i * world_size + 0]), ..., tensor([i * world_size + world_size-1])]
+            # So rank j sends inputs[i][self.rank] = tensor([i * world_size + self.rank]) to this rank.
+            # This rank receives that in output_tensors[j].
+            for j in range(self.world_size):
+                expected_value = torch.tensor([i * self.world_size + self.rank])
+                self.assertEqual(
+                    expected_value,
+                    outputs[i][j],
+                    msg=(
+                        lambda msg: f"{msg}\nMismatch in iteration {i:d} from rank {j:d}"
+                    ),
+                )
+
+    @requires_gloo()
+    def test_alltoall_stress(self):
+        inputs = [
+            [torch.tensor([i * self.world_size + j]) for j in range(self.world_size)]
+            for i in range(1000)
+        ]
+        self._test_alltoall_stress(inputs, lambda t: t.clone())
+
+    @skip_if_lt_x_gpu(2)
+    @requires_gloo()
+    @skipIfRocm(
+        msg="CLR execution-lock busy wait, see https://github.com/ROCm/rocm-systems/issues/11678"
+    )
+    def test_alltoall_stress_cuda(self):
+        inputs = [
+            [torch.tensor([i * self.world_size + j]) for j in range(self.world_size)]
+            for i in range(1000)
+        ]
+        self._test_alltoall_stress(inputs, lambda t: t.clone().cuda())
+
+    def _test_alltoall_data_routing(self, fn):
+        """
+        Test that data routing is correct: rank i sends inputTensors[j]
+        to rank j
+        """
+        store = c10d.FileStore(self.file_name, self.world_size)
+        pg = self._create_process_group_gloo(
+            store, self.rank, self.world_size, self.opts()
+        )
+
+        # Each rank sends unique values to every other rank
+        # Rank i sends tensor with value (i * 100 + j) to rank j
+        input_tensors = []
+        for j in range(self.world_size):
+            value = self.rank * 100 + j
+            input_tensors.append(fn(torch.tensor([value], dtype=torch.float32)))
+
+        output_tensors = [
+            fn(torch.tensor([-1], dtype=torch.float32)) for _ in range(self.world_size)
+        ]
+
+        # Perform all-to-all
+        fut = pg.alltoall(output_tensors, input_tensors).get_future()
+        fut.wait()
+
+        # Verify: rank i should receive tensor with value (j * 100 + i)
+        # from rank j in output_tensors[j]
+        for j in range(self.world_size):
+            expected_value = j * 100 + self.rank
+            actual_value = output_tensors[j].item()
+            self.assertEqual(
+                expected_value,
+                actual_value,
+                msg=(
+                    lambda msg: f"{msg}\nRank {self.rank}: output_tensors[{j}] = "
+                    f"{actual_value}, expected {expected_value}"
+                ),
+            )
+
+    @requires_gloo()
+    def test_alltoall_data_routing(self):
+        self._test_alltoall_data_routing(lambda t: t.clone())
+
+    @skip_if_lt_x_gpu(2)
+    @requires_gloo()
+    def test_alltoall_data_routing_cuda(self):
+        self._test_alltoall_data_routing(lambda t: t.clone().cuda())
+
+    def _test_alltoall_multidim(self, fn):
+        """Test alltoall with multi-dimensional tensors."""
+        store = c10d.FileStore(self.file_name, self.world_size)
+        pg = self._create_process_group_gloo(
+            store, self.rank, self.world_size, self.opts()
+        )
+
+        # Each rank sends a 3x4 tensor with unique values to each destination
+        # Value pattern: rank * 1000 + dest * 100 + row * 10 + col
+        input_tensors = []
+        for dest in range(self.world_size):
+            t = torch.zeros(3, 4, dtype=torch.float32)
+            for row in range(3):
+                for col in range(4):
+                    t[row, col] = self.rank * 1000 + dest * 100 + row * 10 + col
+            input_tensors.append(fn(t))
+
+        output_tensors = [
+            fn(torch.zeros(3, 4, dtype=torch.float32)) for _ in range(self.world_size)
+        ]
+
+        fut = pg.alltoall(output_tensors, input_tensors).get_future()
+        fut.wait()
+
+        # Verify: output_tensors[src] should contain what rank src sent to us
+        for src in range(self.world_size):
+            expected = torch.zeros(3, 4, dtype=torch.float32)
+            for row in range(3):
+                for col in range(4):
+                    expected[row, col] = src * 1000 + self.rank * 100 + row * 10 + col
+            self.assertEqual(expected, output_tensors[src].cpu())
+
+    @requires_gloo()
+    def test_alltoall_multidim(self):
+        self._test_alltoall_multidim(lambda t: t.clone())
+
+    @skip_if_lt_x_gpu(2)
+    @requires_gloo()
+    def test_alltoall_multidim_cuda(self):
+        self._test_alltoall_multidim(lambda t: t.clone().cuda())
 
 
 class DistributedDataParallelTest(
@@ -2216,14 +2567,21 @@ class DistributedDataParallelTest(
         # run the model for 6 iterations, with a checkpoint in the middle
         train_loop(ddp_withload, optimizer_withload, 3)
 
-        # zero out parameters of both DDP and non-DDP models and reload them from the DDP state dict
-        checkpoint_path = tempfile.gettempdir() + "/model.checkpoint"
+        # zero out parameters of both DDP and non-DDP models and reload them from the DDP state dict.
+        # Broadcast the serialized checkpoint instead of sharing a file, so that concurrent runs on
+        # the same host cannot collide on a fixed path under the shared temp directory.
         if self.rank == 0:
-            torch.save(ddp_withload.state_dict(), checkpoint_path)
+            buffer = io.BytesIO()
+            torch.save(ddp_withload.state_dict(), buffer)
+            object_list = [buffer.getvalue()]
+        else:
+            object_list = [None]
+        dist.broadcast_object_list(object_list)
 
-        dist.barrier()
         map_location = {"cuda:0": f"cuda:{self.rank:d}"}
-        ddp_state_dict = torch.load(checkpoint_path, map_location=map_location)
+        ddp_state_dict = torch.load(
+            io.BytesIO(object_list[0]), map_location=map_location
+        )
 
         for model in [ddp_withload, model_withload]:
             for p in model.parameters():
@@ -2250,7 +2608,9 @@ class DistributedDataParallelTest(
             self.assertEqual(p_withload, p_withoutload)
             self.assertEqual(p_non_ddp_withload, p_withoutload)
 
-    def _test_sparse_gradients(self, gradient_as_bucket_view=False):
+    def _test_sparse_gradients(
+        self, gradient_as_bucket_view=False, batched_grad_copy=False
+    ):
         process_group = self._get_process_group()
 
         # Ensure initialized weights and inputs are identical across processes
@@ -2261,6 +2621,7 @@ class DistributedDataParallelTest(
             copy.deepcopy(vanilla_model),
             process_group=process_group,
             gradient_as_bucket_view=gradient_as_bucket_view,
+            batched_grad_copy=batched_grad_copy,
         )
 
         self._run_and_verify_sparse_gradients(vanilla_model, ddp_model)
@@ -2272,6 +2633,61 @@ class DistributedDataParallelTest(
     @requires_gloo()
     def test_sparse_gradients_grad_is_view(self):
         self._test_sparse_gradients(gradient_as_bucket_view=True)
+
+    @requires_gloo()
+    def test_sparse_gradients_batched_grad_copy(self):
+        self._test_sparse_gradients(batched_grad_copy=True)
+
+    @requires_gloo()
+    def test_sparse_gradients_grad_is_view_batched_grad_copy(self):
+        self._test_sparse_gradients(
+            gradient_as_bucket_view=True, batched_grad_copy=True
+        )
+
+    @requires_gloo()
+    def test_static_graph_batched_grad_copy(self):
+        """Test batched_grad_copy with static_graph (delay_all_reduce path)."""
+        process_group = self._get_process_group()
+        torch.manual_seed(42)
+
+        vanilla_model = nn.Linear(2, 4, bias=False).double()
+        model_bat = copy.deepcopy(vanilla_model)
+
+        ddp_bat = DistributedDataParallel(
+            model_bat,
+            process_group=process_group,
+            static_graph=True,
+            batched_grad_copy=True,
+        )
+
+        opt_van = torch.optim.SGD(vanilla_model.parameters(), lr=0.01)
+        opt_bat = torch.optim.SGD(ddp_bat.parameters(), lr=0.01)
+
+        mult = 2
+        # Run multiple iterations to cover both static_graph first iteration
+        # (delay_all_reduce path) and subsequent iterations.
+        for _ in range(3):
+            batch_size = mult * self.world_size
+            input = torch.rand(batch_size, 2, dtype=torch.double)
+
+            # Vanilla model on full batch (mean normalizes by batch size,
+            # matching DDP's allreduce averaging across ranks)
+            opt_van.zero_grad(set_to_none=True)
+            vanilla_model(input).mean().backward()
+
+            # DDP model on partial batch — allreduce averages gradients
+            partial_input = input.split(mult)[self.rank]
+            opt_bat.zero_grad(set_to_none=True)
+            ddp_bat(partial_input).mean().backward()
+
+            for p_van, p_bat in zip(vanilla_model.parameters(), ddp_bat.parameters()):
+                self.assertEqual(p_van.grad, p_bat.grad)
+
+            opt_van.step()
+            opt_bat.step()
+
+        for p_van, p_bat in zip(vanilla_model.parameters(), ddp_bat.parameters()):
+            self.assertEqual(p_van, p_bat)
 
     @requires_gloo()
     def test_ddp_comm_hook_future_passing_cpu(self):
@@ -2630,6 +3046,320 @@ class ReducerTest(TestCase):
             output.backward()
             optimizer.step()
 
+    def _create_reducer(
+        self,
+        model,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=False,
+        batched_grad_copy=False,
+    ):
+        parameters = list(model.parameters())
+        group_by_dtype = groupby(
+            range(len(parameters)), key=lambda i: parameters[i].dtype
+        )
+        buckets = [list(indices) for _, indices in group_by_dtype]
+        return dist.Reducer(
+            parameters,
+            buckets,
+            [dist._DEFAULT_FIRST_BUCKET_BYTES for _ in range(len(buckets))],
+            self.process_group,
+            find_unused_parameters=find_unused_parameters,
+            gradient_as_bucket_view=gradient_as_bucket_view,
+            batched_grad_copy=batched_grad_copy,
+        )
+
+    def _run_forward_backward(self, model, reducer, batch_size=10):
+        """Run one forward+backward pass, return loss."""
+        loss_fn = nn.CrossEntropyLoss()
+        input = torch.rand([batch_size, 2], dtype=torch.double)
+        target = torch.LongTensor([random.randrange(4) for _ in range(batch_size)])
+        output = loss_fn(model(input), target)
+        reducer.prepare_for_backward(output)
+        output.backward()
+        return output
+
+    @requires_gloo()
+    def test_batched_grad_copy_basic(self):
+        """Verify batched_grad_copy uses _foreach_copy_ and produces grads."""
+        model = self._create_mixed_precision_model()
+        reducer = self._create_reducer(model, batched_grad_copy=True)
+        reducer.prepare_for_forward()
+
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+        ) as prof:
+            self._run_forward_backward(model, reducer)
+
+        events = [e.key for e in prof.key_averages()]
+        self.assertIn("aten::_foreach_copy_", events)
+        # mul_out is the per-param copy+div — should NOT appear when batched
+        self.assertNotIn("torch::distributed::reducer::mul_out", events)
+
+        for p in model.parameters():
+            if p.grad is not None:
+                self.assertFalse(torch.all(p.grad == 0))
+
+    @requires_gloo()
+    def test_batched_grad_copy_matches_default(self):
+        """Verify grads are numerically identical with and without batching."""
+        torch.manual_seed(42)
+        model_ref = self._create_mixed_precision_model()
+        model_bat = copy.deepcopy(model_ref)
+
+        input = torch.rand([10, 2], dtype=torch.double)
+        target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+        loss_fn = nn.CrossEntropyLoss()
+
+        # Reference: no batching
+        reducer_ref = self._create_reducer(model_ref)
+        reducer_ref.prepare_for_forward()
+        out_ref = loss_fn(model_ref(input), target)
+        reducer_ref.prepare_for_backward(out_ref)
+        out_ref.backward()
+
+        # Batched
+        reducer_bat = self._create_reducer(model_bat, batched_grad_copy=True)
+        reducer_bat.prepare_for_forward()
+        out_bat = loss_fn(model_bat(input), target)
+        reducer_bat.prepare_for_backward(out_bat)
+        out_bat.backward()
+
+        for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+            self.assertEqual(p_ref.grad, p_bat.grad)
+
+    @requires_gloo()
+    def test_batched_grad_copy_with_set_to_none(self):
+        """Multi-iteration with set_to_none=True — the primary use case."""
+        torch.manual_seed(42)
+        model_ref = self._create_mixed_precision_model()
+        model_bat = copy.deepcopy(model_ref)
+
+        opt_ref = torch.optim.SGD(model_ref.parameters(), lr=0.01)
+        opt_bat = torch.optim.SGD(model_bat.parameters(), lr=0.01)
+
+        reducer_ref = self._create_reducer(model_ref)
+        reducer_bat = self._create_reducer(model_bat, batched_grad_copy=True)
+        loss_fn = nn.CrossEntropyLoss()
+
+        for i in range(3):
+            input = torch.rand([10, 2], dtype=torch.double)
+            target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+
+            # set_to_none=True is the default
+            opt_ref.zero_grad(set_to_none=True)
+            opt_bat.zero_grad(set_to_none=True)
+
+            reducer_ref.prepare_for_forward()
+            out_ref = loss_fn(model_ref(input), target)
+            reducer_ref.prepare_for_backward(out_ref)
+            out_ref.backward()
+
+            reducer_bat.prepare_for_forward()
+            out_bat = loss_fn(model_bat(input), target)
+            reducer_bat.prepare_for_backward(out_bat)
+            out_bat.backward()
+
+            for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+                self.assertEqual(p_ref.grad, p_bat.grad)
+
+            opt_ref.step()
+            opt_bat.step()
+
+        # Params should be identical after training
+        for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+            self.assertEqual(p_ref, p_bat)
+
+    @requires_gloo()
+    def test_batched_grad_copy_with_bucket_view(self):
+        """Test batched_grad_copy + gradient_as_bucket_view (alias path)."""
+        torch.manual_seed(42)
+        model_ref = self._create_mixed_precision_model()
+        model_bat = copy.deepcopy(model_ref)
+
+        opt_ref = torch.optim.SGD(model_ref.parameters(), lr=0.01)
+        opt_bat = torch.optim.SGD(model_bat.parameters(), lr=0.01)
+
+        reducer_ref = self._create_reducer(model_ref, gradient_as_bucket_view=True)
+        reducer_bat = self._create_reducer(
+            model_bat,
+            gradient_as_bucket_view=True,
+            batched_grad_copy=True,
+        )
+        loss_fn = nn.CrossEntropyLoss()
+
+        for i in range(3):
+            input = torch.rand([10, 2], dtype=torch.double)
+            target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+
+            # First iteration: grads undefined (set_to_none default).
+            # Subsequent iterations: grads alias bucket views.
+            opt_ref.zero_grad(set_to_none=True)
+            opt_bat.zero_grad(set_to_none=True)
+
+            reducer_ref.prepare_for_forward()
+            out_ref = loss_fn(model_ref(input), target)
+            reducer_ref.prepare_for_backward(out_ref)
+            out_ref.backward()
+
+            reducer_bat.prepare_for_forward()
+            out_bat = loss_fn(model_bat(input), target)
+            reducer_bat.prepare_for_backward(out_bat)
+            out_bat.backward()
+
+            for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+                self.assertEqual(p_ref.grad, p_bat.grad)
+
+            opt_ref.step()
+            opt_bat.step()
+
+        for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+            self.assertEqual(p_ref, p_bat)
+
+    @requires_gloo()
+    def test_batched_grad_copy_with_unused_parameters(self):
+        """Test batched_grad_copy + find_unused_parameters with fc3 unused."""
+        torch.manual_seed(42)
+        model_ref = self._create_mixed_precision_model()
+        model_bat = copy.deepcopy(model_ref)
+
+        reducer_ref = self._create_reducer(model_ref, find_unused_parameters=True)
+        reducer_bat = self._create_reducer(
+            model_bat, find_unused_parameters=True, batched_grad_copy=True
+        )
+        loss_fn = nn.CrossEntropyLoss()
+
+        input = torch.rand([10, 2], dtype=torch.double)
+        target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+
+        reducer_ref.prepare_for_forward()
+        out_ref = loss_fn(model_ref(input, use_fc3=False), target)
+        reducer_ref.prepare_for_backward(out_ref)
+        out_ref.backward()
+
+        reducer_bat.prepare_for_forward()
+        out_bat = loss_fn(model_bat(input, use_fc3=False), target)
+        reducer_bat.prepare_for_backward(out_bat)
+        out_bat.backward()
+
+        # fc3 is unused — its grad should remain None in both cases
+        self.assertIsNone(model_ref.fc3.weight.grad)
+        self.assertIsNone(model_bat.fc3.weight.grad)
+
+        # Used parameters should have identical grads
+        for (name_ref, p_ref), (name_bat, p_bat) in zip(
+            model_ref.named_parameters(), model_bat.named_parameters()
+        ):
+            if p_ref.grad is not None:
+                self.assertEqual(p_ref.grad, p_bat.grad, msg=name_ref)
+
+    @requires_gloo()
+    def test_batched_grad_copy_with_create_graph(self):
+        """batched_grad_copy falls back to non-batched path with create_graph=True."""
+        torch.manual_seed(42)
+
+        # Run with batched_grad_copy=False (reference)
+        model_ref = self._create_mixed_precision_model()
+        reducer_ref = self._create_reducer(model_ref)
+        loss_fn = nn.CrossEntropyLoss()
+        input = torch.rand([10, 2], dtype=torch.double)
+        target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+
+        reducer_ref.prepare_for_forward()
+        out_ref = loss_fn(model_ref(input), target)
+        reducer_ref.prepare_for_backward(out_ref)
+        ref_error = None
+        try:
+            out_ref.backward(create_graph=True)
+        except RuntimeError as e:
+            ref_error = str(e)
+
+        # Run with batched_grad_copy=True — should fall back to same path
+        torch.manual_seed(42)
+        model_bat = self._create_mixed_precision_model()
+        reducer_bat = self._create_reducer(model_bat, batched_grad_copy=True)
+
+        reducer_bat.prepare_for_forward()
+        out_bat = loss_fn(model_bat(input), target)
+        reducer_bat.prepare_for_backward(out_bat)
+        bat_error = None
+        try:
+            out_bat.backward(create_graph=True)
+        except RuntimeError as e:
+            bat_error = str(e)
+
+        # Both should behave identically (either both succeed or both fail)
+        self.assertEqual(ref_error, bat_error)
+
+    @requires_gloo()
+    def test_batched_grad_copy_with_comm_hook(self):
+        """batched_grad_copy works correctly when a comm_hook is registered."""
+        torch.manual_seed(42)
+        model_ref = self._create_mixed_precision_model()
+        model_bat = copy.deepcopy(model_ref)
+
+        reducer_ref = self._create_reducer(model_ref)
+        reducer_bat = self._create_reducer(model_bat, batched_grad_copy=True)
+
+        # A simple comm hook that just allreduces and divides by world_size.
+        def simple_hook(state, bucket):
+            fut = torch.futures.Future()
+            fut.set_result(bucket.buffer() / state)
+            return fut
+
+        world_size = 1  # single-process test
+        dist._register_comm_hook(reducer_ref, world_size, simple_hook)
+        dist._register_comm_hook(reducer_bat, world_size, simple_hook)
+
+        loss_fn = nn.CrossEntropyLoss()
+        input = torch.rand([10, 2], dtype=torch.double)
+        target = torch.LongTensor([random.randrange(4) for _ in range(10)])
+
+        reducer_ref.prepare_for_forward()
+        out_ref = loss_fn(model_ref(input), target)
+        reducer_ref.prepare_for_backward(out_ref)
+        out_ref.backward()
+
+        reducer_bat.prepare_for_forward()
+        out_bat = loss_fn(model_bat(input), target)
+        reducer_bat.prepare_for_backward(out_bat)
+        out_bat.backward()
+
+        for p_ref, p_bat in zip(model_ref.parameters(), model_bat.parameters()):
+            self.assertEqual(p_ref.grad, p_bat.grad)
+
+    @requires_gloo()
+    def test_batched_grad_copy_batches_copy_out(self):
+        """batched_grad_copy also batches the bucket-to-grad copy-out."""
+        model = self._create_mixed_precision_model()
+
+        # Without batching: one copy_bucket_to_grad record per parameter.
+        reducer_ref = self._create_reducer(model)
+        reducer_ref.prepare_for_forward()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+        ) as prof_ref:
+            self._run_forward_backward(model, reducer_ref)
+        ref_events = [e.key for e in prof_ref.key_averages()]
+        self.assertIn("torch.distributed.ddp.reducer::copy_bucket_to_grad", ref_events)
+
+        # With batching: the per-parameter copy-out is replaced by a single
+        # batched _foreach_copy_ per bucket.
+        model_bat = copy.deepcopy(model)
+        reducer_bat = self._create_reducer(model_bat, batched_grad_copy=True)
+        reducer_bat.prepare_for_forward()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+        ) as prof_bat:
+            self._run_forward_backward(model_bat, reducer_bat)
+        bat_events = [e.key for e in prof_bat.key_averages()]
+        self.assertNotIn(
+            "torch.distributed.ddp.reducer::copy_bucket_to_grad", bat_events
+        )
+        self.assertIn(
+            "torch.distributed.ddp.reducer::copy_bucket_to_grad_batched",
+            bat_events,
+        )
+
 
 @skip_if_win32()
 class ProcessGroupGlooLazyInitTest(ProcessGroupGlooTest):
@@ -2836,28 +3566,6 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
         for root_rank in ranks:
             self._test_broadcast_coalesced(process_group, device, root_rank)
 
-    @requires_gloo()
-    @skip_if_lt_x_gpu(2)
-    def test_sequence_num_set_default_pg_gloo(self):
-        self._test_sequence_num_set_default_pg(backend="gloo")
-
-    @requires_gloo()
-    @skip_if_lt_x_gpu(2)
-    def test_sequence_num_set_gloo_new_group(self):
-        self._test_sequence_num_set_new_group(backend="gloo")
-
-    @skip_if_lt_x_gpu(2)
-    @requires_gloo()
-    def test_sequence_num_incremented_gloo_default(self):
-        self._test_sequence_num_incremented_default_group("gloo")
-
-    @skip_if_lt_x_gpu(4)
-    @requires_gloo()
-    def test_sequence_num_incremented_gloo_subgroup(self):
-        if self.world_size < 4:
-            return skip_but_pass_in_sandcastle("Test requires world_size of at least 4")
-        self._test_sequence_num_incremented_subgroup("gloo")
-
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_gloo_warn_not_in_group(self):
@@ -2881,6 +3589,74 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
     @requires_gloo()
     def test_bool_tensors(self):
         self._test_bool_tensors(backend="gloo")
+
+    @requires_gloo()
+    def test_split_group_does_not_alias_parent_options(self):
+        # Regression test: ProcessGroup::splitGroup used to hand the parent
+        # backend's live Options object to the child, so a split rewrote the
+        # parent's group_name/timeout and ProcessGroupGloo::split overwrote the
+        # parent's global_ranks_in_group with the child's ranks. The parent's
+        # next split then indexed that subgroup-sized vector out of bounds.
+        store = c10d.FileStore(self.file_name, self.world_size)
+        c10d.init_process_group(
+            backend="gloo",
+            store=store,
+            rank=self.rank,
+            world_size=self.world_size,
+            timeout=timedelta(seconds=111),
+        )
+        pg = c10d.distributed_c10d._get_default_group()
+        cpu = torch.device("cpu")
+        parent_options = pg._get_backend(cpu).options
+        parent_group_name = parent_options.group_name
+
+        half = self.world_size // 2
+        halves = (
+            list(range(half))
+            if self.rank < half
+            else list(range(half, self.world_size))
+        )
+        child = pg.split_group(
+            halves, timeout=timedelta(seconds=222), group_name=f"halves{halves}"
+        )
+        child_options = child._get_backend(cpu).options
+        self.assertIsNot(child_options, parent_options)
+        self.assertEqual(parent_options.group_name, parent_group_name)
+        self.assertEqual(parent_options._timeout, timedelta(seconds=111))
+        self.assertEqual(parent_options.global_ranks_in_group, [])
+        self.assertEqual(child_options._timeout, timedelta(seconds=222))
+        self.assertEqual(child_options.global_ranks_in_group, halves)
+
+        # A second split of the same parent must still see the world's ranks.
+        parity = [r for r in range(self.world_size) if r % 2 == self.rank % 2]
+        second = pg.split_group(
+            parity, timeout=timedelta(seconds=333), group_name=f"parity{parity}"
+        )
+        self.assertEqual(second._get_backend(cpu).options.global_ranks_in_group, parity)
+
+        c10d.destroy_process_group()
+
+    @requires_gloo()
+    def test_split_group_keeps_gloo_options(self):
+        # A CPU-only Gloo parent selects its CPU backend without requiring a
+        # bound accelerator, and each child keeps independently cloned options.
+        store = c10d.FileStore(self.file_name, self.world_size)
+        c10d.init_process_group(
+            backend="gloo",
+            store=store,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        ranks = list(range(self.world_size))
+        child = c10d.split_group(split_ranks=[ranks], timeout=timedelta(seconds=222))
+        options = child._get_backend(torch.device("cpu")).options
+        self.assertEqual(options._timeout, timedelta(seconds=222))
+        self.assertEqual(options.group_name, child.group_name)
+        self.assertEqual(options.global_ranks_in_group, ranks)
+        value = torch.tensor(float(self.rank + 1))
+        c10d.all_reduce(value, group=child)
+        self.assertEqual(value, torch.tensor(float(sum(rank + 1 for rank in ranks))))
+        c10d.destroy_process_group()
 
 
 class GlooProcessGroupWithDispatchedCollectivesTests(

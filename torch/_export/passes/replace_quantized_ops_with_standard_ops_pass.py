@@ -285,7 +285,7 @@ def _conv1d_op_with_squeeze(
 ) -> torch.Tensor:
     # In quantized version, conv1d is emulated using conv2d with squeeze and unsqueeze
     # operations before and after the conv2d operation to match the dimension of weights.
-    # Reference: https://github.com/pytorch/pytorch/blob/eca0cb0fbe84bb0a34fa94afe261bceecd52c436/aten/src/ATen/native/quantized/cpu/qconv.cpp#L1827  # noqa: B950
+    # Reference: https://github.com/pytorch/pytorch/blob/eca0cb0fbe84bb0a34fa94afe261bceecd52c436/aten/src/ATen/native/quantized/cpu/qconv.cpp#L1827
     s_inp = torch.ops.aten.unsqueeze(inp, 2)
     conv1d_res = torch.ops.aten.conv2d(
         s_inp,
@@ -644,7 +644,7 @@ def replace_quantized_ops_with_standard_ops(gm: torch.fx.GraphModule):
                 else:
                     last_quantized_node = node
 
-    # Post-processing again to remove legacy ScriptObjects and quantizated tensors
+    # Post-processing again to remove legacy ScriptObjects and quantized tensors
     # stored as attributes or in the buffer. This is used to clean up the GraphModule
     # to not trigger tracing errors like missing __obj_flatten__ functions.
     def _clean_attr(mod: torch.nn.Module):
@@ -669,7 +669,7 @@ def replace_quantized_ops_with_standard_ops(gm: torch.fx.GraphModule):
 
     if quantized:
         """
-        TODO: SetAttr + quantized ops will result incorrect program. This flag is used to temporarily
+        TODO: SetAttr + quantized ops will result in incorrect program. This flag is used to temporarily
         bypass test cases.
 
         The deadcode elimination pass is needed to remove legacy quantized ops. Otherwise, retracing

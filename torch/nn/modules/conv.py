@@ -49,7 +49,7 @@ convolution_notes = {
         In other words, for an input of size :math:`(N, C_{in}, L_{in})`,
         a depthwise convolution with a depthwise multiplier `K` can be performed with the arguments
         :math:`(C_\text{in}=C_\text{in}, C_\text{out}=C_\text{in} \times \text{K}, ..., \text{groups}=C_\text{in})`.""",
-}  # noqa: B950
+}
 
 
 class _ConvNd(Module):
@@ -400,9 +400,11 @@ class Conv2d(_ConvNd):
 
 
     where :math:`\star` is the valid 2D `cross-correlation`_ operator,
-    :math:`N` is a batch size, :math:`C` denotes a number of channels,
-    :math:`H` is a height of input planes in pixels, and :math:`W` is
-    width in pixels.
+    :math:`N` is a batch size, :math:`C_{\text{in}}` and :math:`C_{\text{out}}` correspond to
+    :attr:`in_channels` and :attr:`out_channels` respectively,
+    :math:`H` and :math:`W` are the input height and width in pixels.
+    See the Shape section below for how :math:`H_{\text{out}}` and :math:`W_{\text{out}}`
+    are derived from :attr:`kernel_size`, :attr:`stride`, :attr:`padding`, and :attr:`dilation`.
     """
         + r"""
 
@@ -860,7 +862,7 @@ class ConvTranspose1d(_ConvTransposeNd):
 
     Note:
         The :attr:`padding` argument effectively adds ``dilation * (kernel_size - 1) - padding``
-        amount of zero padding to both sizes of the input. This is set so that
+        amount of zero padding to both sides of the input. This is set so that
         when a :class:`~torch.nn.Conv1d` and a :class:`~torch.nn.ConvTranspose1d`
         are initialized with same parameters, they are inverses of each other in
         regard to the input and output shapes. However, when ``stride > 1``,
@@ -1050,7 +1052,7 @@ class ConvTranspose2d(_ConvTransposeNd):
 
     Note:
         The :attr:`padding` argument effectively adds ``dilation * (kernel_size - 1) - padding``
-        amount of zero padding to both sizes of the input. This is set so that
+        amount of zero padding to both sides of the input. This is set so that
         when a :class:`~torch.nn.Conv2d` and a :class:`~torch.nn.ConvTranspose2d`
         are initialized with same parameters, they are inverses of each other in
         regard to the input and output shapes. However, when ``stride > 1``,
@@ -1247,7 +1249,7 @@ class ConvTranspose3d(_ConvTransposeNd):
 
     Note:
         The :attr:`padding` argument effectively adds ``dilation * (kernel_size - 1) - padding``
-        amount of zero padding to both sizes of the input. This is set so that
+        amount of zero padding to both sides of the input. This is set so that
         when a :class:`~torch.nn.Conv3d` and a :class:`~torch.nn.ConvTranspose3d`
         are initialized with same parameters, they are inverses of each other in
         regard to the input and output shapes. However, when ``stride > 1``,
@@ -1486,7 +1488,7 @@ class _LazyConvXdMixin(LazyModuleMixin):
         raise NotImplementedError
 
 
-# LazyConv1d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConv1d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv1d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1514,7 +1516,7 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
     .. seealso:: :class:`torch.nn.Conv1d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = Conv1d  # type: ignore[assignment]
 
@@ -1558,7 +1560,7 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
         return 1
 
 
-# LazyConv2d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConv2d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv2d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1586,7 +1588,7 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
     .. seealso:: :class:`torch.nn.Conv2d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = Conv2d  # type: ignore[assignment]
 
@@ -1630,7 +1632,7 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
         return 2
 
 
-# LazyConv3d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConv3d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
     r"""A :class:`torch.nn.Conv3d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1659,7 +1661,7 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
     .. seealso:: :class:`torch.nn.Conv3d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = Conv3d  # type: ignore[assignment]
 
@@ -1703,7 +1705,7 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
         return 3
 
 
-# LazyConvTranspose1d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConvTranspose1d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose1d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1729,7 +1731,7 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
     .. seealso:: :class:`torch.nn.ConvTranspose1d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = ConvTranspose1d  # type: ignore[assignment]
 
@@ -1775,7 +1777,7 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
         return 1
 
 
-# LazyConvTranspose2d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConvTranspose2d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose2d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1801,7 +1803,7 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
     .. seealso:: :class:`torch.nn.ConvTranspose2d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = ConvTranspose2d  # type: ignore[assignment]
 
@@ -1847,7 +1849,7 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
         return 2
 
 
-# LazyConvTranspose3d defines weight as a Tensor but derived class defines it as UninitializeParameter
+# LazyConvTranspose3d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[misc]
     r"""A :class:`torch.nn.ConvTranspose3d` module with lazy initialization of the ``in_channels`` argument.
 
@@ -1873,7 +1875,7 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[mi
     .. seealso:: :class:`torch.nn.ConvTranspose3d` and :class:`torch.nn.modules.lazy.LazyModuleMixin`
     """
 
-    # super class define this variable as None. "type: ignore[..] is required
+    # super class defines this variable as None. "type: ignore[..] is required
     # since we are redefining the variable.
     cls_to_become = ConvTranspose3d  # type: ignore[assignment]
 
